@@ -1,0 +1,25 @@
+# The public Docli CLI workspace — three MIT crates, buildable standalone.
+# The monorepo (gitverse.ru/agitek/docli) is the source of truth; this mirror is seeded per
+# release by /release-cli. PRs here are IMPORTED into the monorepo, never merged directly —
+# see cli/CONTRIBUTING.md.
+[workspace]
+resolver = "2"
+members = ["cli", "sync-wire", "docli-rules"]
+
+[workspace.dependencies]
+docli-rules = { path = "docli-rules", default-features = false }
+docli-sync-wire = { path = "sync-wire" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+uuid = { version = "1.23.3", features = ["v4", "serde"] }
+sha2 = "0.11.0"
+hex = "0.4.3"
+base64 = "0.22.1"
+rand = "0.8"
+anyhow = "1.0"
+unicode-normalization = "0.1.24"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[profile.release]
+strip = true
+lto = true

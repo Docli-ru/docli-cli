@@ -1,0 +1,53 @@
+[package]
+name = "docli-cli"
+version = "0.1.0"
+edition = "2021"
+# MSRV for the public mirror: latest stable we build and verify with (user ruling 2026-08-30 —
+# no groveling for old toolchains). Kept uniform across the three mirror crates; clippy's
+# incompatible_msrv lint enforces it against the code.
+rust-version = "1.94"
+# MIT — the whole public mirror (apps/cli + packages/sync-wire + packages/docli-rules) builds
+# standalone under it (v0.28.0 D1/D11).
+license = "MIT"
+description = "docli CLI — a read-only agent cache over the docli sync plane"
+repository = "https://gitverse.ru/agitek/docli-cli"
+publish = false
+
+[lib]
+name = "docli_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "docli"
+path = "src/main.rs"
+
+[dependencies]
+# The two mirror crates — deliberately NOT docli-core (UNLICENSED; also keeps sqlx/comrak/
+# syntect/chacha20poly1305 out of the binary — the composition check in ci/run-checks.sh).
+docli-rules = { workspace = true, features = ["fold"] }
+docli-sync-wire.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+sha2.workspace = true
+hex.workspace = true
+base64.workspace = true
+rand.workspace = true
+anyhow.workspace = true
+# The fold guard's NFC half — the CLI's own dep, not through docli-core (D1).
+unicode-normalization.workspace = true
+
+# CLI-only deps (not workspace-shared): argument parsing, the mount-table format, HTTP (blocking;
+# rustls like everything else in-tree), and the self-update signature verifier (D9 — pure Rust,
+# no native deps in the static binary).
+clap = { version = "4", features = ["derive"] }
+toml = "0.9"
+reqwest = { workspace = true, features = ["blocking"] }
+minisign-verify = "0.2"
+# Format-preserving merges into USER-owned agent configs (`agents.rs`, D12.4) — plain `toml`
+# would re-serialize and destroy the user's comments/layout.
+toml_edit = "0.25.13"
+
+[dev-dependencies]
+tempfile = "3"

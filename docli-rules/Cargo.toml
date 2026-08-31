@@ -1,0 +1,28 @@
+[package]
+name = "docli-rules"
+version = "0.1.0"
+edition = "2021"
+# MSRV for the public mirror: latest stable we build and verify with (user ruling 2026-08-30 —
+# no groveling for old toolchains). Kept uniform across the three mirror crates; clippy's
+# incompatible_msrv lint enforces it against the code.
+rust-version = "1.94"
+# MIT, unlike the workspace default: this crate ships in the public CLI mirror and must build
+# standalone there (v0.28.0 D1) — which is also why it must never depend on docli-core.
+license = "MIT"
+description = "docli's shared pure client rules: note names, name folding, Windows path projection, MCP connection-label grammar"
+repository = "https://gitverse.ru/agitek/docli-cli"
+publish = false
+
+[dependencies]
+# The fold guard's NFC half, behind the default-on `fold` feature. docli-core consumes this crate
+# with `default-features = false` (it only needs the note-name rule), so the Unicode tables never
+# ride into the wasm preview bundle through the re-export.
+unicode-normalization = { workspace = true, optional = true }
+
+[features]
+default = ["fold"]
+fold = ["dep:unicode-normalization"]
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true

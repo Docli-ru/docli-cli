@@ -1,0 +1,25 @@
+{
+  "name": "@docli/cli",
+  "version": "0.0.0",
+  "description": "docli CLI — read-only workspace mirrors for coding agents (https://docli.ru)",
+  "license": "MIT",
+  "repository": "https://gitverse.ru/agitek/docli-cli",
+  "homepage": "https://docli.ru",
+  "bin": {
+    "docli": "bin/docli.js"
+  },
+  "files": [
+    "bin/"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "@docli/cli-darwin-arm64": "0.0.0",
+    "@docli/cli-darwin-x64": "0.0.0",
+    "@docli/cli-linux-x64": "0.0.0",
+    "@docli/cli-linux-arm64": "0.0.0",
+    "@docli/cli-win32-x64": "0.0.0",
+    "@docli/cli-win32-arm64": "0.0.0"
+  }
+}

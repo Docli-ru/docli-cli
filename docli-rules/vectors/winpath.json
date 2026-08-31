@@ -1,0 +1,130 @@
+{
+  "roundtrip": [
+    {
+      "server": "CON.md",
+      "local": "%43ON.md"
+    },
+    {
+      "server": "a:b.md",
+      "local": "a%3Ab.md"
+    },
+    {
+      "server": "a<b.md",
+      "local": "a%3Cb.md"
+    },
+    {
+      "server": "dot..md",
+      "local": "dot..md"
+    },
+    {
+      "server": "sp .md",
+      "local": "sp .md"
+    },
+    {
+      "server": "aux.tar",
+      "local": "%61ux.tar"
+    },
+    {
+      "server": "a<%b.md",
+      "local": "a%3C%25b.md"
+    },
+    {
+      "server": "trail.",
+      "local": "trail%2E"
+    },
+    {
+      "server": "trail ",
+      "local": "trail%20"
+    },
+    {
+      "server": "NUL",
+      "local": "%4EUL"
+    },
+    {
+      "server": "COM1.md",
+      "local": "%43OM1.md"
+    },
+    {
+      "server": "com9",
+      "local": "%63om9"
+    },
+    {
+      "server": "LPT5.txt",
+      "local": "%4CPT5.txt"
+    },
+    {
+      "server": "ab.md",
+      "local": "ab.md"
+    },
+    {
+      "server": "q?.md",
+      "local": "q%3F.md"
+    },
+    {
+      "server": "star*.md",
+      "local": "star%2A.md"
+    },
+    {
+      "server": "quote\".md",
+      "local": "quote%22.md"
+    },
+    {
+      "server": "back\\slash.md",
+      "local": "back%5Cslash.md"
+    },
+    {
+      "server": "pipe|x.md",
+      "local": "pipe%7Cx.md"
+    },
+    {
+      "server": "gt>x.md",
+      "local": "gt%3Ex.md"
+    },
+    {
+      "server": "folder:sub/CON.md",
+      "local": "folder%3Asub/%43ON.md"
+    },
+    {
+      "server": "ctl\u0001.md",
+      "local": "ctl%01.md"
+    },
+    {
+      "server": "COM¹.md",
+      "local": "%43OM¹.md"
+    },
+    {
+      "server": "lpt³",
+      "local": "%6Cpt³"
+    },
+    {
+      "server": "COM².txt",
+      "local": "%43OM².txt"
+    }
+  ],
+  "decode": [
+    {
+      "local": "a%3Cb.md",
+      "server": "a<b.md"
+    },
+    {
+      "local": "a%b.md",
+      "server": "a%b.md"
+    },
+    {
+      "local": "%20name.md",
+      "server": "%20name.md"
+    },
+    {
+      "local": "%25.md",
+      "server": "%25.md"
+    },
+    {
+      "local": "%2ax.md",
+      "server": "%2ax.md"
+    },
+    {
+      "local": "CON%2Emd",
+      "server": "CON%2Emd"
+    }
+  ]
+}

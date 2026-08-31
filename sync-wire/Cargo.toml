@@ -1,0 +1,22 @@
+[package]
+name = "docli-sync-wire"
+version = "0.1.0"
+edition = "2021"
+# MSRV for the public mirror: latest stable we build and verify with (user ruling 2026-08-30 —
+# no groveling for old toolchains). Kept uniform across the three mirror crates; clippy's
+# incompatible_msrv lint enforces it against the code.
+rust-version = "1.94"
+# MIT, unlike the workspace default: this crate ships in the public CLI mirror and must build
+# standalone there (v0.28.0 D1). The crates.io name is reserved at 0.0.0; real publishes ride
+# `/release-cli`, so accidental `cargo publish` from the monorepo stays off.
+license = "MIT"
+description = "docli vault-sync wire types, shared by the api server and the docli CLI"
+repository = "https://gitverse.ru/agitek/docli-cli"
+publish = false
+
+[dependencies]
+serde.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

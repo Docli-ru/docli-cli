@@ -1,0 +1,1657 @@
+// SPDX-FileCopyrightText: 2026 OOO Agitek
+// SPDX-License-Identifier: MIT
+
+//! `docli init` agent wiring (v0.28.0 D12) — the opt-in MCP picker + per-agent config adapters.
+//!
+//! Design pins (D12.4, research: `docs/research/2026-08-30-coding-agent-skills-mcp-matrix.md`):
+//! - **Opt-in only** — `--mcp` or an interactive yes; never automatic, never on plain re-runs.
+//! - **No credential is ever written.** The configs carry a URL; the agent runs its own browser
+//!   OAuth on first connect, and the v0.25.7 per-connection persona pin binds the workspace.
+//!   Labels carry no authority, so these files are safe to commit.
+//! - **Write policy** (every adapter): create if absent; merge ONLY our key if the file exists;
+//!   leave an existing `docli` entry untouched; print the snippet if the file is occupied in a
+//!   way we can't merge (JSONC comments, non-object roots, exotic spellings).
+//! - **Merges are splices, not rewrites**: an existing file is never re-serialized wholesale
+//!   (that would re-sort keys and destroy the user's formatting) — our entry is spliced into the
+//!   located top-level object, and anything the splicer can't locate falls to the print branch.
+//! - Print-only agents (Qwen/Cline/Trae + everything unlisted) still get the skill copy where
+//!   they have an off-standard skills dir; their MCP snippet is printed, never written —
+//!   Cline's config is global-only, and Trae's remote-MCP OAuth is unconfirmed (a PAT-in-header
+//!   config would resurrect the pasted-token UX the OAuth server exists to kill).
+
+use std::fs;
+use std::path::Path;
+
+use anyhow::{Context, Result};
+
+/// The labeled MCP resource path (doc-twin of docli-core's `MCP_LABEL_PATH_PREFIX` — the CLI
+/// cannot depend on core; the grammar itself is shared via `docli_rules::valid_label`).
+const MCP_LABEL_PATH_PREFIX: &str = "/api/mcp/c/";
+
+pub fn connection_url(server: &str, label: &str) -> String {
+    format!(
+        "{}{MCP_LABEL_PATH_PREFIX}{label}",
+        server.trim_end_matches('/')
+    )
+}
+
+/// The BARE (unlabeled) connection — the `--mcp-bare` escape hatch. Labeled URLs are the
+/// default (the v0.25.7 per-connection pin is the whole point of wiring per project), but the
+/// audience fence is byte-exact and a client that omits RFC 8707 `resource` gets a bare-audience
+/// token the labeled route refuses — and the labeled live-client gate is still open for most
+/// wired clients. The bare connection is the proven-everywhere fallback.
+pub fn connection_url_bare(server: &str) -> String {
+    format!("{}/api/mcp", server.trim_end_matches('/'))
+}
+
+/// Derive a grammar-valid connection label from a free-form name (the project dir name).
+/// Lowercase, separators → `-`, everything outside `[a-z0-9-]` dropped, runs collapsed,
+/// byte-capped WITH re-trim (the grammar rejects over-long, so the derivation may shorten —
+/// unlike a user-SUPPLIED label, which is validated verbatim and refused off-grammar).
+pub fn sanitize_label(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.to_lowercase().chars() {
+        let mapped = match c {
+            'a'..='z' | '0'..='9' => Some(c),
+            ' ' | '_' | '.' | '-' => Some('-'),
+            _ => None,
+        };
+        if let Some(m) = mapped {
+            if m == '-' && out.ends_with('-') {
+                continue;
+            }
+            out.push(m);
+        }
+    }
+    out.truncate(docli_rules::CONNECTION_LABEL_MAX_BYTES);
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() {
+        // Nothing survived the ASCII grammar — the COMMON case for RU-named directories
+        // («докли», «заметки»), not an edge. A constant fallback would wire every such
+        // project to ONE connection (one grant, one persona pin); a stable hash of the
+        // original name keeps differently-named projects on different connections in
+        // practice (collision-RESISTANT at personal-project scale, not guaranteed distinct —
+        // round-4 F-D; `--mcp-label` is the deterministic escape), and stays deterministic
+        // per name.
+        use sha2::{Digest, Sha256};
+        let h = Sha256::digest(name.as_bytes());
+        format!("project-{}", hex::encode(&h[..4]))
+    } else {
+        out
+    }
+}
+
+/// How one agent gets its MCP entry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum McpAdapter {
+    /// Splice `"docli": <entry>` under a top-level JSON key in `path`.
+    Json {
+        path: &'static str,
+        top_key: &'static str,
+        entry_shape: JsonShape,
+    },
+    /// `[mcp_servers.docli] url = …` in `path`, format-preserving (toml_edit).
+    CodexToml { path: &'static str },
+    /// Print the snippet; never write (global-only or OAuth-unconfirmed config).
+    Print,
+}
+
+/// The three JSON entry spellings the tier-1 agents use. `httpUrl`-vs-`url` is load-bearing on
+/// Gemini (and Qwen): `url` means SSE there — the classic misconfig the research pass flagged.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum JsonShape {
+    TypeHttpUrl,    // {"type": "http", "url": …}   — .mcp.json, .vscode/mcp.json
+    UrlOnly,        // {"url": …}                   — .cursor/mcp.json
+    HttpUrl,        // {"httpUrl": …}               — .gemini/settings.json
+    OpencodeRemote, // {"type": "remote", "url": …, "enabled": true}
+}
+
+impl JsonShape {
+    /// Entries are built by the JSON SERIALIZER, never by `format!` interpolation (round-3
+    /// F0): `config.server` comes from a COMMITTED docli.toml nobody validates as a URL, so a
+    /// quote in it must become an escaped character inside the `url` string — not a panic,
+    /// and never an extra sibling key written into a teammate's agent config.
+    fn entry_value(self, url: &str) -> serde_json::Value {
+        match self {
+            JsonShape::TypeHttpUrl => serde_json::json!({"type": "http", "url": url}),
+            JsonShape::UrlOnly => serde_json::json!({"url": url}),
+            JsonShape::HttpUrl => serde_json::json!({"httpUrl": url}),
+            JsonShape::OpencodeRemote => {
+                serde_json::json!({"type": "remote", "url": url, "enabled": true})
+            }
+        }
+    }
+
+    fn entry(self, url: &str) -> String {
+        self.entry_value(url).to_string()
+    }
+}
+
+pub struct AgentDef {
+    pub key: &'static str,
+    pub display: &'static str,
+    /// Project-relative markers whose presence pre-selects this agent.
+    project_markers: &'static [&'static str],
+    /// $HOME-relative markers meaning "installed on this machine".
+    home_markers: &'static [&'static str],
+    adapter: McpAdapter,
+    /// Off-standard skills dir (project-relative) for agents that don't read `.agents/skills/`.
+    pub skill_copy_dir: Option<&'static str>,
+}
+
+/// The picker table. Tier-1 adapters write; the rest print. `.mcp.json` serves Claude Code AND
+/// Copilot CLI with one write (same path, same format — the research pass's best accident).
+pub const AGENTS: &[AgentDef] = &[
+    AgentDef {
+        key: "claude",
+        display: "Claude Code + Copilot CLI (.mcp.json)",
+        project_markers: &[".claude", ".mcp.json"],
+        home_markers: &[".claude"],
+        adapter: McpAdapter::Json {
+            path: ".mcp.json",
+            top_key: "mcpServers",
+            entry_shape: JsonShape::TypeHttpUrl,
+        },
+        skill_copy_dir: None,
+    },
+    AgentDef {
+        key: "codex",
+        display: "Codex CLI (.codex/config.toml)",
+        project_markers: &[".codex"],
+        home_markers: &[".codex"],
+        adapter: McpAdapter::CodexToml {
+            path: ".codex/config.toml",
+        },
+        skill_copy_dir: None,
+    },
+    AgentDef {
+        key: "gemini",
+        display: "Gemini CLI (.gemini/settings.json)",
+        project_markers: &[".gemini"],
+        home_markers: &[".gemini"],
+        adapter: McpAdapter::Json {
+            path: ".gemini/settings.json",
+            top_key: "mcpServers",
+            entry_shape: JsonShape::HttpUrl,
+        },
+        skill_copy_dir: None,
+    },
+    AgentDef {
+        key: "cursor",
+        display: "Cursor (.cursor/mcp.json)",
+        project_markers: &[".cursor"],
+        home_markers: &[".cursor"],
+        adapter: McpAdapter::Json {
+            path: ".cursor/mcp.json",
+            top_key: "mcpServers",
+            entry_shape: JsonShape::UrlOnly,
+        },
+        skill_copy_dir: None,
+    },
+    AgentDef {
+        key: "vscode",
+        display: "VS Code / Copilot (.vscode/mcp.json)",
+        project_markers: &[".vscode"],
+        home_markers: &[],
+        adapter: McpAdapter::Json {
+            path: ".vscode/mcp.json",
+            top_key: "servers",
+            entry_shape: JsonShape::TypeHttpUrl,
+        },
+        skill_copy_dir: None,
+    },
+    AgentDef {
+        key: "opencode",
+        display: "OpenCode (opencode.json)",
+        project_markers: &["opencode.json", ".opencode"],
+        home_markers: &[".config/opencode"],
+        adapter: McpAdapter::Json {
+            path: "opencode.json",
+            top_key: "mcp",
+            entry_shape: JsonShape::OpencodeRemote,
+        },
+        skill_copy_dir: None,
+    },
+    AgentDef {
+        key: "qwen",
+        display: "Qwen Code (snippet + skill copy)",
+        project_markers: &[".qwen"],
+        home_markers: &[".qwen"],
+        adapter: McpAdapter::Print,
+        skill_copy_dir: Some(".qwen/skills/docli-mirror"),
+    },
+    AgentDef {
+        key: "cline",
+        display: "Cline (snippet + skill copy)",
+        project_markers: &[".clinerules", ".cline"],
+        home_markers: &[".cline"],
+        adapter: McpAdapter::Print,
+        skill_copy_dir: Some(".cline/skills/docli-mirror"),
+    },
+    AgentDef {
+        key: "trae",
+        display: "Trae (snippet + skill copy)",
+        project_markers: &[".trae"],
+        home_markers: &[".trae"],
+        adapter: McpAdapter::Print,
+        skill_copy_dir: Some(".trae/skills/docli-mirror"),
+    },
+    // The remaining print-only set (D12.4): reachable by key so every named agent's user can
+    // get their snippet — Zed's project-level MCP placement is undocumented, Windsurf's config
+    // is global-only, SourceCraft's and Junie's remote-MCP OAuth is unconfirmed. Zed and
+    // Windsurf read `.agents/skills/` natively, so no skill copy; SourceCraft and Junie have
+    // no skills mechanism at all.
+    AgentDef {
+        key: "zed",
+        display: "Zed (snippet)",
+        project_markers: &[".zed"],
+        home_markers: &[".config/zed"],
+        adapter: McpAdapter::Print,
+        skill_copy_dir: None,
+    },
+    AgentDef {
+        key: "windsurf",
+        display: "Windsurf (snippet)",
+        project_markers: &[".windsurf"],
+        home_markers: &[".codeium/windsurf"],
+        adapter: McpAdapter::Print,
+        skill_copy_dir: None,
+    },
+    AgentDef {
+        key: "sourcecraft",
+        display: "SourceCraft Code Assistant (snippet)",
+        project_markers: &[".codeassistant"],
+        home_markers: &[],
+        adapter: McpAdapter::Print,
+        skill_copy_dir: None,
+    },
+    AgentDef {
+        key: "junie",
+        display: "JetBrains Junie (snippet)",
+        project_markers: &[".junie"],
+        home_markers: &[".junie"],
+        adapter: McpAdapter::Print,
+        skill_copy_dir: None,
+    },
+    // Tier-2 (research doc): documented project config + confirmed OAuth, smaller audience —
+    // snippet-only until demand shows; reads `.agents/skills/` natively, so no skill copy.
+    AgentDef {
+        key: "amp",
+        display: "Amp (snippet)",
+        project_markers: &[".amp"],
+        home_markers: &[".config/amp"],
+        adapter: McpAdapter::Print,
+        skill_copy_dir: None,
+    },
+];
+
+pub fn agent(key: &str) -> Option<&'static AgentDef> {
+    AGENTS.iter().find(|a| a.key == key)
+}
+
+/// The keys pre-selected by detection: a project marker OR a home marker exists.
+pub fn detect(project: &Path, home: Option<&Path>) -> Vec<&'static str> {
+    // `symlink_metadata`, not `exists()` (Codex round 3): a DANGLING `.mcp.json` symlink is
+    // still a marker — `exists()` follows the link and would hide the agent whose config the
+    // writer is specifically able to heal (it creates the referent).
+    fn present(p: &Path) -> bool {
+        p.symlink_metadata().is_ok()
+    }
+    AGENTS
+        .iter()
+        .filter(|a| {
+            a.project_markers.iter().any(|m| present(&project.join(m)))
+                || home
+                    .map(|h| a.home_markers.iter().any(|m| present(&h.join(m))))
+                    .unwrap_or(false)
+        })
+        .map(|a| a.key)
+        .collect()
+}
+
+/// What a merge decided. `Write` carries the FULL new file content (the splice already applied).
+#[derive(Debug, PartialEq, Eq)]
+pub enum MergeOutcome {
+    Write(String),
+    /// Our entry already exists; `same` = it matches what we would write today.
+    AlreadyConfigured {
+        same: bool,
+    },
+    /// Can't merge safely — the caller prints the snippet instead. Never an error.
+    Occupied(String),
+}
+
+/// Splice `"docli": <entry>` under `top_key` in a JSON config, preserving the user's text.
+fn merge_json(existing: Option<&str>, top_key: &str, entry: &str) -> MergeOutcome {
+    let desired: serde_json::Value = serde_json::from_str(entry)
+        .expect("the entry is serializer output (JsonShape::entry) — always valid JSON");
+    let text = existing.map(str::trim).filter(|t| !t.is_empty());
+    let Some(text) = text else {
+        return MergeOutcome::Write(format!(
+            "{{\n  \"{top_key}\": {{\n    \"docli\": {entry}\n  }}\n}}\n"
+        ));
+    };
+    let root: serde_json::Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(_) => {
+            return MergeOutcome::Occupied(
+                "does not parse as strict JSON (it may contain comments)".to_string(),
+            )
+        }
+    };
+    let Some(obj) = root.as_object() else {
+        return MergeOutcome::Occupied("root is not a JSON object".to_string());
+    };
+    match obj.get(top_key) {
+        Some(serde_json::Value::Object(servers)) => {
+            if let Some(ours) = servers.get("docli") {
+                if *ours == desired {
+                    return MergeOutcome::AlreadyConfigured { same: true };
+                }
+                // An explicit re-run with a different URL (a label change, --mcp-bare)
+                // UPDATES our own entry in place — ours and only ours; everything around it
+                // stays byte-identical. If the entry can't be located unambiguously, fall
+                // back to the left-untouched report.
+                return match replace_docli_entry(text, top_key, entry) {
+                    Some(out) => MergeOutcome::Write(out),
+                    None => MergeOutcome::AlreadyConfigured { same: false },
+                };
+            }
+            let Some(brace) = top_level_value_brace(text, top_key) else {
+                return MergeOutcome::Occupied(format!(
+                    "could not locate the \"{top_key}\" object to merge into"
+                ));
+            };
+            let insert = if servers.is_empty() {
+                format!("\"docli\": {entry}")
+            } else {
+                format!("\"docli\": {entry}, ")
+            };
+            let mut out = String::with_capacity(text.len() + insert.len());
+            out.push_str(&text[..=brace]);
+            out.push_str(&insert);
+            out.push_str(&text[brace + 1..]);
+            ensure_trailing_newline(&mut out);
+            MergeOutcome::Write(out)
+        }
+        Some(_) => MergeOutcome::Occupied(format!("\"{top_key}\" is not an object")),
+        None => {
+            // No top_key yet — splice the whole block right after the root `{`.
+            let Some(brace) = text.find('{') else {
+                return MergeOutcome::Occupied("no root object".to_string());
+            };
+            let insert = if obj.is_empty() {
+                format!("\"{top_key}\": {{\"docli\": {entry}}}")
+            } else {
+                format!("\"{top_key}\": {{\"docli\": {entry}}}, ")
+            };
+            let mut out = String::with_capacity(text.len() + insert.len());
+            out.push_str(&text[..=brace]);
+            out.push_str(&insert);
+            out.push_str(&text[brace + 1..]);
+            ensure_trailing_newline(&mut out);
+            MergeOutcome::Write(out)
+        }
+    }
+}
+
+fn ensure_trailing_newline(s: &mut String) {
+    if !s.ends_with('\n') {
+        s.push('\n');
+    }
+}
+
+/// Byte offset of the `{` opening `key`'s value, where `key` is a DEPTH-1 member of the root
+/// object — a tiny JSON walk (strings + escapes + depth over `{}`/`[]`). Returns `None` for any
+/// shape it isn't sure about; the caller then falls to the print branch rather than guessing.
+/// «Isn't sure» includes a DUPLICATED depth-1 key: serde_json keeps the LAST duplicate while a
+/// first-match splice would edit the object the agent ignores — so any second candidate match
+/// makes the whole locate refuse.
+fn top_level_value_brace(text: &str, key: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    let mut found: Option<usize> = None;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                let start = i + 1;
+                let end = scan_string(bytes, start)?;
+                // A candidate KEY: depth 1, plain spelling, followed by `:`.
+                // ANY escaped string at this depth refuses the whole locate (Codex round
+                // 1): an escaped alias of our key is a duplicate serde resolves last-wins
+                // while a plain-spelling matcher would edit the ineffective entry — and
+                // telling aliases apart would mean reimplementing JSON unescaping. Any
+                // doubt → the print branch.
+                if depth == 1 && text[start..end].contains('\\') {
+                    return None;
+                }
+                if depth == 1 && &text[start..end] == key {
+                    let mut j = end + 1;
+                    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if j < bytes.len() && bytes[j] == b':' {
+                        if found.is_some() {
+                            return None; // duplicated key — refuse rather than guess
+                        }
+                        j += 1;
+                        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                            j += 1;
+                        }
+                        if j >= bytes.len() || bytes[j] != b'{' {
+                            return None;
+                        }
+                        found = Some(j);
+                    }
+                }
+                i = end + 1;
+            }
+            b'{' | b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' | b']' => {
+                depth = depth.checked_sub(1)?;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    found
+}
+
+/// Index just past the closing quote's content: `bytes[start..ret]` is the raw string body.
+fn scan_string(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Replace the VALUE of the (unique) `"docli"` member inside `top_key`'s object with `entry`,
+/// splicing over the user's text like everything else here. `None` = couldn't locate it
+/// unambiguously; the caller reports left-untouched instead of guessing.
+fn replace_docli_entry(text: &str, top_key: &str, entry: &str) -> Option<String> {
+    let obj_open = top_level_value_brace(text, top_key)?;
+    let (val_start, val_end) = value_of_key_in_object(text, obj_open, "docli")?;
+    let mut out = String::with_capacity(text.len() + entry.len());
+    out.push_str(&text[..val_start]);
+    out.push_str(entry);
+    out.push_str(&text[val_end..]);
+    ensure_trailing_newline(&mut out);
+    Some(out)
+}
+
+/// Locate the value span of `key` as a DIRECT member of the object opening at `obj_open`
+/// (byte index of its `{`). Same discipline as [`top_level_value_brace`]: strings and escapes
+/// respected, a duplicated key refuses, any doubt returns `None`.
+fn value_of_key_in_object(text: &str, obj_open: usize, key: &str) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut i = obj_open;
+    let mut found: Option<(usize, usize)> = None;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                let start = i + 1;
+                let end = scan_string(bytes, start)?;
+                // ANY escaped string at this depth refuses the whole locate (Codex round
+                // 1): an escaped alias of our key is a duplicate serde resolves last-wins
+                // while a plain-spelling matcher would edit the ineffective entry — and
+                // telling aliases apart would mean reimplementing JSON unescaping. Any
+                // doubt → the print branch.
+                if depth == 1 && text[start..end].contains('\\') {
+                    return None;
+                }
+                if depth == 1 && &text[start..end] == key {
+                    let mut j = end + 1;
+                    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if j < bytes.len() && bytes[j] == b':' {
+                        if found.is_some() {
+                            return None; // duplicated key — refuse rather than guess
+                        }
+                        j += 1;
+                        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                            j += 1;
+                        }
+                        let val_end = json_value_extent(bytes, j)?;
+                        found = Some((j, val_end));
+                        i = val_end;
+                        continue;
+                    }
+                }
+                i = end + 1;
+            }
+            b'{' | b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' | b']' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return found; // the object we were scanning closed
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// End (exclusive) of the JSON value starting at `start` (first byte of the value).
+fn json_value_extent(bytes: &[u8], start: usize) -> Option<usize> {
+    match *bytes.get(start)? {
+        b'"' => scan_string(bytes, start + 1).map(|e| e + 1),
+        b'{' | b'[' => {
+            // One depth walk handles both bracket kinds; the root parse already guaranteed
+            // they are balanced and correctly paired.
+            let mut depth = 0usize;
+            let mut i = start;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'"' => i = scan_string(bytes, i + 1)? + 1,
+                    b'{' | b'[' => {
+                        depth += 1;
+                        i += 1;
+                    }
+                    b'}' | b']' => {
+                        depth = depth.checked_sub(1)?;
+                        i += 1;
+                        if depth == 0 {
+                            return Some(i);
+                        }
+                    }
+                    _ => i += 1,
+                }
+            }
+            None
+        }
+        _ => {
+            // number / true / false / null — runs to the next structural delimiter.
+            let mut i = start;
+            while i < bytes.len()
+                && !matches!(bytes[i], b',' | b'}' | b']')
+                && !bytes[i].is_ascii_whitespace()
+            {
+                i += 1;
+            }
+            (i > start).then_some(i)
+        }
+    }
+}
+
+/// `[mcp_servers.docli] url = …`, format-preserving via toml_edit.
+fn merge_codex_toml(existing: Option<&str>, url: &str) -> MergeOutcome {
+    let text = existing.map(str::trim).filter(|t| !t.is_empty());
+    let mut doc = match text {
+        None => toml_edit::DocumentMut::new(),
+        Some(t) => match t.parse::<toml_edit::DocumentMut>() {
+            Ok(d) => d,
+            Err(_) => return MergeOutcome::Occupied("does not parse as TOML".to_string()),
+        },
+    };
+    // Guard BEFORE any IndexMut: toml_edit's `doc[..]` panics when asked to index INTO a
+    // non-table value (round-3 F1) — a `docli = "…"` string or a `[[mcp_servers.docli]]`
+    // array must be handled, not unwound through `docli init`.
+    if doc.get("mcp_servers").is_some() && doc["mcp_servers"].as_table_like().is_none() {
+        return MergeOutcome::Occupied("mcp_servers is not a table".to_string());
+    }
+    if let Some(existing_entry) = doc.get("mcp_servers").and_then(|t| t.get("docli")) {
+        // «Same» under the wholesale-convergence ruling (round-3 F2): exactly the entry we
+        // would write — one `url` key with our URL. Anything else converges below.
+        let same = existing_entry
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(|u| u == url)
+            .unwrap_or(false)
+            && existing_entry.as_table_like().map(|t| t.len() == 1) == Some(true);
+        if same {
+            return MergeOutcome::AlreadyConfigured { same: true };
+        }
+    } else if doc.get("mcp_servers").is_none() {
+        let mut t = toml_edit::Table::new();
+        t.set_implicit(true);
+        doc["mcp_servers"] = toml_edit::Item::Table(t);
+    }
+    // Create or wholesale-REPLACE our entry (both adapters share this semantics — the plan's
+    // round-3 ruling). A regular table is cleared and refilled IN PLACE so its position and
+    // any comment on its `[mcp_servers.docli]` header survive; every other prior shape
+    // (string, number, array-of-tables, inline value) is replaced by assignment — which never
+    // indexes INTO the old value, so nothing here can hit toml_edit's IndexMut panic.
+    let existing_table = doc
+        .get_mut("mcp_servers")
+        .and_then(|t| t.get_mut("docli"))
+        .and_then(|i| i.as_table_mut());
+    if let Some(tbl) = existing_table {
+        tbl.clear();
+        tbl.insert("url", toml_edit::value(url));
+    } else {
+        let mut entry = toml_edit::Table::new();
+        entry["url"] = toml_edit::value(url);
+        doc["mcp_servers"]["docli"] = toml_edit::Item::Table(entry);
+    }
+    MergeOutcome::Write(doc.to_string())
+}
+
+fn merge_for(def: &AgentDef, existing: Option<&str>, url: &str) -> Option<(String, MergeOutcome)> {
+    match def.adapter {
+        McpAdapter::Json {
+            path,
+            top_key,
+            entry_shape,
+        } => {
+            let mut outcome = merge_json(existing, top_key, &entry_shape.entry(url));
+            // opencode.json is schema-anchored; give a FRESH file the $schema line so the
+            // user's editor validates it (never touch an existing file's schema).
+            if def.key == "opencode" && existing.map(str::trim).filter(|t| !t.is_empty()).is_none()
+            {
+                if let MergeOutcome::Write(_) = outcome {
+                    outcome = MergeOutcome::Write(format!(
+                        "{{\n  \"$schema\": \"https://opencode.ai/config.json\",\n  \"mcp\": {{\n    \"docli\": {}\n  }}\n}}\n",
+                        entry_shape.entry(url)
+                    ));
+                }
+            }
+            Some((path.to_string(), outcome))
+        }
+        McpAdapter::CodexToml { path } => Some((path.to_string(), merge_codex_toml(existing, url))),
+        McpAdapter::Print => None,
+    }
+}
+
+/// The copy-paste snippet for one agent (the print branch and the occupied fallback).
+/// Every embedded URL goes through the JSON string serializer (round-4 F-C — same reasoning
+/// as F0: `config.server` is untrusted committed input, and a quote in it must yield a
+/// snippet that is malformed-LOOKING at worst, never one that parses into extra keys when
+/// pasted); the Codex shell line single-quotes it.
+pub fn snippet(def: &AgentDef, url: &str) -> String {
+    // A JSON string literal (quotes included) with `url` correctly escaped.
+    let jurl = serde_json::Value::String(url.to_string()).to_string();
+    match def.adapter {
+        McpAdapter::Json {
+            path,
+            top_key,
+            entry_shape,
+        } => format!(
+            "{path}:\n  {{ \"{top_key}\": {{ \"docli\": {} }} }}",
+            entry_shape.entry(url)
+        ),
+        McpAdapter::CodexToml { path } => {
+            // TOML basic strings share JSON's escape rules for the characters that matter
+            // here (`"` and `\`), so the JSON-escaped literal is a valid TOML string too.
+            format!(
+                "{path} (or `codex mcp add docli --url '{}'` in the global config):\n  [mcp_servers.docli]\n  url = {jurl}",
+                url.replace('\'', "'\\''")
+            )
+        }
+        McpAdapter::Print => match def.key {
+            "qwen" => format!(
+                ".qwen/settings.json:\n  {{ \"mcpServers\": {{ \"docli\": {{ \"httpUrl\": {jurl} }} }} }}\n  (httpUrl, not url — url means SSE there)"
+            ),
+            "cline" => format!(
+                "Cline's MCP config is global (the extension's MCP panel / ~/.cline/mcp.json):\n  {{ \"mcpServers\": {{ \"docli\": {{ \"type\": \"streamableHttp\", \"url\": {jurl} }} }} }}"
+            ),
+            "zed" => format!(
+                "Zed settings.json (project-level placement of context_servers is undocumented — use \
+                 `zed: open settings`):\n  {{ \"context_servers\": {{ \"docli\": {{ \"source\": \"custom\", \"url\": {jurl} }} }} }}"
+            ),
+            "windsurf" => format!(
+                "Windsurf's MCP config is global (~/.codeium/windsurf/mcp_config.json):\n  {{ \"mcpServers\": {{ \"docli\": {{ \"serverUrl\": {jurl} }} }} }}"
+            ),
+            "sourcecraft" => format!(
+                ".codeassistant/mcp.json:\n  {{ \"mcpServers\": {{ \"docli\": {{ \"url\": {jurl} }} }} }}\n  (docli MCP requires a browser OAuth flow; support for it is unverified in this client — if sign-in fails, use a verified OAuth-capable client)"
+            ),
+            "junie" => format!(
+                ".junie/mcp/mcp.json:\n  {{ \"mcpServers\": {{ \"docli\": {{ \"url\": {jurl} }} }} }}\n  (docli MCP requires a browser OAuth flow; support for it is unverified in this client — if sign-in fails, use a verified OAuth-capable client)"
+            ),
+            "trae" => format!(
+                ".trae/mcp.json:\n  {{ \"mcpServers\": {{ \"docli\": {{ \"url\": {jurl} }} }} }}\n  (docli MCP requires a browser OAuth flow; support for it is unverified in this client — if sign-in fails, use a verified OAuth-capable client)"
+            ),
+            "amp" => format!(
+                ".amp/settings.json:\n  {{ \"amp.mcpServers\": {{ \"docli\": {{ \"url\": {jurl} }} }} }}"
+            ),
+            _ => format!(
+                "add a remote MCP server named \"docli\" at {url} in the agent's MCP settings"
+            ),
+        },
+    }
+}
+
+/// Apply the wiring for `selected` agent keys — genuinely BEST-EFFORT per agent: a failure on
+/// one agent (an unwritable config, an unreadable dir) is reported with its snippet and the
+/// rest proceed; `wire` itself never errors (the partial-success discipline). `labeled` gates
+/// the bare-URL fallback note: the audience fence is byte-exact, so an agent that omits RFC
+/// 8707 `resource` gets a bare-audience token the labeled route refuses — the note tells the
+/// user the escape hatch instead of leaving them at an opaque `invalid_token`.
+pub fn wire(project_root: &Path, selected: &[&AgentDef], url: &str, labeled: bool, skill_md: &str) {
+    println!("\nMCP connection URL for this project: {url}");
+    println!(
+        "(each agent authorizes itself through browser OAuth on first connection; docli \
+         writes no credential to project files)"
+    );
+    if labeled {
+        println!(
+            "(if an agent rejects this labeled URL with invalid_token, re-run with --mcp-bare \
+             for the unlabeled connection)"
+        );
+    }
+    sweep_cfg_temps(project_root, selected);
+    for def in selected {
+        if let Err(e) = wire_one(project_root, def, url) {
+            println!(
+                "  {}: FAILED ({e:#}); add by hand:\n    {}",
+                def.display,
+                snippet(def, url)
+            );
+        }
+        if let Some(dir) = def.skill_copy_dir {
+            if let Err(e) = copy_skill(project_root, dir, skill_md) {
+                println!("    {}: skill copy FAILED ({e:#})", def.display);
+            } else {
+                println!("    wrote {dir}/SKILL.md");
+            }
+        }
+    }
+}
+
+fn wire_one(project_root: &Path, def: &AgentDef, url: &str) -> Result<()> {
+    let existing = read_existing(project_root, def);
+    // An unreadable/undecodable existing file is the Occupied shape, not an abort: fold it in.
+    let (existing, read_problem) = match existing {
+        Ok(v) => (v, None),
+        Err(reason) => (None, Some(reason)),
+    };
+    let merged = merge_for(def, existing.as_deref(), url);
+    match merged {
+        Some((rel, outcome)) => {
+            let outcome = match read_problem {
+                Some(reason) => MergeOutcome::Occupied(reason),
+                None => outcome,
+            };
+            let abs = project_root.join(&rel);
+            match outcome {
+                MergeOutcome::Write(content) => {
+                    if let Some(parent) = abs.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    write_user_config(&abs, content.as_bytes())?;
+                    println!("  {}: wrote {}", def.display, rel);
+                    if def.key == "codex" {
+                        println!(
+                            "    (Codex reads project configuration only in trusted \
+                             repositories — approve the repository on first run)"
+                        );
+                    }
+                }
+                MergeOutcome::AlreadyConfigured { same: true } => {
+                    println!("  {}: {} already configured", def.display, rel);
+                }
+                MergeOutcome::AlreadyConfigured { same: false } => {
+                    println!(
+                        "  {}: {} already has a \"docli\" entry; it was left unchanged. To update it manually, use:\n    {}",
+                        def.display,
+                        rel,
+                        snippet(def, url)
+                    );
+                }
+                MergeOutcome::Occupied(reason) => {
+                    println!(
+                        "  {}: {} — {}; add by hand:\n    {}",
+                        def.display,
+                        rel,
+                        reason,
+                        snippet(def, url)
+                    );
+                }
+            }
+        }
+        None => {
+            println!("  {}:\n    {}", def.display, snippet(def, url));
+        }
+    }
+    Ok(())
+}
+
+/// Atomic write for a USER-OWNED config (round-4 F-B): same temp+rename shape as the mirror's
+/// `write_atomic`, minus the read-only bit (these are the user's files — marking them
+/// read-only would be hostile). Truncate-in-place on a `.mcp.json` would risk exactly the
+/// data the whole splice discipline exists to preserve, with no re-sync and no doctor class
+/// behind it.
+///
+/// Round-5 F1 — the rename must not change what the file IS: the write goes through the
+/// RESOLVED target (a symlinked `.mcp.json` keeps its link identity and updates the shared
+/// file behind it), and an existing target's permissions ride the temp through the swap (a
+/// `0600` config holding another server's env secret must not come back umask-default).
+/// Ownership is untouched by construction — everything here runs as the invoking user.
+/// The ONE resolution both the writer and the sweep apply (Codex round 2, finding 4 — two
+/// resolvers of one namespace drift): an existing target canonicalizes; a DANGLING symlink
+/// still is one (`exists()` follows the link), so a temporarily-absent referent (an unmounted
+/// dotfiles checkout) is reached by following `read_link` by hand — the link keeps its
+/// identity and the referent is created. Bounded walk; a cycle degrades to the literal path.
+fn resolve_config_dest(target: &Path) -> std::path::PathBuf {
+    if target.exists() {
+        return fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
+    }
+    let mut p = target.to_path_buf();
+    for _ in 0..8 {
+        match fs::read_link(&p) {
+            Ok(next) => {
+                p = if next.is_absolute() {
+                    next
+                } else {
+                    p.parent().map(|d| d.join(&next)).unwrap_or(next)
+                };
+            }
+            Err(_) => break,
+        }
+    }
+    p
+}
+
+fn write_user_config(target: &Path, bytes: &[u8]) -> Result<()> {
+    use rand::RngCore;
+    let dest = resolve_config_dest(target);
+    let existing_perms = fs::metadata(&dest).ok().map(|m| m.permissions());
+    let dir = dest
+        .parent()
+        .with_context(|| format!("no parent dir for {}", dest.display()))?;
+    let mut suffix = [0u8; 8];
+    rand::thread_rng().fill_bytes(&mut suffix);
+    let tmp = dir.join(format!(".docli-cfg-{}.tmp", hex::encode(suffix)));
+    debug_assert!(is_cfg_temp(tmp.file_name().unwrap().to_str().unwrap()));
+    let write = (|| -> Result<()> {
+        // The temp is BORN restrictive on unix (Codex round 2, finding 1): the bytes may
+        // include another server's env secret copied from a 0600 config, and creating at
+        // umask default would expose them for the write→chmod window (permanently, if the
+        // process dies inside it). The copied perms then widen it to the target's own mode.
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)
+                .with_context(|| format!("creating {}", tmp.display()))?;
+            f.write_all(bytes)
+                .with_context(|| format!("writing {}", tmp.display()))?;
+        }
+        #[cfg(not(unix))]
+        fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+        if let Some(perms) = existing_perms.clone() {
+            let _ = fs::set_permissions(&tmp, perms);
+        }
+        // Ownership must survive the inode swap too (Codex round 3): a 0640 file whose GROUP
+        // carries the read grant would silently re-group to the directory default through a
+        // rename. Reproduce uid/gid on the temp; when that is not permitted (a group the
+        // invoking user is not a member of), fall back to the inode-preserving direct write.
+        #[cfg(unix)]
+        if let Ok(md) = fs::metadata(&dest) {
+            use std::os::unix::fs::MetadataExt;
+            if std::os::unix::fs::chown(&tmp, Some(md.uid()), Some(md.gid())).is_err() {
+                fs::write(&dest, bytes).with_context(|| format!("writing {}", dest.display()))?;
+                let _ = crate::mountfs::remove_owned_file(&tmp);
+                return Ok(());
+            }
+        }
+        if fs::rename(&tmp, &dest).is_err() {
+            // The Windows share-blocked-rename shape; fall back to a direct write (which
+            // keeps the inode, so metadata is preserved trivially on this branch). The
+            // fallback IS truncate-in-place — the recorded trade (Codex round 1): when the
+            // OS forbids the swap there is no atomic option left, and this is exactly the
+            // pre-D12 semantics, reachable only on that arm. Failing the wire instead would
+            // trade a narrow crash window for a guaranteed no-write.
+            fs::write(&dest, bytes).with_context(|| format!("writing {}", dest.display()))?;
+            // The temp may CARRY the target's read-only bit (we just copied it) — removal
+            // must lift it first, the same owned-removal shape as the mirror's (round-6).
+            let _ = crate::mountfs::remove_owned_file(&tmp);
+        }
+        Ok(())
+    })();
+    if write.is_err() {
+        let _ = crate::mountfs::remove_owned_file(&tmp);
+    }
+    write
+}
+
+/// Exactly the writer's temp shape (Codex round 1: the sweep DELETES matches, so the
+/// recognizer must never be looser than the generator — the same rule the mirror's
+/// `is_write_temp` follows; a user's own `.docli-cfg-manual-backup.tmp` must survive).
+fn is_cfg_temp(name: &str) -> bool {
+    // LOWERCASE hex only (Codex round 2): `hex::encode` never emits A-F, and the sweep
+    // deletes matches — an uppercase spelling is a name the writer cannot have generated.
+    name.strip_prefix(".docli-cfg-")
+        .and_then(|r| r.strip_suffix(".tmp"))
+        .is_some_and(|h| h.len() == 16 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+}
+
+/// Best-effort cleanup of `.docli-cfg-*.tmp` strays a crashed earlier `init` may have left in
+/// the directories we are about to write into (round-5 F2 — the residue would otherwise be
+/// unowned: no doctor class runs in a user project dir, and `git add -A` would commit it).
+fn sweep_cfg_temps(project_root: &Path, selected: &[&AgentDef]) {
+    let mut dirs: Vec<std::path::PathBuf> = selected
+        .iter()
+        .filter_map(|def| match def.adapter {
+            McpAdapter::Json { path, .. } => Some(path),
+            McpAdapter::CodexToml { path } => Some(path),
+            McpAdapter::Print => None,
+        })
+        .filter_map(|rel| {
+            // The SAME resolution the writer applies (round-6 facet B; ONE fn since Codex
+            // round 2): a symlinked config — dangling included — puts the temp beside the
+            // RESOLVED target, so that is where a stale one lives.
+            resolve_config_dest(&project_root.join(rel))
+                .parent()
+                .map(|p| p.to_path_buf())
+        })
+        .collect();
+    dirs.dedup();
+    for dir in dirs {
+        let Ok(rd) = fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let n = name.to_string_lossy();
+            if is_cfg_temp(&n) {
+                // May carry a copied read-only bit — owned removal, never bare remove_file.
+                let _ = crate::mountfs::remove_owned_file(&e.path());
+            }
+        }
+    }
+}
+
+fn copy_skill(project_root: &Path, dir: &str, skill_md: &str) -> Result<()> {
+    let d = project_root.join(dir);
+    fs::create_dir_all(&d)?;
+    fs::write(d.join("SKILL.md"), skill_md)
+        .with_context(|| format!("writing {}/SKILL.md", d.display()))?;
+    Ok(())
+}
+
+/// `Err(reason)` means «a file exists there but we can't take its text» (unreadable, not
+/// UTF-8) — the caller renders it as the Occupied/print branch, never as an init failure.
+fn read_existing(
+    project_root: &Path,
+    def: &AgentDef,
+) -> std::result::Result<Option<String>, String> {
+    let rel = match def.adapter {
+        McpAdapter::Json { path, .. } => path,
+        McpAdapter::CodexToml { path } => path,
+        McpAdapter::Print => return Ok(None),
+    };
+    let abs = project_root.join(rel);
+    if !abs.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&abs).map_err(|e| format!("could not read it ({e})"))?;
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| "it is not UTF-8 text".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const URL: &str = "https://docli.ru/api/mcp/c/myproj";
+
+    // ---- label derivation ----
+
+    #[test]
+    fn sanitized_labels_always_satisfy_the_shared_grammar() {
+        for name in [
+            "My Docs",
+            "докли",
+            "a__b.c",
+            "ПРОЕКТ-docs",
+            "--x--",
+            "",
+            "___",
+            &"x".repeat(200),
+            "Ж",
+        ] {
+            let label = sanitize_label(name);
+            assert!(
+                docli_rules::valid_label(&label),
+                "{name:?} -> {label:?} must be grammar-valid"
+            );
+        }
+        assert_eq!(sanitize_label("My Docs"), "my-docs");
+        assert_eq!(sanitize_label("a__b.c"), "a-b-c");
+        assert_eq!(sanitize_label("ПРОЕКТ-docs"), "docs");
+        // Nothing survives the ASCII grammar → a per-name hash fallback: two RU-named
+        // projects must NOT share one connection (R3 — the common case, not an edge).
+        assert!(sanitize_label("докли").starts_with("project-"));
+        assert_ne!(sanitize_label("докли"), sanitize_label("заметки"));
+        assert_eq!(
+            sanitize_label("докли"),
+            sanitize_label("докли"),
+            "deterministic"
+        );
+        assert_eq!(sanitize_label(&"x".repeat(200)).len(), 64);
+    }
+
+    #[test]
+    fn connection_url_joins_without_double_slash() {
+        assert_eq!(
+            connection_url("https://docli.ru/", "x"),
+            "https://docli.ru/api/mcp/c/x"
+        );
+    }
+
+    // ---- JSON merges ----
+
+    #[test]
+    fn fresh_file_is_created_with_the_top_key() {
+        let entry = JsonShape::TypeHttpUrl.entry(URL);
+        let MergeOutcome::Write(out) = merge_json(None, "mcpServers", &entry) else {
+            panic!("fresh file must write");
+        };
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["mcpServers"]["docli"]["type"], "http");
+        assert_eq!(v["mcpServers"]["docli"]["url"], URL);
+    }
+
+    #[test]
+    fn merge_preserves_the_users_text_verbatim_outside_the_splice() {
+        // Weird-but-valid formatting the splice must not normalize away.
+        let existing = "{\n    \"mcpServers\": {\n        \"other\": {\"command\":\"x\"}\n    },\n    \"unrelated\":  [1,2 , 3]\n}";
+        let entry = JsonShape::TypeHttpUrl.entry(URL);
+        let MergeOutcome::Write(out) = merge_json(Some(existing), "mcpServers", &entry) else {
+            panic!("must merge");
+        };
+        // Both entries present and parseable…
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["mcpServers"]["docli"]["url"], URL);
+        assert_eq!(v["mcpServers"]["other"]["command"], "x");
+        // …and the untouched regions survive byte-for-byte (the odd spacing included).
+        assert!(out.contains("\"unrelated\":  [1,2 , 3]"));
+        assert!(out.contains("\"other\": {\"command\":\"x\"}"));
+    }
+
+    #[test]
+    fn merge_creates_the_top_key_when_absent() {
+        let existing = r#"{ "$schema": "https://opencode.ai/config.json", "theme": "dark" }"#;
+        let entry = JsonShape::OpencodeRemote.entry(URL);
+        let MergeOutcome::Write(out) = merge_json(Some(existing), "mcp", &entry) else {
+            panic!("must merge");
+        };
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["mcp"]["docli"]["type"], "remote");
+        assert_eq!(v["theme"], "dark");
+        assert!(out.contains("\"theme\": \"dark\""), "user text preserved");
+    }
+
+    #[test]
+    fn our_entry_present_and_identical_is_a_no_op() {
+        // Deliberate round-2 contract change (R2): an IDENTICAL entry is left alone; a
+        // DIFFERENT one is updated in place (covered by
+        // a_rerun_with_a_different_url_updates_our_entry_and_nothing_else) — never duplicated.
+        let same =
+            format!(r#"{{ "mcpServers": {{ "docli": {{ "type": "http", "url": "{URL}" }} }} }}"#);
+        let entry = JsonShape::TypeHttpUrl.entry(URL);
+        assert_eq!(
+            merge_json(Some(&same), "mcpServers", &entry),
+            MergeOutcome::AlreadyConfigured { same: true }
+        );
+    }
+
+    #[test]
+    fn jsonc_and_non_object_shapes_fall_to_print_not_error() {
+        let entry = JsonShape::TypeHttpUrl.entry(URL);
+        for bad in [
+            "// vscode-style comment\n{ \"servers\": {} }",
+            "[1,2,3]",
+            "{ \"mcpServers\": [] }",
+            "not json at all",
+        ] {
+            assert!(
+                matches!(
+                    merge_json(Some(bad), "mcpServers", &entry),
+                    MergeOutcome::Occupied(_)
+                ) || matches!(
+                    merge_json(Some(bad), "servers", &entry),
+                    MergeOutcome::Occupied(_)
+                ),
+                "{bad:?} must fall to the print branch"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_same_named_key_does_not_fool_the_splicer() {
+        // A DEEPER "mcpServers" appears first in the text; the splicer must find the depth-1 one.
+        let existing = r#"{ "profiles": { "mcpServers": { "decoy": 1 } }, "mcpServers": { "other": { "url": "u" } } }"#;
+        let entry = JsonShape::UrlOnly.entry(URL);
+        let MergeOutcome::Write(out) = merge_json(Some(existing), "mcpServers", &entry) else {
+            panic!("must merge");
+        };
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["mcpServers"]["docli"]["url"], URL);
+        assert_eq!(v["profiles"]["mcpServers"]["decoy"], 1, "decoy untouched");
+        assert!(v["profiles"]["mcpServers"].get("docli").is_none());
+    }
+
+    #[test]
+    fn braces_inside_strings_do_not_break_depth_tracking() {
+        let existing = r#"{ "note": "{ not a real { object [", "mcpServers": {} }"#;
+        let entry = JsonShape::HttpUrl.entry(URL);
+        let MergeOutcome::Write(out) = merge_json(Some(existing), "mcpServers", &entry) else {
+            panic!("must merge");
+        };
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["mcpServers"]["docli"]["httpUrl"], URL);
+    }
+
+    #[test]
+    fn gemini_and_vscode_spellings_are_exact() {
+        // The two easy-to-get-wrong shapes, pinned: Gemini takes httpUrl (url = SSE), and
+        // VS Code's top-level key is "servers", not "mcpServers".
+        assert_eq!(
+            JsonShape::HttpUrl.entry_value(URL),
+            serde_json::json!({"httpUrl": URL})
+        );
+        let vscode = AGENTS.iter().find(|a| a.key == "vscode").unwrap();
+        let McpAdapter::Json { top_key, .. } = vscode.adapter else {
+            panic!("vscode is a JSON adapter");
+        };
+        assert_eq!(top_key, "servers");
+    }
+
+    #[test]
+    fn opencode_fresh_file_carries_the_schema_anchor() {
+        let def = AGENTS.iter().find(|a| a.key == "opencode").unwrap();
+        let (_, outcome) = merge_for(def, None, URL).unwrap();
+        let MergeOutcome::Write(out) = outcome else {
+            panic!("fresh write");
+        };
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["$schema"], "https://opencode.ai/config.json");
+        assert_eq!(v["mcp"]["docli"]["enabled"], true);
+    }
+
+    // ---- Codex TOML ----
+
+    #[test]
+    fn codex_toml_fresh_and_merge_preserve_user_content() {
+        let MergeOutcome::Write(fresh) = merge_codex_toml(None, URL) else {
+            panic!("fresh write");
+        };
+        assert!(fresh.contains("[mcp_servers.docli]"));
+        assert!(fresh.contains(&format!("url = \"{URL}\"")));
+
+        let existing =
+            "# my codex settings\nmodel = \"gpt-5\"\n\n[mcp_servers.other]\ncommand = \"x\"\n";
+        let MergeOutcome::Write(out) = merge_codex_toml(Some(existing), URL) else {
+            panic!("must merge");
+        };
+        assert!(out.contains("# my codex settings"), "comment preserved");
+        assert!(out.contains("model = \"gpt-5\""));
+        assert!(out.contains("[mcp_servers.other]"));
+        assert!(out.contains("[mcp_servers.docli]"));
+    }
+
+    #[test]
+    fn codex_toml_identical_entry_is_a_no_op_and_bad_toml_prints() {
+        let same = format!("[mcp_servers.docli]\nurl = \"{URL}\"\n");
+        assert_eq!(
+            merge_codex_toml(Some(&same), URL),
+            MergeOutcome::AlreadyConfigured { same: true }
+        );
+        assert!(matches!(
+            merge_codex_toml(Some("not = [valid"), URL),
+            MergeOutcome::Occupied(_)
+        ));
+    }
+
+    // ---- detection ----
+
+    #[test]
+    fn detection_reads_project_and_home_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("p");
+        let home = tmp.path().join("h");
+        fs::create_dir_all(project.join(".cursor")).unwrap();
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        let detected = detect(&project, Some(&home));
+        assert!(detected.contains(&"cursor"), "project marker");
+        assert!(detected.contains(&"codex"), "home marker");
+        assert!(!detected.contains(&"gemini"));
+        assert_eq!(detect(&project, None), vec!["cursor"]);
+        // Codex round 3: a DANGLING symlink marker still detects.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(project.join("nowhere.json"), project.join(".mcp.json"))
+                .unwrap();
+            assert!(
+                detect(&project, None).contains(&"claude"),
+                "dangling marker"
+            );
+        }
+    }
+
+    // ---- wire() end to end ----
+
+    #[test]
+    fn wire_writes_selected_adapters_and_copies_off_standard_skills() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(
+            root.join(".mcp.json"),
+            r#"{ "mcpServers": { "other": { "command": "x" } } }"#,
+        )
+        .unwrap();
+        let selected: Vec<&AgentDef> = ["claude", "codex", "qwen"]
+            .iter()
+            .map(|k| agent(k).unwrap())
+            .collect();
+        wire(root, &selected, URL, true, "SKILLBODY");
+
+        let mcp: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(root.join(".mcp.json")).unwrap()).unwrap();
+        assert_eq!(mcp["mcpServers"]["docli"]["url"], URL);
+        assert_eq!(mcp["mcpServers"]["other"]["command"], "x");
+
+        let codex = fs::read_to_string(root.join(".codex/config.toml")).unwrap();
+        assert!(codex.contains("[mcp_servers.docli]"));
+
+        // Qwen: no MCP file written (print-only), but the off-standard skill copy lands.
+        assert!(!root.join(".qwen/settings.json").exists());
+        assert_eq!(
+            fs::read_to_string(root.join(".qwen/skills/docli-mirror/SKILL.md")).unwrap(),
+            "SKILLBODY"
+        );
+    }
+
+    #[test]
+    fn wire_never_writes_a_credential_or_token_field() {
+        // The no-credential pin (D12.4): everything any adapter can ever write derives from
+        // the URL alone. Generate every write outcome and scan for credential-shaped keys.
+        let tmp = tempfile::tempdir().unwrap();
+        let selected: Vec<&AgentDef> = AGENTS.iter().collect();
+        wire(tmp.path(), &selected, URL, true, "S");
+        for entry in walkdir(tmp.path()) {
+            let body = fs::read_to_string(&entry)
+                .unwrap_or_default()
+                .to_lowercase();
+            for needle in ["token", "authorization", "bearer", "secret", "password"] {
+                assert!(
+                    !body.contains(needle),
+                    "{} must not carry {needle}",
+                    entry.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_rerun_with_a_different_url_updates_our_entry_and_nothing_else() {
+        // R2: --mcp-bare (or a label change) must converge the config, not print a no-op.
+        let existing = r#"{
+    "mcpServers": {
+        "other": {"command":"x"},
+        "docli": { "type": "http", "url": "https://docli.ru/api/mcp/c/old-label" }
+    },
+    "unrelated":  [1,2 , 3]
+}"#;
+        let entry = JsonShape::TypeHttpUrl.entry(URL);
+        let MergeOutcome::Write(out) = merge_json(Some(existing), "mcpServers", &entry) else {
+            panic!("must update in place");
+        };
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["mcpServers"]["docli"]["url"], URL);
+        assert_eq!(v["mcpServers"]["other"]["command"], "x");
+        assert!(
+            out.contains("\"unrelated\":  [1,2 , 3]"),
+            "user text preserved"
+        );
+        assert!(!out.contains("old-label"));
+
+        // Same convergence for the TOML adapter, comments preserved.
+        let toml_existing =
+            "# mine\n[mcp_servers.docli]\nurl = \"https://docli.ru/api/mcp/c/old\"\n";
+        let MergeOutcome::Write(out) = merge_codex_toml(Some(toml_existing), URL) else {
+            panic!("must update in place");
+        };
+        assert!(out.contains("# mine"));
+        assert!(out.contains(&format!("url = \"{URL}\"")));
+        assert!(!out.contains("/c/old\""));
+
+        // A hand-edited NON-OBJECT docli value still gets replaced cleanly.
+        let weird = r#"{ "mcpServers": { "docli": "hand-edited" } }"#;
+        let MergeOutcome::Write(out) = merge_json(Some(weird), "mcpServers", &entry) else {
+            panic!("must update in place");
+        };
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["mcpServers"]["docli"]["url"], URL);
+    }
+
+    #[test]
+    fn json_metacharacters_in_the_server_cannot_break_or_extend_the_entry() {
+        // Round-3 F0: config.server is committed, shared, and validated by nobody — a quote
+        // in it must stay INSIDE the url string, never mint a sibling key in a teammate's
+        // config and never panic init.
+        let evil = r#"https://e.ru", "command": "curl evil"#;
+        let url = connection_url(evil, "x");
+        let entry = JsonShape::TypeHttpUrl.entry(&url);
+        let v: serde_json::Value = serde_json::from_str(&entry).unwrap();
+        assert_eq!(v["url"], url);
+        assert!(v.get("command").is_none());
+        let MergeOutcome::Write(out) = merge_json(None, "mcpServers", &entry) else {
+            panic!("must write");
+        };
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["mcpServers"]["docli"]["url"], url);
+        assert!(v["mcpServers"]["docli"].get("command").is_none());
+    }
+
+    #[test]
+    fn codex_toml_weird_docli_shapes_replace_instead_of_panicking() {
+        // Round-3 F1: toml_edit IndexMut panics when indexing INTO a non-table — every prior
+        // shape of our key must converge to the fresh entry instead.
+        for weird in [
+            "[mcp_servers]\ndocli = \"https://old\"\n",
+            "mcp_servers = { docli = 5 }\n",
+            "[[mcp_servers.docli]]\nurl = \"x\"\n",
+        ] {
+            let MergeOutcome::Write(out) = merge_codex_toml(Some(weird), URL) else {
+                panic!("{weird:?} must converge");
+            };
+            let parsed: toml_edit::DocumentMut = out.parse().unwrap();
+            assert_eq!(
+                parsed["mcp_servers"]["docli"]["url"].as_str(),
+                Some(URL),
+                "{weird:?} -> {out}"
+            );
+        }
+        // The wholesale-convergence ruling: a user-augmented entry is REPLACED, not merged —
+        // grafting our url onto a stdio shim would produce a mixed entry no client accepts.
+        let aug = "[mcp_servers.docli]\ncommand = \"npx\"\nurl = \"https://old\"\n";
+        let MergeOutcome::Write(out) = merge_codex_toml(Some(aug), URL) else {
+            panic!("must converge");
+        };
+        assert!(!out.contains("command"), "wholesale replace: {out}");
+        assert!(out.contains(&format!("url = \"{URL}\"")));
+    }
+
+    #[test]
+    fn write_user_config_swaps_atomically_and_preserves_what_the_file_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Fresh file: plain create, no temp residue.
+        let fresh = tmp.path().join("fresh.json");
+        write_user_config(&fresh, b"{}").unwrap();
+        assert_eq!(fs::read(&fresh).unwrap(), b"{}");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Round-5 F1a: a 0600 config (another server's env secret) stays 0600.
+            let secret = tmp.path().join("secret.json");
+            fs::write(&secret, b"old").unwrap();
+            fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+            write_user_config(&secret, b"new").unwrap();
+            assert_eq!(fs::read(&secret).unwrap(), b"new");
+            assert_eq!(
+                fs::metadata(&secret).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+
+            // Round-5 F1b: a symlinked config keeps its link identity; the write lands in
+            // the shared file behind it — which lives in a DIFFERENT directory, so this
+            // also proves the temp goes beside the RESOLVED target (round-6 facet B).
+            let shared_dir = tmp.path().join("dotfiles");
+            fs::create_dir_all(&shared_dir).unwrap();
+            let shared = shared_dir.join("shared.json");
+            fs::write(&shared, b"shared-old").unwrap();
+            let link = tmp.path().join("link.json");
+            std::os::unix::fs::symlink(&shared, &link).unwrap();
+            write_user_config(&link, b"through-the-link").unwrap();
+            assert!(fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(fs::read(&shared).unwrap(), b"through-the-link");
+            let link_strays: Vec<_> = fs::read_dir(&shared_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().starts_with(".docli-cfg-"))
+                .collect();
+            assert!(
+                link_strays.is_empty(),
+                "temp beside the resolved target: {link_strays:?}"
+            );
+        }
+
+        // No temp residue anywhere after the writes.
+        let strays: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".docli-cfg-"))
+            .collect();
+        assert!(strays.is_empty(), "{strays:?}");
+    }
+
+    #[test]
+    fn wire_sweeps_stale_cfg_temps_from_the_dirs_it_writes() {
+        // Round-5 F2: a crashed earlier init's residue is collected on the next wiring run —
+        // READ-ONLY residue included (round-6 facet A: the temp may carry a copied
+        // read-only bit, and removal lifts it first).
+        let tmp = tempfile::tempdir().unwrap();
+        let stray = tmp.path().join(".docli-cfg-deadbeefdeadbeef.tmp");
+        fs::write(&stray, b"partial").unwrap();
+        let mut p = fs::metadata(&stray).unwrap().permissions();
+        p.set_readonly(true);
+        fs::set_permissions(&stray, p).unwrap();
+        wire(tmp.path(), &[agent("claude").unwrap()], URL, true, "S");
+        assert!(!stray.exists(), "wire must sweep its own stale temps");
+
+        // Round-6 facet B: with a SYMLINKED config, the sweep visits the resolved dir.
+        #[cfg(unix)]
+        {
+            let shared_dir = tmp.path().join("dotfiles");
+            fs::create_dir_all(&shared_dir).unwrap();
+            fs::write(shared_dir.join("mcp.json"), "{}").unwrap();
+            // Replace the .mcp.json wire() just wrote with a symlink into dotfiles/.
+            fs::remove_file(tmp.path().join(".mcp.json")).unwrap();
+            std::os::unix::fs::symlink(shared_dir.join("mcp.json"), tmp.path().join(".mcp.json"))
+                .unwrap();
+            let resolved_stray = shared_dir.join(".docli-cfg-feedfacefeedface.tmp");
+            fs::write(&resolved_stray, b"partial").unwrap();
+            wire(tmp.path(), &[agent("claude").unwrap()], URL, true, "S");
+            assert!(
+                !resolved_stray.exists(),
+                "the sweep must visit the RESOLVED dir"
+            );
+
+            // Codex round 2 (finding 4): the sweep resolves DANGLING links the same way the
+            // writer does — a stale temp beside a missing referent is still collected.
+            let dangle_dir = tmp.path().join("dotfiles2");
+            fs::create_dir_all(&dangle_dir).unwrap();
+            fs::remove_file(tmp.path().join(".mcp.json")).unwrap();
+            std::os::unix::fs::symlink(
+                dangle_dir.join("missing.json"),
+                tmp.path().join(".mcp.json"),
+            )
+            .unwrap();
+            let dangle_stray = dangle_dir.join(".docli-cfg-0123456789abcdef.tmp");
+            fs::write(&dangle_stray, b"partial").unwrap();
+            wire(tmp.path(), &[agent("claude").unwrap()], URL, true, "S");
+            assert!(!dangle_stray.exists(), "dangling-link dirs are swept too");
+            assert!(
+                fs::symlink_metadata(tmp.path().join(".mcp.json"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "the dangling link kept its identity through the write"
+            );
+        }
+    }
+
+    #[test]
+    fn escaped_key_aliases_refuse_the_merge_instead_of_editing_the_loser() {
+        // Codex round 1 (finding 4): a key spelled with a JSON unicode escape (u0064 = 'd')
+        // unescapes to "docli" — serde keeps the LAST duplicate, a plain-spelling splice
+        // would edit the FIRST. Any escaped key at the scanned depth must refuse to the
+        // print branch. The escapes are constructed at runtime so no toolchain in between
+        // can silently decode them out of the source.
+        let bs = char::from(92u8);
+        let aliased = format!(
+            r#"{{ "mcpServers": {{ "docli": {{"url":"old1"}}, "{bs}u0064ocli": {{"url":"old2"}} }} }}"#
+        );
+        let entry = JsonShape::UrlOnly.entry(URL);
+        // Prove the premise: serde parses BOTH spellings as one key, last wins.
+        let parsed: serde_json::Value = serde_json::from_str(&aliased).unwrap();
+        assert_eq!(parsed["mcpServers"]["docli"]["url"], "old2");
+        let out = merge_json(Some(&aliased), "mcpServers", &entry);
+        assert!(
+            !matches!(out, MergeOutcome::Write(_)),
+            "must not write over an aliased duplicate: {out:?}"
+        );
+        // Same guard one level up: an escaped depth-1 alias of the TOP key (u006d = 'm').
+        let top_aliased = format!(
+            r#"{{ "mcpServers": {{ "a": 1 }}, "{bs}u006dcpServers": {{ "docli": {{"url":"x"}} }} }}"#
+        );
+        assert!(
+            !matches!(
+                merge_json(Some(&top_aliased), "mcpServers", &entry),
+                MergeOutcome::Write(_)
+            ),
+            "top-level aliases refuse too"
+        );
+    }
+
+    #[test]
+    fn cfg_sweep_spares_user_files_that_merely_share_the_prefix() {
+        // Codex round 1 (finding 2): the sweep deletes matches, so the recognizer is the
+        // writer's exact 16-hex shape — a hand-named backup survives.
+        let tmp = tempfile::tempdir().unwrap();
+        let user_file = tmp.path().join(".docli-cfg-manual-backup.tmp");
+        fs::write(&user_file, b"the user's own file").unwrap();
+        wire(tmp.path(), &[agent("claude").unwrap()], URL, true, "S");
+        assert!(
+            user_file.exists(),
+            "non-16-hex names are not ours to delete"
+        );
+        assert!(is_cfg_temp(".docli-cfg-00112233445566aa.tmp"));
+        assert!(!is_cfg_temp(".docli-cfg-manual-backup.tmp"));
+        // Uppercase hex is a name the writer can't generate (Codex round 2).
+        assert!(!is_cfg_temp(".docli-cfg-DEADBEEFDEADBEEF.tmp"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_keeps_its_identity_and_gets_its_referent_created() {
+        // Codex round 1 (finding 3): exists() follows links, so a dangling .mcp.json link
+        // must not be replaced by a regular file — the referent is created instead.
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("dotfiles/mcp.json");
+        fs::create_dir_all(missing.parent().unwrap()).unwrap();
+        let link = tmp.path().join(".mcp.json");
+        std::os::unix::fs::symlink(&missing, &link).unwrap();
+        assert!(!link.exists(), "dangling: exists() follows the link");
+        write_user_config(&link, b"{}").unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link survives"
+        );
+        assert_eq!(
+            fs::read(&missing).unwrap(),
+            b"{}",
+            "the referent was created"
+        );
+    }
+
+    #[test]
+    fn snippets_escape_metacharacter_urls_too() {
+        // Round-4 F-C: F0 applied to what is PRINTED for the user to paste, not only what is
+        // written. Every JSON-shaped snippet must still parse with the url intact.
+        let evil = connection_url(r#"https://e.ru", "command": "curl evil"#, "x");
+        for def in AGENTS {
+            let snip = snippet(def, &evil);
+            // Extract each `{ ... }` JSON body line and prove it parses with our url inside.
+            for line in snip.lines().filter(|l| l.trim_start().starts_with('{')) {
+                let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap_or_else(|e| {
+                    panic!("{}: unparseable snippet line {line:?}: {e}", def.key)
+                });
+                assert!(
+                    line.contains("e.ru"),
+                    "{}: url missing from {line:?}",
+                    def.key
+                );
+                assert!(v.is_object());
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_depth1_keys_refuse_the_splice() {
+        // serde_json keeps the LAST duplicate; a first-match splice would edit the ignored
+        // object. The walker refuses instead (Occupied → the print branch).
+        let dup = r#"{ "mcpServers": { "a": 1 }, "mcpServers": { "b": 2 } }"#;
+        let entry = JsonShape::UrlOnly.entry(URL);
+        assert!(matches!(
+            merge_json(Some(dup), "mcpServers", &entry),
+            MergeOutcome::Occupied(_)
+        ));
+    }
+
+    #[test]
+    fn non_utf8_existing_config_prints_instead_of_failing_init() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join(".mcp.json"), [0xFF, 0xFE, 0x00, 0x80]).unwrap();
+        let selected = vec![agent("claude").unwrap()];
+        // Best-effort: wire() must not panic/error, and must not touch the bytes.
+        wire(tmp.path(), &selected, URL, true, "S");
+        assert_eq!(
+            fs::read(tmp.path().join(".mcp.json")).unwrap(),
+            [0xFF, 0xFE, 0x00, 0x80]
+        );
+    }
+
+    #[test]
+    fn bare_url_and_every_named_agent_has_a_specific_snippet() {
+        assert_eq!(
+            connection_url_bare("https://docli.ru/"),
+            "https://docli.ru/api/mcp"
+        );
+        // EVERY print-only agent in the TABLE renders a snippet naming its config surface —
+        // iterating AGENTS (not a hand list) so a new entry can't silently fall to the
+        // generic arm, which is reserved for genuinely unlisted agents.
+        for def in AGENTS {
+            let snip = snippet(def, URL);
+            assert!(snip.contains(URL), "{}: {snip}", def.key);
+            assert!(
+                !snip.starts_with("add a remote MCP server"),
+                "{} fell to the generic arm",
+                def.key
+            );
+        }
+    }
+
+    fn walkdir(dir: &Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        if let Ok(rd) = fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    out.extend(walkdir(&p));
+                } else {
+                    out.push(p);
+                }
+            }
+        }
+        out
+    }
+}

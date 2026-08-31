@@ -1,0 +1,72 @@
+[
+  {
+    "input": "Быстрые.md",
+    "ci": "быстрые.md",
+    "cs": "Быстрые.md"
+  },
+  {
+    "input": "йога.md",
+    "ci": "йога.md",
+    "cs": "йога.md"
+  },
+  {
+    "input": "Ёлка.md",
+    "ci": "ёлка.md",
+    "cs": "Ёлка.md"
+  },
+  {
+    "input": "Ёлка.md",
+    "ci": "ёлка.md",
+    "cs": "Ёлка.md"
+  },
+  {
+    "input": "CAFÉ.md",
+    "ci": "café.md",
+    "cs": "CAFÉ.md"
+  },
+  {
+    "input": "Straße.md",
+    "ci": "straße.md",
+    "cs": "Straße.md"
+  },
+  {
+    "input": "ẞ.md",
+    "ci": "ß.md",
+    "cs": "ẞ.md"
+  },
+  {
+    "input": "İstanbul.md",
+    "ci": "i̇stanbul.md",
+    "cs": "İstanbul.md"
+  },
+  {
+    "input": "MiXeD/Папка/File.MD",
+    "ci": "mixed/папка/file.md",
+    "cs": "MiXeD/Папка/File.MD"
+  },
+  {
+    "input": "ﬁle.md",
+    "ci": "ﬁle.md",
+    "cs": "ﬁle.md"
+  },
+  {
+    "input": "ｆｕｌｌwidth.md",
+    "ci": "ｆｕｌｌwidth.md",
+    "cs": "ｆｕｌｌwidth.md"
+  },
+  {
+    "input": "ΟΔΟΣ.md",
+    "ci": "οδοσ.md",
+    "cs": "ΟΔΟΣ.md"
+  },
+  {
+    "input": "Ας.md",
+    "ci": "ασ.md",
+    "cs": "Ας.md"
+  },
+  {
+    "input": "ς.md",
+    "ci": "σ.md",
+    "cs": "ς.md"
+  }
+]
