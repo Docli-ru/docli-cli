@@ -37,14 +37,14 @@ pub struct SyncOptions {
     pub full: bool,
 }
 
-/// The no-access refusal (D4): the AUTHOR's mount name, «попросите доступ» — and the word
-/// «токен» must not appear in this branch (pinned by a copy test; the publish-substring-ban
+/// The no-access refusal (D4): the AUTHOR's mount name, «ask the owner» — and the word
+/// «token» must not appear in this branch (pinned by a copy test; the publish-substring-ban
 /// precedent). Designation without authority: the config NAMES the workspace, login state
 /// decides reach.
 pub fn no_access_message(mount_name: &str) -> String {
     format!(
-        "нет доступа к «{mount_name}» — попросите доступ у владельца пространства \
-         (монтирование пропущено, остальные продолжают работать)"
+        "no access to `{mount_name}` - ask the workspace owner to share it with you \
+         (this mount was skipped; the others carry on)"
     )
 }
 
@@ -55,11 +55,11 @@ pub fn rollback_warning(ws: Uuid) -> String {
     format!(
         "the server did not honor ephemeral sync for workspace {ws}: a head-reaching page came \
          back without the live-node count. This CLI's pulls are being REGISTERED as a sync \
-         device (one hidden sync_clients row per pulled workspace — not visible in «Доступ», \
+         device (one hidden sync_clients row per pulled workspace - not visible in Access, \
          and revoking the OAuth connection does not clear it). Stopping before persisting this \
          cycle. Fix: redeploy a v0.28.0+ API; the stray row ages out of the purge horizon on \
-         its own after 30 days (the trash panel's «deletes after device sync» badge disappears \
-         when the row expires) — the only faster path is operator SQL."
+         its own after 30 days (the trash panel's `deletes after device sync` badge disappears \
+         when the row expires) - the only faster path is operator SQL."
     )
 }
 
@@ -71,7 +71,16 @@ fn now_unix() -> i64 {
 }
 
 pub fn run(project: &Project, api: &Api, opts: &SyncOptions) -> Result<i32> {
-    validate_geometry(&project.root, &project.config)?;
+    if let Err(e) = validate_geometry(&project.root, &project.config) {
+        // A missing `.gitignore` line is the one geometry failure with a one-keystroke fix;
+        // offer it, then re-validate so every OTHER geometry rule still refuses as before.
+        // `--check` is the scripted freshness gate (agents branch on its exit code): it must
+        // answer, never ask. The offer is for a person running a plain `docli sync`.
+        if opts.check || !crate::wizard::offer_missing_ignores(&project.root, &project.config)? {
+            return Err(e);
+        }
+        validate_geometry(&project.root, &project.config)?;
+    }
     let rules = FsRules::native();
     let control = ControlRoot::new(&project.root);
     std::fs::create_dir_all(&control.dir).context("creating .docli/")?;
@@ -87,8 +96,7 @@ pub fn run(project: &Project, api: &Api, opts: &SyncOptions) -> Result<i32> {
                     worst_exit = worst_exit.max(1);
                 } else if e.downcast_ref::<NotEntitled>().is_some() {
                     eprintln!(
-                        "«{}»: синхронизация не включена для вашего аккаунта — монтирование \
-                         пропущено",
+                        "`{}`: sync is not enabled for your account - mount skipped",
                         mount.display_name()
                     );
                     worst_exit = worst_exit.max(1);
@@ -263,7 +271,7 @@ fn sync_mount(
     }
     if let Some(reason) = invalidator(&state, mount, &handle.root, control) {
         if opts.check {
-            eprintln!("{}: stale — {reason}", mount.display_name());
+            crate::ui::warn(&format!("{}: stale - {reason}", mount.display_name()));
             // Make the pending repair durable + visible exactly as a sync would.
             state.from_zero = true;
             persist_incomplete(control, &handle, ws, &state)?;
@@ -295,10 +303,10 @@ fn sync_mount(
                 swept += crate::mountfs::sweep_write_temps(&ws_markers);
             }
             if swept > 0 {
-                println!(
+                crate::ui::detail(&format!(
                     "{}: removed interrupted-write temporary files: {swept}",
                     mount.display_name()
-                );
+                ));
             }
             from_zero_sync(api, control, &handle, rules, mount, &mut state)?;
             break;
@@ -320,27 +328,37 @@ fn report(mount: &Mount, state: &WsState) {
         .filter(|p| p.class == ParkClass::Structural)
         .collect();
     let transient = state.parks.len() - structural.len();
-    print!(
-        "{}: узлов в зеркале: {}",
+    // One line per mount, then the caveats as indented details: a single run-on sentence made
+    // the difference between «синхронизировано» and «синхронизировано, но три вещи требуют
+    // внимания» invisible.
+    let clean = transient == 0 && state.pending_removals.is_empty() && structural.is_empty();
+    let head = format!(
+        "{}: {} in the mirror",
         mount.display_name(),
-        state.nodes.len()
+        crate::ui::plural(state.nodes.len(), "node", "nodes")
     );
+    if clean {
+        crate::ui::ok(&head);
+        return;
+    }
+    crate::ui::warn(&head);
     if transient > 0 {
-        print!(", временно отложено: {transient} — см. `docli sync --check`");
+        crate::ui::detail(&format!(
+            "parked for now: {transient} - details: docli sync --check"
+        ));
     }
     if !state.pending_removals.is_empty() {
-        print!(
-            ", удаление каталогов заблокировано посторонним содержимым: {} — см. `docli sync --check`",
+        crate::ui::detail(&format!(
+            "directory removals blocked by unrelated content: {} - docli sync --check",
             state.pending_removals.len()
-        );
+        ));
     }
     if !structural.is_empty() {
-        print!(
-            ", структурных конфликтов: {} — см. `docli doctor`",
+        crate::ui::detail(&format!(
+            "structural conflicts: {} - docli doctor",
             structural.len()
-        );
+        ));
     }
-    println!();
 }
 
 /// One incremental resume-to-head. Returns `false` when a count mismatch flagged from-zero
@@ -353,8 +371,29 @@ fn incremental_sync(
     mount: &Mount,
     state: &mut WsState,
 ) -> Result<bool> {
+    // A pull of a large workspace is many round-trips; with nothing on screen it reads as a
+    // hang. The counter is in-place and silent off a terminal (see `ui::Progress`).
+    let progress = crate::ui::Progress::new(mount.display_name());
+    let result = incremental_pages(api, control, handle, rules, mount, state, &progress);
+    progress.finish();
+    result
+}
+
+fn incremental_pages(
+    api: &Api,
+    control: &ControlRoot,
+    handle: &MountHandle,
+    rules: &FsRules,
+    mount: &Mount,
+    state: &mut WsState,
+    progress: &crate::ui::Progress,
+) -> Result<bool> {
     let ws = mount.workspace;
     loop {
+        progress.set(&format!(
+            "received: {}",
+            crate::ui::plural(state.nodes.len(), "node", "nodes")
+        ));
         let req = ephemeral_request(ws, state.cursor, state.epoch, PAGE_LIMIT);
         let resp = match api.pull(&req)? {
             Ok(r) => r,
@@ -410,7 +449,7 @@ fn incremental_sync(
                 state.from_zero = true;
                 persist_incomplete(control, handle, ws, state)?;
                 eprintln!(
-                    "{}: server live-node count {live} != mirror ledger {} — a hard delete was \
+                    "{}: server live-node count {live} != mirror ledger {} - a hard delete was \
                      missed; running a full resync",
                     mount.display_name(),
                     state.ledger.len()
@@ -520,6 +559,24 @@ fn from_zero_sync(
     mount: &Mount,
     state: &mut WsState,
 ) -> Result<()> {
+    // The progress line is cleared on EVERY exit path, including the four early returns inside
+    // the replay — a half-drawn counter with the summary appended to it is the bug this
+    // wrapper exists to prevent.
+    let progress = crate::ui::Progress::new(mount.display_name());
+    let result = from_zero_pages(api, control, handle, rules, mount, state, &progress);
+    progress.finish();
+    result
+}
+
+fn from_zero_pages(
+    api: &Api,
+    control: &ControlRoot,
+    handle: &MountHandle,
+    rules: &FsRules,
+    mount: &Mount,
+    state: &mut WsState,
+    progress: &crate::ui::Progress,
+) -> Result<()> {
     let ws = mount.workspace;
     // The flag is durable and visible BEFORE any work (an interrupted from-zero must fail
     // `--check` — it re-writes the same paths, so cursor and counts would look healthy).
@@ -545,7 +602,7 @@ fn from_zero_sync(
             // the exact self-healing event the mid-replay arm below already absorbs — the
             // durable flag stays set, the next run replays against the new epoch.
             eprintln!(
-                "{}: the workspace was resynced mid-replay — the repair stays pending; \
+                "{}: the workspace was resynced mid-replay - the repair stays pending; \
                  run `docli sync` again",
                 mount.display_name()
             );
@@ -556,6 +613,10 @@ fn from_zero_sync(
     let epoch = first.epoch;
     let mut resp = first;
     loop {
+        progress.set(&format!(
+            "rebuilding: {}",
+            crate::ui::plural(state.nodes.len(), "node", "nodes")
+        ));
         let head = head_reaching(&resp, PAGE_LIMIT);
         if head && resp.live_nodes.is_none() {
             bail!(rollback_warning(ws));
@@ -582,7 +643,7 @@ fn from_zero_sync(
                 // Offsetting add+miss inside one replay window; leave the flag set — the next
                 // run replays again, `doctor` is the strict detector.
                 eprintln!(
-                    "{}: count still mismatched after a full replay ({live} vs {}) — \
+                    "{}: count still mismatched after a full replay ({live} vs {}) - \
                      leaving the repair pending; run `docli doctor`",
                     mount.display_name(),
                     delivered.len()
@@ -610,7 +671,7 @@ fn from_zero_sync(
                 // leave the repair pending (CACHE_INCOMPLETE present, `--check` failing) and let
                 // the caller's loop/the next run replay from (0,0) against the new epoch.
                 eprintln!(
-                    "{}: the workspace was resynced mid-replay — the repair stays pending; \
+                    "{}: the workspace was resynced mid-replay - the repair stays pending; \
                      run `docli sync` again",
                     mount.display_name()
                 );
@@ -643,7 +704,7 @@ fn check_mount(
         // state save and the marker write must not leave them contradicting.
         persist_incomplete(control, handle, ws, state)?;
         eprintln!(
-            "{}: stale — parked deliveries are waiting (remove the occupants, then \
+            "{}: stale - parked deliveries are waiting (remove the occupants, then \
              `docli sync --full`)",
             mount.display_name()
         );
@@ -655,7 +716,7 @@ fn check_mount(
     if !state.pending_removals.is_empty() {
         persist_incomplete(control, handle, ws, state)?;
         eprintln!(
-            "{}: stale — directory removals blocked by untracked occupants: {} (remove \
+            "{}: stale - directory removals blocked by untracked occupants: {} (remove \
              them, then run `docli sync`)",
             mount.display_name(),
             state.pending_removals.len()
@@ -669,7 +730,7 @@ fn check_mount(
             state.from_zero = true;
             persist_incomplete(control, handle, ws, state)?;
             eprintln!(
-                "{}: stale — the workspace was resynced",
+                "{}: stale - the workspace was resynced",
                 mount.display_name()
             );
             return Ok(1);
@@ -682,7 +743,7 @@ fn check_mount(
         state.at_head = false;
         persist_incomplete(control, handle, ws, state)?;
         eprintln!(
-            "{}: stale — behind the server; run `docli sync`",
+            "{}: stale - behind the server; run `docli sync`",
             mount.display_name()
         );
         return Ok(1);
@@ -696,7 +757,7 @@ fn check_mount(
         state.from_zero = true;
         persist_incomplete(control, handle, ws, state)?;
         eprintln!(
-            "{}: stale — server live count {live} != mirror {}; run `docli sync`",
+            "{}: stale - server live count {live} != mirror {}; run `docli sync`",
             mount.display_name(),
             state.ledger.len()
         );
@@ -714,7 +775,7 @@ fn check_mount(
     // removal leaves a lying CACHE_INCOMPLETE over a state that already says head — the probe
     // just proved freshness, so the marker must say so too.
     persist_incomplete(control, handle, ws, state)?;
-    println!("{}: fresh", mount.display_name());
+    crate::ui::ok(&format!("{}: fresh", mount.display_name()));
     Ok(0)
 }
 
@@ -765,14 +826,17 @@ mod tests {
 
     #[test]
     fn the_no_access_branch_never_says_token() {
+        // The v0.28.0 D10.3 standing pin, in the language the CLI now speaks: designation
+        // without authority — docli.toml NAMES the workspace, login state decides reach, and
+        // this branch must never suggest that pasting a credential is the remedy.
         let msg = no_access_message("книга продаж");
         let lower = msg.to_lowercase();
-        assert!(!lower.contains("токен"), "{msg}");
         assert!(!lower.contains("token"), "{msg}");
-        assert!(lower.contains("попросите доступ"), "{msg}");
+        assert!(!lower.contains("токен"), "{msg}");
+        assert!(lower.contains("ask the workspace owner"), "{msg}");
         assert!(
             msg.contains("книга продаж"),
-            "the AUTHOR's mount name: {msg}"
+            "the AUTHOR's mount name, whatever language it is in: {msg}"
         );
     }
 

@@ -76,15 +76,52 @@ pub fn find_project(start: &Path) -> Option<PathBuf> {
 
 pub fn load_project(start: &Path) -> Result<Project> {
     let Some(root) = find_project(start) else {
-        bail!("no {CONFIG_NAME} here or in any parent directory — run `docli init` first");
+        bail!("no {CONFIG_NAME} here or in any parent directory - run `docli init` first");
     };
     let raw = fs::read_to_string(root.join(CONFIG_NAME)).context("reading docli.toml")?;
-    let mut config: DocliToml = toml::from_str(&raw).context("parsing docli.toml")?;
-    // ONE origin normalization at the load seam: a hand-edited trailing slash would otherwise
-    // split the credential between two keys (login stores under `…/`, the api trims it and
-    // looks up bare) and build `//api/…` URLs (Codex round 1).
-    config.server = config.server.trim_end_matches('/').to_string();
+    // ONE origin normalization and ONE control-character refusal, both at this seam — see
+    // `parse_config`, which `init` and the wizard share so neither can skip them.
+    let config = parse_config(&raw)?;
+    refuse_control_characters(&config)?;
     Ok(Project { root, config })
+}
+
+/// Parse `docli.toml` text — the ONE door for this file, so its refusals cannot be bypassed by
+/// a caller that happens to read it itself. (`init` and the wizard both do, to inspect an
+/// existing project before deciding what to write.)
+pub fn parse_config(raw: &str) -> Result<DocliToml> {
+    let mut config: DocliToml = toml::from_str(raw).context("parsing docli.toml")?;
+    config.server = config.server.trim_end_matches('/').to_string();
+    refuse_control_characters(&config)?;
+    Ok(config)
+}
+
+/// `docli.toml` is committed and teammate-editable, so an escape sequence in it reaches a
+/// colleague's terminal through whichever command renders it — and `status` deliberately
+/// reports on configurations it has not otherwise validated. Refusing at INGESTION means no
+/// renderer downstream can meet one, which is a property no amount of per-call-site escaping
+/// can give. The vector is TOML's own `\uXXXX` escape; a raw control byte is already rejected
+/// by the parser.
+fn refuse_control_characters(config: &DocliToml) -> Result<()> {
+    let dirty = [("server", config.server.as_str())]
+        .into_iter()
+        .chain(config.mounts.iter().flat_map(|m| {
+            [
+                Some(("dir", m.dir.as_str())),
+                m.name.as_deref().map(|n| ("name", n)),
+                m.folder.as_deref().map(|f| ("folder", f)),
+            ]
+            .into_iter()
+            .flatten()
+        }))
+        .find(|(_, v)| v.chars().any(|c| c.is_control()));
+    if let Some((field, _)) = dirty {
+        bail!(
+            "docli.toml: `{field}` contains a control character - remove it (it would be \
+             interpreted by whatever terminal renders it)"
+        );
+    }
+    Ok(())
 }
 
 /// Absolute mount dir for a mount (lexically normalized — `.`/`..` resolved without touching
@@ -179,7 +216,22 @@ fn is_ancestor_or_self(a: &Path, b: &Path) -> bool {
 /// unignored/nonexistent mount dir violated the works-without-a-cache contract.
 pub fn validate_config(config: &DocliToml) -> Result<()> {
     if config.mounts.is_empty() {
-        bail!("docli.toml has no [[mount]] entries — add one or run `docli init`");
+        bail!("docli.toml has no [[mount]] entries - add one with `docli init`");
+    }
+    for m in &config.mounts {
+        // A control character in a mount dir cannot be expressed as a `.gitignore` pattern (a
+        // NEWLINE becomes two patterns, one of which may hide something real), and no
+        // legitimate path needs one.
+        if m.dir.chars().any(|c| c.is_control())
+            || m.name
+                .as_deref()
+                .is_some_and(|n| n.chars().any(|c| c.is_control()))
+        {
+            bail!(
+                "mount `{}`: the path or name contains a control character - remove it",
+                crate::ui::sanitize(m.display_name())
+            );
+        }
     }
     // One mount per workspace: `.docli/` state is per-workspace, and two mounts draining one
     // cursor would each hold half the tree.
@@ -187,7 +239,7 @@ pub fn validate_config(config: &DocliToml) -> Result<()> {
     for m in &config.mounts {
         if !seen.insert(m.workspace) {
             bail!(
-                "workspace {} is mounted more than once — each workspace may have only one \
+                "workspace {} is mounted more than once - each workspace may have only one \
                  mount",
                 m.workspace
             );
@@ -209,8 +261,8 @@ pub fn validate_config(config: &DocliToml) -> Result<()> {
             });
             if f.is_empty() || f.starts_with('/') || f.ends_with('/') || bad_segment {
                 bail!(
-                    "mount `{}`: folder scope must be a relative server folder path such as \
-                     `docs/api` — nonempty segments of at most 255 bytes, with no `.`, `..`, \
+                    "mount `{}`: the folder scope is a relative server folder path such as \
+                     `docs/api` - nonempty segments of at most 255 bytes, with no `.`, `..`, \
                      backslashes, control characters, surrounding whitespace, or leading or \
                      trailing slashes",
                     m.display_name()
@@ -224,6 +276,22 @@ pub fn validate_config(config: &DocliToml) -> Result<()> {
 /// The D2 geometry rules — a config-level HARD refusal (auth-reach failures are the
 /// partial-success class; broken geometry is not). Checked at `init` AND every `sync`/`doctor`.
 pub fn validate_geometry(project_root: &Path, config: &DocliToml) -> Result<()> {
+    validate_geometry_inner(project_root, config, true)
+}
+
+/// The geometry rules WITHOUT the git-ignore requirement — for the interactive wizard, which
+/// validates the mount the moment it is chosen and only offers to write `.gitignore` two steps
+/// later. Never a substitute for [`validate_geometry`] on the sync path: the ignore rule is a
+/// gate there, and this one deliberately does not enforce it.
+pub fn validate_geometry_paths_only(project_root: &Path, config: &DocliToml) -> Result<()> {
+    validate_geometry_inner(project_root, config, false)
+}
+
+fn validate_geometry_inner(
+    project_root: &Path,
+    config: &DocliToml,
+    require_ignored: bool,
+) -> Result<()> {
     validate_config(config)?;
     // Geometry runs on PHYSICAL paths: symlinked ancestors must not smuggle a mount past the
     // overlap/control/vault/git rules (Codex round 1).
@@ -242,7 +310,7 @@ pub fn validate_geometry(project_root: &Path, config: &DocliToml) -> Result<()> 
         for (j, b) in &abs {
             if i < j && (is_ancestor_or_self(a, b) || is_ancestor_or_self(b, a)) {
                 bail!(
-                    "mounts `{}` and `{}` overlap ({} vs {}) — mounts must be disjoint",
+                    "mounts `{}` and `{}` overlap ({} vs {}) - mounts must be disjoint",
                     m.display_name(),
                     config.mounts[*j].display_name(),
                     a.display(),
@@ -256,14 +324,14 @@ pub fn validate_geometry(project_root: &Path, config: &DocliToml) -> Result<()> 
         // inverse containment.
         if is_ancestor_or_self(a, &project_root_phys) {
             bail!(
-                "mount `{}` contains the project's docli.toml or .docli/ directory — choose a \
+                "mount `{}` contains the project's docli.toml or .docli/ directory - choose a \
                  mount directory that contains neither",
                 m.display_name()
             );
         }
         if is_ancestor_or_self(&control, a) {
             bail!(
-                "mount `{}` is inside .docli/ — choose a directory outside .docli/",
+                "mount `{}` is inside .docli/ - choose a directory outside .docli/",
                 m.display_name()
             );
         }
@@ -274,7 +342,7 @@ pub fn validate_geometry(project_root: &Path, config: &DocliToml) -> Result<()> 
         while let Some(d) = anc {
             if d.join(".obsidian").is_dir() {
                 bail!(
-                    "mount `{}` sits inside an Obsidian vault ({}) — the plugin would push the \
+                    "mount `{}` sits inside an Obsidian vault ({}) - the plugin would push the \
                      whole mirror back as new notes; mount outside the vault",
                     m.display_name(),
                     d.display()
@@ -286,13 +354,19 @@ pub fn validate_geometry(project_root: &Path, config: &DocliToml) -> Result<()> 
         // the full note-path tree of every mounted workspace, which must not sweep into a git
         // REMOTE any more than bodies may (the §8 inheritance is about the agent's machine, not
         // arbitrary remotes; only docli.toml is committed).
-        require_gitignored(&project_root_phys, a, m)?;
+        if require_ignored {
+            require_gitignored(&project_root_phys, a, m)?;
+        }
     }
-    require_gitignored_control(&project_root_phys, &control)?;
+    if require_ignored {
+        require_gitignored_control(&project_root_phys, &control)?;
+    }
     Ok(())
 }
 
-fn find_git_worktree(from: &Path) -> Option<PathBuf> {
+/// The git work tree governing `from`, if any — the NEAREST one, so a mount inside a vendored
+/// repository resolves to that repository rather than the outer project.
+pub(crate) fn find_git_worktree(from: &Path) -> Option<PathBuf> {
     let mut d = Some(from);
     while let Some(p) = d {
         if p.join(".git").exists() {
@@ -318,15 +392,76 @@ fn git_check_ignore(worktree: &Path, path: &Path) -> Result<bool> {
         .arg(worktree)
         .arg("check-ignore")
         .arg("-q")
+        // `--` before the path: a mount named `-notes` is otherwise parsed as an OPTION, and
+        // the guard then reports «git could not answer» for a directory git ignores perfectly
+        // well — blocking sync on a legal name.
+        .arg("--")
         .arg(arg)
+        // git's own diagnostics are SILENCED: this CLI reports the condition itself, in its own
+        // voice, and a raw `fatal: not a git repository` printed twice above our message just
+        // makes the reader hunt for which line matters.
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status();
+    // `git check-ignore` documents THREE outcomes and they must stay three: 0 = ignored,
+    // 1 = not ignored, anything else = git could not answer (a dubious-ownership repository, a
+    // corrupt `.git`, exit 128). Folding «could not answer» into «not ignored» made
+    // `--gitignore` append entries and the gate refuse a moment later on the same failure.
     match out {
-        Ok(s) => Ok(s.success()),
-        Err(e) => bail!(
-            "a git work tree was detected at {}, but `git` could not be run ({e}) — cannot verify \
-             the mirror is git-ignored; install git or mount outside the repository",
+        Ok(s) if s.code() == Some(0) => Ok(true),
+        Ok(s) if s.code() == Some(1) => Ok(false),
+        // Code 128 is git's catch-all refusal, and by far its commonest cause is the
+        // safe.directory check on a repository owned by another user (shared volumes, Docker
+        // mounts, a checkout made under sudo). Naming that fix turns a dead end into one line
+        // of shell; a broken `.git` lands here too, hence the second suggestion.
+        Ok(s) => bail!(
+            "`git check-ignore` in {} exited with code {} - cannot verify that the mirror is \
+             hidden from git.\nIf the repository belongs to another user:\n  git config --global \
+             --add safe.directory {}\nOtherwise repair the repository, or put the mirror \
+             outside it.",
+            worktree.display(),
+            s.code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "a signal".to_string()),
             worktree.display()
         ),
+        Err(e) => bail!(
+            "a git work tree was detected at {}, but `git` could not be run ({e}) - cannot \
+             verify the mirror is git-ignored; install git or mount outside the repository",
+            worktree.display()
+        ),
+    }
+}
+
+/// The advisory answer to «does this path still need a `.gitignore` entry?» — THREE-valued,
+/// because the third value is the one that matters.
+///
+/// Collapsing «git could not answer» into either boolean is wrong in a different way each time.
+/// As «missing», `--gitignore` appends lines on the strength of an answer nobody has, and the
+/// gate refuses a moment later on the same git failure. As «covered», `status` reports no
+/// problem and exits 0 while `sync` refuses, and the wizard says «`.gitignore` уже закрывает…»
+/// just before the gate disagrees. The value has to survive to whoever renders it.
+///
+/// Never a gate itself — `require_gitignored` is the one that fails closed.
+pub(crate) enum IgnoreState {
+    /// Not in a git work tree: nothing to ignore, no requirement at all.
+    NotInRepo,
+    /// git ignores it already.
+    Covered,
+    /// git says it is not ignored — an entry is genuinely missing.
+    Missing,
+    /// git could not answer (broken repository, `safe.directory`, exit 128).
+    Unknown(String),
+}
+
+pub(crate) fn ignore_state(from: &Path, path: &Path) -> IgnoreState {
+    let Some(wt) = find_git_worktree(from) else {
+        return IgnoreState::NotInRepo;
+    };
+    match git_check_ignore(&wt, path) {
+        Ok(true) => IgnoreState::Covered,
+        Ok(false) => IgnoreState::Missing,
+        Err(e) => IgnoreState::Unknown(format!("{e:#}")),
     }
 }
 
@@ -336,9 +471,10 @@ fn require_gitignored(project_root: &Path, mount: &Path, m: &Mount) -> Result<()
     };
     if !git_check_ignore(&wt, mount)? {
         bail!(
-            "mount `{}` ({}) is inside the git work tree at {} but is not git-ignored — \
+            "mount `{}` ({}) is inside the git work tree at {} but is not git-ignored - \
              `git add -A` would stage mirrored note contents, which could then be committed \
-             and pushed to a remote.\nAdd to .gitignore:\n  {}/\n  .docli/",
+             and pushed to a remote.\nAdd to .gitignore:\n  {}/\n  .docli/\nOr let docli \
+             append them: docli init --gitignore",
             m.display_name(),
             mount.display(),
             wt.display(),
@@ -356,8 +492,9 @@ fn require_gitignored_control(project_root: &Path, control: &Path) -> Result<()>
     // `.docli/` may not exist yet on a fresh init — check-ignore works on hypothetical paths.
     if !git_check_ignore(&wt, control)? {
         bail!(
-            ".docli/ is inside the git work tree at {} but is NOT git-ignored — it holds the \
-             full note-path tree of every mounted workspace.\nAdd to .gitignore:\n  .docli/",
+            ".docli/ is inside the git work tree at {} but is NOT git-ignored - it holds the \
+             full note-path tree of every mounted workspace.\nAdd to .gitignore:\n  .docli/\n\
+             Or let docli append it: docli init --gitignore",
             wt.display()
         );
     }
@@ -431,17 +568,17 @@ mod tests {
         // overwrite the configuration.
         let c = cfg(vec![mount(1, ".")]);
         let err = validate_geometry(tmp.path(), &c).unwrap_err().to_string();
-        assert!(err.contains("docli.toml or .docli"), "{err}");
+        assert!(err.contains("docli.toml or .docli/ directory"), "{err}");
         // …and a parent dir too.
         let sub = tmp.path().join("proj");
         std::fs::create_dir_all(&sub).unwrap();
         let c = cfg(vec![mount(1, "..")]);
         let err = validate_geometry(&sub, &c).unwrap_err().to_string();
-        assert!(err.contains("docli.toml or .docli"), "{err}");
+        assert!(err.contains("docli.toml or .docli/ directory"), "{err}");
         // Inverse containment: a mount inside .docli/ itself.
         let c = cfg(vec![mount(1, ".docli/mirror")]);
         let err = validate_geometry(tmp.path(), &c).unwrap_err().to_string();
-        assert!(err.contains("outside .docli/"), "{err}");
+        assert!(err.contains("inside .docli/"), "{err}");
     }
 
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -453,7 +590,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let c = cfg(vec![mount(1, ".DOCLI/mirror")]);
         let err = validate_geometry(tmp.path(), &c).unwrap_err().to_string();
-        assert!(err.contains("outside .docli/"), "{err}");
+        assert!(err.contains("inside .docli/"), "{err}");
         // Case-varied overlap between mounts is the same alias.
         let c = cfg(vec![mount(1, "Notes"), mount(2, "notes/sub")]);
         let err = validate_geometry(tmp.path(), &c).unwrap_err().to_string();
@@ -479,6 +616,61 @@ mod tests {
     }
 
     #[test]
+    fn loading_refuses_control_characters_anywhere_in_the_file() {
+        // `docli.toml` is committed and teammate-editable; an escape sequence in ANY rendered
+        // field reaches a colleague's terminal through whichever command prints it. Refusing at
+        // the LOAD seam is what makes every downstream renderer safe without knowing about it.
+        //
+        // The vector is TOML's own `BSu001B` escape: a RAW control byte is already refused by
+        // the TOML parser, but the escape decodes to one after parsing.
+        let tmp = tempfile::tempdir().unwrap();
+        let esc = "BSu001B";
+        let mount = "workspace = QQ00000000-0000-0000-0000-000000000001QQ";
+        for field in [
+            format!("server = QQhttps://docli.ru/{esc}[2JQQ"),
+            format!(
+                "server = QQhttps://docli.ruQQ\n\n[[mount]]\n{mount}\ndir = QQcacheQQ\n\
+                 name = QQ{esc}[2JforgedQQ"
+            ),
+            format!(
+                "server = QQhttps://docli.ruQQ\n\n[[mount]]\n{mount}\ndir = QQcacheQQ\n\
+                 folder = QQdocs{esc}[2JQQ"
+            ),
+        ] {
+            let toml = field.replace("QQ", "\"").replace("BS", "\\");
+            std::fs::write(tmp.path().join(CONFIG_NAME), &toml).unwrap();
+            let err = match load_project(tmp.path()) {
+                Err(e) => format!("{e:#}"),
+                Ok(_) => panic!("{toml:?} must not load"),
+            };
+            assert!(err.contains("control character"), "{toml:?}: {err}");
+        }
+        // …and an ordinary file still loads, including a non-ASCII name.
+        let ok = format!(
+            "server = QQhttps://docli.ruQQ\n\n[[mount]]\n{mount}\ndir = QQcacheQQ\n\
+             name = QQДокументацияQQ"
+        )
+        .replace("QQ", "\"");
+        std::fs::write(tmp.path().join(CONFIG_NAME), ok).unwrap();
+        assert_eq!(
+            load_project(tmp.path()).unwrap().config.mounts[0]
+                .name
+                .as_deref(),
+            Some("Документация")
+        );
+    }
+
+    #[test]
+    fn a_control_character_in_a_mount_dir_is_refused() {
+        // A NEWLINE cannot be expressed as one `.gitignore` pattern: `cache\n/src` writes two,
+        // and the second can hide the project's real `src` while the actual mount stays
+        // unignored and the gate keeps refusing.
+        let c = cfg(vec![mount(1, "cache\n/src")]);
+        let err = validate_config(&c).unwrap_err().to_string();
+        assert!(err.contains("control character"), "{err}");
+    }
+
+    #[test]
     fn an_impossible_folder_scope_is_refused() {
         // Codex round 25: a scope no server path can match would from-zero the mirror EMPTY.
         for bad in [
@@ -494,7 +686,7 @@ mod tests {
             let mut m = mount(1, "m");
             m.folder = Some(bad.to_string());
             let err = validate_config(&cfg(vec![m])).unwrap_err().to_string();
-            assert!(err.contains("folder scope"), "{bad}: {err}");
+            assert!(err.contains("folder scope is a relative"), "{bad}: {err}");
         }
         let mut long = mount(1, "m");
         long.folder = Some("я".repeat(130)); // 260 bytes > the 255-byte server cap
@@ -524,6 +716,8 @@ mod tests {
                 mcp_label: None,
                 mcp_bare: false,
                 allow_prompt: false,
+                clear_folder: false,
+                write_gitignore: false,
             },
         )
         .unwrap_err()

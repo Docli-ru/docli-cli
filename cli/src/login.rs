@@ -155,9 +155,10 @@ pub fn run_login(server: &str, creds: &CredsStore) -> Result<()> {
     let install_id = creds.install_id(server)?;
     let round = authorize_round(server, port, &install_id);
 
-    println!("Открываю браузер для входа в docli…");
+    crate::ui::heading("Sign in to docli");
+    crate::ui::detail("Opening your browser...");
     println!(
-        "Если браузер не открылся, откройте эту ссылку вручную:\n\n  {}\n",
+        "If it did not open, follow this link by hand:\n\n  {}\n",
         round.url
     );
     open_browser(&round.url);
@@ -190,8 +191,10 @@ pub fn run_login(server: &str, creds: &CredsStore) -> Result<()> {
         }
         let outcome = parse_callback(&line);
         let body = match &outcome {
-            Ok(_) => "<html><body><p>docli подключён — можно закрыть это окно.</p></body></html>",
-            Err(_) => "<html><body><p>Вход не удался — вернитесь в терминал.</p></body></html>",
+            Ok(_) => {
+                "<html><body><p>docli is connected - you can close this window.</p></body></html>"
+            }
+            Err(_) => "<html><body><p>Sign-in failed - return to the terminal.</p></body></html>",
         };
         let _ = write!(
             stream,
@@ -203,7 +206,7 @@ pub fn run_login(server: &str, creds: &CredsStore) -> Result<()> {
     };
     let (code, cb_state) = outcome?;
     if cb_state != round.state {
-        bail!("state mismatch in the callback — refusing the code");
+        bail!("state mismatch in the callback - refusing the code");
     }
 
     // Exchange the code.
@@ -244,7 +247,9 @@ pub fn run_login(server: &str, creds: &CredsStore) -> Result<()> {
             install_id,
         },
     )?;
-    println!("Вход выполнен — устройство подключено к {server}.");
+    crate::ui::ok(&format!(
+        "Signed in - this device is connected to {server}."
+    ));
     Ok(())
 }
 

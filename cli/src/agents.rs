@@ -28,6 +28,10 @@ use anyhow::{Context, Result};
 /// cannot depend on core; the grammar itself is shared via `docli_rules::valid_label`).
 const MCP_LABEL_PATH_PREFIX: &str = "/api/mcp/c/";
 
+/// The unlabeled MCP resource path (`--mcp-bare`, and what a client that omits RFC 8707
+/// `resource` connects to).
+const MCP_BARE_PATH: &str = "/api/mcp";
+
 pub fn connection_url(server: &str, label: &str) -> String {
     format!(
         "{}{MCP_LABEL_PATH_PREFIX}{label}",
@@ -41,7 +45,7 @@ pub fn connection_url(server: &str, label: &str) -> String {
 /// token the labeled route refuses — and the labeled live-client gate is still open for most
 /// wired clients. The bare connection is the proven-everywhere fallback.
 pub fn connection_url_bare(server: &str) -> String {
-    format!("{}/api/mcp", server.trim_end_matches('/'))
+    format!("{}{MCP_BARE_PATH}", server.trim_end_matches('/'))
 }
 
 /// Derive a grammar-valid connection label from a free-form name (the project dir name).
@@ -100,10 +104,10 @@ enum McpAdapter {
 /// Gemini (and Qwen): `url` means SSE there — the classic misconfig the research pass flagged.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum JsonShape {
-    TypeHttpUrl,    // {"type": "http", "url": …}   — .mcp.json, .vscode/mcp.json
-    UrlOnly,        // {"url": …}                   — .cursor/mcp.json
-    HttpUrl,        // {"httpUrl": …}               — .gemini/settings.json
-    OpencodeRemote, // {"type": "remote", "url": …, "enabled": true}
+    TypeHttpUrl,    // {"type": "http", "url": ...}   - .mcp.json, .vscode/mcp.json
+    UrlOnly,        // {"url": ...}                   - .cursor/mcp.json
+    HttpUrl,        // {"httpUrl": ...}               - .gemini/settings.json
+    OpencodeRemote, // {"type": "remote", "url": ..., "enabled": true}
 }
 
 impl JsonShape {
@@ -324,7 +328,7 @@ pub enum MergeOutcome {
 /// Splice `"docli": <entry>` under `top_key` in a JSON config, preserving the user's text.
 fn merge_json(existing: Option<&str>, top_key: &str, entry: &str) -> MergeOutcome {
     let desired: serde_json::Value = serde_json::from_str(entry)
-        .expect("the entry is serializer output (JsonShape::entry) — always valid JSON");
+        .expect("the entry is serializer output (JsonShape::entry) - always valid JSON");
     let text = existing.map(str::trim).filter(|t| !t.is_empty());
     let Some(text) = text else {
         return MergeOutcome::Write(format!(
@@ -433,7 +437,7 @@ fn top_level_value_brace(text: &str, key: &str) -> Option<usize> {
                     }
                     if j < bytes.len() && bytes[j] == b':' {
                         if found.is_some() {
-                            return None; // duplicated key — refuse rather than guess
+                            return None; // duplicated key - refuse rather than guess
                         }
                         j += 1;
                         while j < bytes.len() && bytes[j].is_ascii_whitespace() {
@@ -516,7 +520,7 @@ fn value_of_key_in_object(text: &str, obj_open: usize, key: &str) -> Option<(usi
                     }
                     if j < bytes.len() && bytes[j] == b':' {
                         if found.is_some() {
-                            return None; // duplicated key — refuse rather than guess
+                            return None; // duplicated key - refuse rather than guess
                         }
                         j += 1;
                         while j < bytes.len() && bytes[j].is_ascii_whitespace() {
@@ -695,26 +699,26 @@ pub fn snippet(def: &AgentDef, url: &str) -> String {
         }
         McpAdapter::Print => match def.key {
             "qwen" => format!(
-                ".qwen/settings.json:\n  {{ \"mcpServers\": {{ \"docli\": {{ \"httpUrl\": {jurl} }} }} }}\n  (httpUrl, not url — url means SSE there)"
+                ".qwen/settings.json:\n  {{ \"mcpServers\": {{ \"docli\": {{ \"httpUrl\": {jurl} }} }} }}\n  (httpUrl, not url - url means SSE there)"
             ),
             "cline" => format!(
                 "Cline's MCP config is global (the extension's MCP panel / ~/.cline/mcp.json):\n  {{ \"mcpServers\": {{ \"docli\": {{ \"type\": \"streamableHttp\", \"url\": {jurl} }} }} }}"
             ),
             "zed" => format!(
-                "Zed settings.json (project-level placement of context_servers is undocumented — use \
+                "Zed settings.json (project-level placement of context_servers is undocumented - use \
                  `zed: open settings`):\n  {{ \"context_servers\": {{ \"docli\": {{ \"source\": \"custom\", \"url\": {jurl} }} }} }}"
             ),
             "windsurf" => format!(
                 "Windsurf's MCP config is global (~/.codeium/windsurf/mcp_config.json):\n  {{ \"mcpServers\": {{ \"docli\": {{ \"serverUrl\": {jurl} }} }} }}"
             ),
             "sourcecraft" => format!(
-                ".codeassistant/mcp.json:\n  {{ \"mcpServers\": {{ \"docli\": {{ \"url\": {jurl} }} }} }}\n  (docli MCP requires a browser OAuth flow; support for it is unverified in this client — if sign-in fails, use a verified OAuth-capable client)"
+                ".codeassistant/mcp.json:\n  {{ \"mcpServers\": {{ \"docli\": {{ \"url\": {jurl} }} }} }}\n  (docli MCP requires a browser OAuth flow; support for it is unverified in this client - if sign-in fails, use a verified OAuth-capable client)"
             ),
             "junie" => format!(
-                ".junie/mcp/mcp.json:\n  {{ \"mcpServers\": {{ \"docli\": {{ \"url\": {jurl} }} }} }}\n  (docli MCP requires a browser OAuth flow; support for it is unverified in this client — if sign-in fails, use a verified OAuth-capable client)"
+                ".junie/mcp/mcp.json:\n  {{ \"mcpServers\": {{ \"docli\": {{ \"url\": {jurl} }} }} }}\n  (docli MCP requires a browser OAuth flow; support for it is unverified in this client - if sign-in fails, use a verified OAuth-capable client)"
             ),
             "trae" => format!(
-                ".trae/mcp.json:\n  {{ \"mcpServers\": {{ \"docli\": {{ \"url\": {jurl} }} }} }}\n  (docli MCP requires a browser OAuth flow; support for it is unverified in this client — if sign-in fails, use a verified OAuth-capable client)"
+                ".trae/mcp.json:\n  {{ \"mcpServers\": {{ \"docli\": {{ \"url\": {jurl} }} }} }}\n  (docli MCP requires a browser OAuth flow; support for it is unverified in this client - if sign-in fails, use a verified OAuth-capable client)"
             ),
             "amp" => format!(
                 ".amp/settings.json:\n  {{ \"amp.mcpServers\": {{ \"docli\": {{ \"url\": {jurl} }} }} }}"
@@ -733,31 +737,31 @@ pub fn snippet(def: &AgentDef, url: &str) -> String {
 /// 8707 `resource` gets a bare-audience token the labeled route refuses — the note tells the
 /// user the escape hatch instead of leaving them at an opaque `invalid_token`.
 pub fn wire(project_root: &Path, selected: &[&AgentDef], url: &str, labeled: bool, skill_md: &str) {
-    println!("\nMCP connection URL for this project: {url}");
-    println!(
-        "(each agent authorizes itself through browser OAuth on first connection; docli \
-         writes no credential to project files)"
+    crate::ui::heading("This project's MCP connection");
+    crate::ui::line(&format!("  {}", crate::ui::path(url)));
+    crate::ui::detail(
+        "Each agent authorizes itself through browser OAuth on first connection; docli writes \
+         no credential into project files.",
     );
     if labeled {
-        println!(
-            "(if an agent rejects this labeled URL with invalid_token, re-run with --mcp-bare \
-             for the unlabeled connection)"
+        crate::ui::detail(
+            "If an agent rejects this labeled URL with invalid_token, re-run with --mcp-bare.",
         );
     }
     sweep_cfg_temps(project_root, selected);
     for def in selected {
         if let Err(e) = wire_one(project_root, def, url) {
-            println!(
-                "  {}: FAILED ({e:#}); add by hand:\n    {}",
+            crate::ui::refuse(&format!(
+                "{}: failed ({e:#}). Add it by hand:\n    {}",
                 def.display,
                 snippet(def, url)
-            );
+            ));
         }
         if let Some(dir) = def.skill_copy_dir {
             if let Err(e) = copy_skill(project_root, dir, skill_md) {
-                println!("    {}: skill copy FAILED ({e:#})", def.display);
+                crate::ui::refuse(&format!("{}: could not copy SKILL.md ({e:#})", def.display));
             } else {
-                println!("    wrote {dir}/SKILL.md");
+                crate::ui::detail(&format!("wrote {dir}/SKILL.md"));
             }
         }
     }
@@ -784,38 +788,39 @@ fn wire_one(project_root: &Path, def: &AgentDef, url: &str) -> Result<()> {
                         fs::create_dir_all(parent)?;
                     }
                     write_user_config(&abs, content.as_bytes())?;
-                    println!("  {}: wrote {}", def.display, rel);
+                    crate::ui::ok(&format!("{}: wrote {}", def.display, rel));
                     if def.key == "codex" {
-                        println!(
-                            "    (Codex reads project configuration only in trusted \
-                             repositories — approve the repository on first run)"
+                        crate::ui::detail(
+                            "Codex reads project configuration only in trusted repositories \
+                             - approve the repository on first run.",
                         );
                     }
                 }
                 MergeOutcome::AlreadyConfigured { same: true } => {
-                    println!("  {}: {} already configured", def.display, rel);
+                    crate::ui::ok(&format!("{}: {} already configured", def.display, rel));
                 }
                 MergeOutcome::AlreadyConfigured { same: false } => {
-                    println!(
-                        "  {}: {} already has a \"docli\" entry; it was left unchanged. To update it manually, use:\n    {}",
+                    crate::ui::warn(&format!(
+                        "{}: {} already has a \"docli\" entry; it was left unchanged. To \
+                         update it by hand:\n    {}",
                         def.display,
                         rel,
                         snippet(def, url)
-                    );
+                    ));
                 }
                 MergeOutcome::Occupied(reason) => {
-                    println!(
-                        "  {}: {} — {}; add by hand:\n    {}",
+                    crate::ui::warn(&format!(
+                        "{}: {} - {}; add it by hand:\n    {}",
                         def.display,
                         rel,
                         reason,
                         snippet(def, url)
-                    );
+                    ));
                 }
             }
         }
         None => {
-            println!("  {}:\n    {}", def.display, snippet(def, url));
+            crate::ui::line(&format!("  {}\n    {}", def.display, snippet(def, url)));
         }
     }
     Ok(())
@@ -837,6 +842,141 @@ fn wire_one(project_root: &Path, def: &AgentDef, url: &str) -> Result<()> {
 /// still is one (`exists()` follows the link), so a temporarily-absent referent (an unmounted
 /// dotfiles checkout) is reached by following `read_link` by hand — the link keeps its
 /// identity and the referent is created. Bounded walk; a cycle degrades to the literal path.
+/// Which agent configurations in this project already carry a docli entry — what
+/// `docli status` reports.
+///
+/// The test is deliberately textual rather than a per-shape parse: status must never refuse to
+/// render because a teammate's config has a trailing comma, and the wiring itself is idempotent
+/// so a miss costs only a re-run of `--mcp`. But it looks for OUR ENTRY, not merely the origin:
+/// a config naming this server under some other MCP entry (or in a comment) is not this project
+/// wired to docli, and reporting it as such is a confident wrong answer.
+///
+/// Only agents whose configuration is a PROJECT file can be checked at all. The print-only
+/// adapters keep their configuration globally (Cline's panel, Windsurf's home directory), which
+/// is why they are absent here rather than reported as unwired — this answers «what does this
+/// project carry», not «what is installed on this machine».
+pub fn wired_here(project_root: &Path, server: &str) -> Vec<String> {
+    let needle = server.trim_end_matches('/');
+    let mut out = Vec::new();
+    for def in AGENTS {
+        let Some(rel) = def.config_path() else {
+            continue;
+        };
+        let Ok(body) = fs::read_to_string(project_root.join(rel)) else {
+            continue;
+        };
+        if entry_points_at(def, &body, needle) {
+            // `display` already names the file it writes; appending `rel` printed it twice.
+            out.push(def.display.to_string());
+        }
+    }
+    out
+}
+
+/// Does this config's OWN `docli` entry point at `server`?
+///
+/// Parsed, not grepped. The first attempt matched the origin anywhere in the file, which called
+/// a project wired because some OTHER MCP server happened to share the host; the second required
+/// the two to share a line, which fails on a pretty-printed `.mcp.json` where `"docli": {` and
+/// `"url": …` are two lines apart — reporting a config we wrote ourselves as unwired.
+///
+/// An unparseable file (JSONC comments, a trailing comma, a half-finished edit) is not an error
+/// here: status must render, and the honest answer for a file we cannot read is «no entry
+/// found». The wiring itself is idempotent, so a miss costs one re-run of `--mcp`.
+fn entry_points_at(def: &AgentDef, body: &str, server: &str) -> bool {
+    // A BOUNDED origin test: `starts_with` alone accepts `https://docli.ru.evil/api/mcp` for
+    // the origin `https://docli.ru`, and status would then report an agent as wired to this
+    // project when it is pointed at somebody else's host entirely.
+    // …and the destination must be the MCP ROUTE. The origin alone accepts `…/api/other`, the
+    // site root, or `…?x`: configurations that cannot reach MCP at all, which `status` would
+    // then vouch for while the agent fails to connect.
+    let is_ours = |url: &str| {
+        let Some(rest) = url.strip_prefix(server) else {
+            return false;
+        };
+        // EXACT: the API serves `/api/mcp` and `/api/mcp/c/<label>` and nothing else, so a
+        // query string, a fragment or a trailing slash is a URL it refuses. Accepting the
+        // lexical variants would vouch for a configuration that cannot connect.
+        let path = rest;
+        if path == MCP_BARE_PATH {
+            return true;
+        }
+        // A LABELED route is only a route the server will serve: the label has to satisfy the
+        // shared grammar and be the last segment. `/api/mcp/c/Blog` (uppercase),
+        // `/api/mcp/c/` (empty) and `/api/mcp/c/blog/extra` are all refused by the API, so
+        // reporting them as wired points the reader away from the actual problem.
+        match path.strip_prefix(MCP_LABEL_PATH_PREFIX) {
+            Some(label) => !label.is_empty() && docli_rules::valid_label(label),
+            None => false,
+        }
+    };
+    match def.adapter {
+        McpAdapter::Json {
+            top_key,
+            entry_shape,
+            ..
+        } => serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get(top_key)?.get("docli").cloned())
+            .is_some_and(|entry| {
+                // The key THIS agent requires, not any URL-ish key: Gemini reads `url` as SSE
+                // and needs `httpUrl`, so an entry with `url` is a misconfiguration, and
+                // reporting it as wired sends the reader looking for a problem elsewhere.
+                let key = match entry_shape {
+                    JsonShape::HttpUrl => "httpUrl",
+                    JsonShape::TypeHttpUrl | JsonShape::UrlOnly | JsonShape::OpencodeRemote => {
+                        "url"
+                    }
+                };
+                // OpenCode's own switch: `enabled: false` is a configured-but-off server.
+                let enabled = !matches!(entry_shape, JsonShape::OpencodeRemote)
+                    || entry.get("enabled").and_then(|e| e.as_bool()) != Some(false);
+                // …and the TRANSPORT the shape declares: an entry carrying an MCP url under
+                // `type: "stdio"` is not a working remote server, whatever the url says.
+                let transport_ok = match entry_shape {
+                    JsonShape::TypeHttpUrl => {
+                        entry.get("type").and_then(|t| t.as_str()) == Some("http")
+                    }
+                    JsonShape::OpencodeRemote => {
+                        entry.get("type").and_then(|t| t.as_str()) == Some("remote")
+                    }
+                    // These shapes carry no transport field — the KEY is the transport.
+                    JsonShape::UrlOnly | JsonShape::HttpUrl => true,
+                };
+                enabled
+                    && transport_ok
+                    && entry.get(key).and_then(|u| u.as_str()).is_some_and(is_ours)
+            }),
+        McpAdapter::CodexToml { .. } => body
+            .parse::<toml_edit::DocumentMut>()
+            .ok()
+            .and_then(|doc| {
+                Some(
+                    doc.get("mcp_servers")?
+                        .get("docli")?
+                        .get("url")?
+                        .as_str()?
+                        .to_string(),
+                )
+            })
+            .is_some_and(|u| is_ours(&u)),
+        // Global configuration, not a project file: this answers «what does THIS PROJECT
+        // carry», and there is nothing here to read.
+        McpAdapter::Print => false,
+    }
+}
+
+impl AgentDef {
+    /// The PROJECT-relative config this adapter writes, or None for print-only agents.
+    fn config_path(&self) -> Option<&'static str> {
+        match self.adapter {
+            McpAdapter::Json { path, .. } => Some(path),
+            McpAdapter::CodexToml { path } => Some(path),
+            McpAdapter::Print => None,
+        }
+    }
+}
+
 fn resolve_config_dest(target: &Path) -> std::path::PathBuf {
     if target.exists() {
         return fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
@@ -1214,6 +1354,156 @@ mod tests {
     }
 
     // ---- detection ----
+
+    #[test]
+    fn wired_here_needs_our_entry_not_just_the_origin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let server = "https://docli.ru";
+
+        // A config that merely MENTIONS the origin under someone else's server is not this
+        // project wired to docli.
+        fs::write(
+            root.join(".mcp.json"),
+            r#"{"mcpServers":{"other":{"type":"http","url":"https://docli.ru/api/other"}}}"#,
+        )
+        .unwrap();
+        assert!(wired_here(root, server).is_empty());
+
+        // Our own entry counts.
+        fs::write(
+            root.join(".mcp.json"),
+            r#"{"mcpServers":{"docli":{"type":"http","url":"https://docli.ru/api/mcp/c/x"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(wired_here(root, server).len(), 1);
+
+        // A PRETTY-PRINTED entry — the shape a user's editor leaves behind — must still count:
+        // `"docli"` and its url are lines apart.
+        fs::write(
+            root.join(".mcp.json"),
+            "{\n  \"mcpServers\": {\n    \"docli\": {\n      \"type\": \"http\",\n      \
+             \"url\": \"https://docli.ru/api/mcp/c/x\"\n    }\n  }\n}\n",
+        )
+        .unwrap();
+        assert_eq!(wired_here(root, server).len(), 1);
+
+        // The TOML shape puts the URL on a later line than the table header.
+        fs::create_dir_all(root.join(".codex")).unwrap();
+        fs::write(
+            root.join(".codex/config.toml"),
+            "[mcp_servers.docli]\nurl = \"https://docli.ru/api/mcp/c/x\"\n",
+        )
+        .unwrap();
+        assert_eq!(wired_here(root, server).len(), 2);
+
+        // A different server in our table means this project points somewhere else.
+        assert!(wired_here(root, "https://other.example").is_empty());
+
+        // A docli entry pointing somewhere that is NOT the MCP route cannot connect, so it is
+        // not «wired» however right the origin looks.
+        for url in [
+            "https://docli.ru/api/other",
+            "https://docli.ru",
+            "https://docli.ru/",
+            "https://docli.ru?x",
+        ] {
+            fs::write(
+                root.join(".mcp.json"),
+                format!(r#"{{"mcpServers":{{"docli":{{"type":"http","url":"{url}"}}}}}}"#),
+            )
+            .unwrap();
+            let wired = wired_here(root, server);
+            assert!(
+                !wired.iter().any(|w| w.contains("Claude")),
+                "{url} is not the MCP route: {wired:?}"
+            );
+        }
+        // The bare route and a labeled one both are.
+        for url in [
+            "https://docli.ru/api/mcp",
+            "https://docli.ru/api/mcp/c/proj",
+        ] {
+            fs::write(
+                root.join(".mcp.json"),
+                format!(r#"{{"mcpServers":{{"docli":{{"type":"http","url":"{url}"}}}}}}"#),
+            )
+            .unwrap();
+            assert!(
+                wired_here(root, server)
+                    .iter()
+                    .any(|w| w.contains("Claude")),
+                "{url} should count"
+            );
+        }
+
+        // An off-grammar or over-long label is a route the server refuses.
+        for url in [
+            "https://docli.ru/api/mcp/c/Blog",
+            "https://docli.ru/api/mcp/c/",
+            "https://docli.ru/api/mcp/c/blog/extra",
+            // Lexical variants the API refuses: a trailing slash, a query, a fragment.
+            "https://docli.ru/api/mcp/c/blog/",
+            "https://docli.ru/api/mcp/c/blog?x=1",
+            "https://docli.ru/api/mcp/",
+            "https://docli.ru/api/mcp?x=1",
+        ] {
+            fs::write(
+                root.join(".mcp.json"),
+                format!(r#"{{"mcpServers":{{"docli":{{"type":"http","url":"{url}"}}}}}}"#),
+            )
+            .unwrap();
+            let wired = wired_here(root, server);
+            assert!(
+                !wired.iter().any(|w| w.contains("Claude")),
+                "{url} is not a servable route: {wired:?}"
+            );
+        }
+        // The wrong TRANSPORT is not a working entry either.
+        fs::write(
+            root.join(".mcp.json"),
+            r#"{"mcpServers":{"docli":{"type":"stdio","url":"https://docli.ru/api/mcp"}}}"#,
+        )
+        .unwrap();
+        assert!(!wired_here(root, server)
+            .iter()
+            .any(|w| w.contains("Claude")));
+
+        // A LOOKALIKE host must not pass: `docli.ru.evil` is not `docli.ru`.
+        fs::write(
+            root.join(".mcp.json"),
+            r#"{"mcpServers":{"docli":{"type":"http","url":"https://docli.ru.evil/api/mcp"}}}"#,
+        )
+        .unwrap();
+        let wired = wired_here(root, server);
+        assert!(
+            !wired.iter().any(|w| w.contains("Claude")),
+            "an unbounded prefix accepted a lookalike origin: {wired:?}"
+        );
+
+        // A SIMILARLY-NAMED table is not ours, and a later table's URL does not leak into it.
+        fs::write(
+            root.join(".codex/config.toml"),
+            "[mcp_servers.docli_backup]\nurl = \"https://docli.ru/api/mcp/c/x\"\n",
+        )
+        .unwrap();
+        let wired = wired_here(root, server);
+        assert!(
+            !wired.iter().any(|w| w.contains("Codex")),
+            "prefix match leaked: {wired:?}"
+        );
+        fs::write(
+            root.join(".codex/config.toml"),
+            "[mcp_servers.docli]\ncommand = \"x\"\n\n[mcp_servers.other]\nurl = \
+             \"https://docli.ru/api/mcp\"\n",
+        )
+        .unwrap();
+        let wired = wired_here(root, server);
+        assert!(
+            !wired.iter().any(|w| w.contains("Codex")),
+            "a following table's url was read as ours: {wired:?}"
+        );
+    }
 
     #[test]
     fn detection_reads_project_and_home_markers() {

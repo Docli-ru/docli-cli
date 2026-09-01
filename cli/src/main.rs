@@ -5,70 +5,98 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use docli_cli::{config, creds, doctor, http, init_cmd, login, search_cmd, selfupdate, sync_cmd};
+use docli_cli::{
+    config, creds, doctor, http, init_cmd, list_cmd, login, logout, search_cmd, selfupdate, status,
+    sync_cmd, ui, uninstall, wizard,
+};
 
-/// D12.5 — the identity block: name, version, site, copyright. `-V` prints the short line,
+/// D12.5 - the identity block: name, version, site, copyright. `-V` prints the short line,
 /// `--version` the full block; help carries the site + copyright in the footer.
-const LONG_VERSION: &str = concat!(
+const LONG_VERSION_UNICODE: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "\nDocli CLI \u{2014} https://docli.ru\n\u{a9} 2026 OOO Agitek. MIT License."
 );
-const AFTER_HELP: &str =
+const LONG_VERSION_ASCII: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\nDocli CLI - https://docli.ru\n(c) 2026 OOO Agitek. MIT License."
+);
+const AFTER_HELP_UNICODE: &str =
     "Docli CLI \u{b7} https://docli.ru \u{b7} \u{a9} 2026 OOO Agitek \u{b7} MIT License";
+const AFTER_HELP_ASCII: &str = "Docli CLI | https://docli.ru | (c) 2026 OOO Agitek | MIT License";
+const ABOUT_UNICODE: &str =
+    "Docli CLI \u{2014} read-only docli workspace mirrors for coding agents";
+const ABOUT_ASCII: &str = "Docli CLI - read-only docli workspace mirrors for coding agents";
 
 #[derive(Parser)]
 #[command(
     name = "docli",
     version,
-    long_version = LONG_VERSION,
-    about = "Docli CLI \u{2014} read-only workspace mirrors for coding agents",
-    after_help = AFTER_HELP
+    long_version = LONG_VERSION_ASCII,
+    about = ABOUT_ASCII,
+    after_help = AFTER_HELP_ASCII,
+    // clig.dev: show help when run with no arguments, rather than a bare parse error.
+    arg_required_else_help = true
 )]
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Print less: drops the narration, never results or warnings
+    #[arg(long, short = 'q', global = true)]
+    quiet: bool,
+    /// No colour (NO_COLOR, TERM=dumb and a non-TTY stdout do the same)
+    #[arg(long, global = true)]
+    no_color: bool,
+    /// Never prompt - for scripts and CI
+    #[arg(long, global = true)]
+    no_input: bool,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Sign this device in (loopback OAuth; opens a browser)
+    /// Sign this device in (browser OAuth)
     Login {
-        /// The docli server URL (default: docli.toml's `server`, otherwise https://docli.ru)
+        /// docli server URL (default: docli.toml's `server`, else https://docli.ru)
         #[arg(long)]
         server: Option<String>,
     },
-    /// Create or extend docli.toml and install the agent SKILL.md
+    /// Set the project up - guided, or by flags (docli.toml + the agent SKILL.md)
     Init {
-        /// Workspace ID to mount (see the list `docli init` prints)
+        /// Workspace ID to mount (with no flags at a terminal, the guided setup runs)
         #[arg(long)]
         workspace: Option<uuid::Uuid>,
-        /// Local mount directory (relative to docli.toml)
+        /// Mirror directory, relative to docli.toml
         #[arg(long)]
         dir: Option<String>,
-        /// Optional server folder scope (mirror only this subtree)
+        /// Mirror only this folder of the workspace
         #[arg(long)]
         folder: Option<String>,
-        /// Display name for this mount (shown in refusal messages)
+        /// Display name for this mount - what refusals report
         #[arg(long)]
         name: Option<String>,
-        /// The docli server URL for a new docli.toml
+        /// docli server URL for docli.toml
         #[arg(long)]
         server: Option<String>,
         /// Add this project's MCP connection to agent configurations: `auto` (detected
-        /// agents), `none`, or a comma-separated list
+        /// here), `none`, or a comma-separated list
         /// (claude,codex,gemini,cursor,vscode,opencode,qwen,cline,trae,zed,windsurf,sourcecraft,junie,amp)
         #[arg(long)]
         mcp: Option<String>,
         /// Connection label for the MCP URL (default: derived from the directory name)
         #[arg(long)]
         mcp_label: Option<String>,
-        /// Wire the bare unlabeled MCP URL (for clients that don't send RFC 8707 `resource`)
+        /// Wire the unlabeled MCP URL (for clients that omit RFC 8707 `resource`)
         #[arg(long, conflicts_with = "mcp_label")]
         mcp_bare: bool,
+        /// Drop the folder scope - mirror the whole workspace
+        #[arg(long, conflicts_with = "folder")]
+        clear_folder: bool,
+        /// Append the missing .gitignore lines (otherwise they are only named)
+        #[arg(long)]
+        gitignore: bool,
     },
-    /// Pull every mount to the server's head (one-shot; never pushes)
+    /// Bring every mount to the server's head (one-shot; never pushes)
     Sync {
-        /// Cheap freshness gate: exit 0 confirms freshness; non-zero means freshness was not confirmed
+        /// Freshness gate only: exit 0 confirms the mirror is current
         #[arg(long, conflicts_with = "full")]
         check: bool,
         /// Rebuild the mirror from server state and prune stale files
@@ -77,36 +105,123 @@ enum Command {
     },
     /// Server search across all mounts (results carry local paths)
     Search {
-        /// The query (docli's BM25 + RU/EN stemming)
+        /// The query
+        #[arg(value_name = "QUERY")]
         query: Vec<String>,
+        /// Machine-readable output (JSON)
         #[arg(long)]
         json: bool,
     },
-    /// Three-way reconciliation of server, disk, and state (read-only)
+    /// Three-way reconciliation of server, disk and state (read-only)
     Doctor {
+        /// Machine-readable output (JSON)
         #[arg(long)]
         json: bool,
     },
     /// Update this binary from the signed release manifest
     SelfUpdate,
+    /// Disconnect this device and drop its credentials
+    Logout {
+        /// Server URL (default: docli.toml's `server`)
+        #[arg(long)]
+        server: Option<String>,
+        /// Log out of every server this device is signed in to
+        #[arg(long, conflicts_with = "server")]
+        all: bool,
+    },
+    /// List every workspace; the ones mounted here are marked *
+    List {
+        /// Server URL (default: docli.toml's `server`)
+        #[arg(long)]
+        server: Option<String>,
+        /// Machine-readable output (JSON)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Who you are, what is mounted, and how fresh the mirrors are
+    Status {
+        /// Server URL (default: docli.toml's `server`)
+        #[arg(long)]
+        server: Option<String>,
+        /// Machine-readable output (JSON)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove docli from this device
+    Uninstall {
+        /// Also remove this project's mirrors and .docli/
+        #[arg(long)]
+        purge: bool,
+        /// Skip the confirmation
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
-fn resolve_server(explicit: Option<&str>, cwd: &std::path::Path) -> String {
+fn resolve_server(explicit: Option<&str>, cwd: &std::path::Path) -> Result<String> {
     if let Some(s) = explicit {
-        return s.trim_end_matches('/').to_string();
+        return Ok(s.trim_end_matches('/').to_string());
     }
-    config::find_project(cwd)
-        .and_then(|root| config::load_project(&root).ok())
-        .map(|p| p.config.server)
-        .unwrap_or_else(|| "https://docli.ru".to_string())
+    // A docli.toml that will not parse must SAY so, not quietly fall back to production. The
+    // fallback made `docli logout` in a self-hosted project revoke the PRODUCTION credential
+    // and report success while the intended one stayed live.
+    match config::find_project(cwd) {
+        Some(root) => Ok(config::load_project(&root)?.config.server),
+        None => Ok("https://docli.ru".to_string()),
+    }
+}
+
+/// Colour has to be settled BEFORE clap runs: `--help`, a bare invocation and any parse error
+/// are rendered and exited from inside `get_matches`, long before `ui::configure` would see the
+/// flag. Reading argv directly is the only order that works. (`NO_COLOR`, `CLICOLOR` and the
+/// non-TTY case are handled by `console` itself, and need no help here.)
+fn preconfigure_color() {
+    if std::env::args().any(|a| a == "--no-color") {
+        console::set_colors_enabled(false);
+        console::set_colors_enabled_stderr(false);
+    }
+}
+
+/// Ctrl-C at a prompt is an ANSWER, not a crash: `dialoguer` reports it as an interrupted I/O
+/// error, and printing `docli: operation interrupted` under it reads as a bug in the tool. The
+/// shell convention is a silent exit with 128+SIGINT.
+fn interrupted(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::Interrupted)
+    })
 }
 
 fn main() {
+    preconfigure_color();
     selfupdate::cleanup_stale_binary();
-    let cli = Cli::parse();
+    // Extended characters where the terminal can render them; the derive carries the ASCII
+    // spelling so a plain `--help` is safe even if this swap is ever skipped.
+    let cli = {
+        use clap::{CommandFactory, FromArgMatches};
+        let mut cmd = Cli::command();
+        // clap keeps its OWN `ColorChoice`, which `console::set_colors_enabled` does not reach:
+        // without this, `docli --no-color --help` and parse errors stayed styled on a TTY.
+        if std::env::args().any(|a| a == "--no-color") {
+            cmd = cmd.color(clap::ColorChoice::Never);
+        }
+        if ui::unicode() {
+            cmd = cmd
+                .about(ABOUT_UNICODE)
+                .long_version(LONG_VERSION_UNICODE)
+                .after_help(AFTER_HELP_UNICODE);
+        }
+        match Cli::from_arg_matches(&cmd.get_matches()) {
+            Ok(c) => c,
+            Err(e) => e.exit(),
+        }
+    };
     match run(cli) {
         Ok(code) => std::process::exit(code),
         Err(e) => {
+            if interrupted(&e) {
+                std::process::exit(130);
+            }
             eprintln!("docli: {e:#}");
             std::process::exit(2);
         }
@@ -114,10 +229,11 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<i32> {
+    ui::configure(cli.quiet, cli.no_color, cli.no_input);
     let cwd = std::env::current_dir().context("reading the working directory")?;
     match cli.command {
         Command::Login { server } => {
-            let server = resolve_server(server.as_deref(), &cwd);
+            let server = resolve_server(server.as_deref(), &cwd)?;
             let creds = creds::CredsStore::open_default()?;
             login::run_login(&server, &creds)?;
             Ok(0)
@@ -131,27 +247,33 @@ fn run(cli: Cli) -> Result<i32> {
             mcp,
             mcp_label,
             mcp_bare,
+            clear_folder,
+            gitignore,
         } => {
-            let origin = resolve_server(server.as_deref(), &cwd);
+            let origin = resolve_server(server.as_deref(), &cwd)?;
+            let args = init_cmd::InitArgs {
+                workspace,
+                dir,
+                folder,
+                name,
+                server,
+                mcp,
+                mcp_label,
+                mcp_bare,
+                allow_prompt: true,
+                clear_folder,
+                write_gitignore: gitignore,
+            };
+            // A bare `docli init` at a terminal is the guided journey; any flag, or a pipe,
+            // keeps the scriptable path an agent can drive.
+            if wizard::should_run(&args) {
+                return wizard::run(&cwd, args.server.as_deref());
+            }
             let api = creds::CredsStore::open_default().ok().and_then(|c| {
                 c.get(&origin).ok().flatten()?;
                 http::Api::new(&origin, c).ok()
             });
-            init_cmd::run(
-                &cwd,
-                api.as_ref(),
-                &init_cmd::InitArgs {
-                    workspace,
-                    dir,
-                    folder,
-                    name,
-                    server,
-                    mcp,
-                    mcp_label,
-                    mcp_bare,
-                    allow_prompt: true,
-                },
-            )
+            init_cmd::run(&cwd, api.as_ref(), &args)
         }
         Command::Sync { check, full } => {
             let project = config::load_project(&cwd)?;
@@ -173,6 +295,32 @@ fn run(cli: Cli) -> Result<i32> {
             doctor::run(&project, &api, json)
         }
         Command::SelfUpdate => selfupdate::run(),
+        Command::Logout { server, all } => {
+            // `--all` names no project: reading docli.toml for a value it will not use turned a
+            // malformed config into «cannot log out at all».
+            if all {
+                return logout::all();
+            }
+            let server = resolve_server(server.as_deref(), &cwd)?;
+            logout::run(&server, false)
+        }
+        Command::List { server, json } => {
+            // Deliberately NOT `api_for`: listing workspaces is the one thing that has to work
+            // before a project exists — that is when people need it most, and `--server` is how
+            // a self-hosted origin is named when there is no docli.toml to read it from.
+            let server = resolve_server(server.as_deref(), &cwd)?;
+            let store = creds::CredsStore::open_default()?;
+            if store.get(&server)?.is_none() {
+                anyhow::bail!("not signed in to {server} - run `docli login`");
+            }
+            let api = http::Api::new(&server, store)?;
+            list_cmd::run(&cwd, &api, &server, json)
+        }
+        Command::Status { server, json } => {
+            let server = resolve_server(server.as_deref(), &cwd)?;
+            status::run(&cwd, &server, json)
+        }
+        Command::Uninstall { purge, yes } => uninstall::run(&cwd, purge, yes),
     }
 }
 
@@ -180,7 +328,7 @@ fn api_for(project: &config::Project) -> Result<http::Api> {
     let creds = creds::CredsStore::open_default()?;
     if creds.get(&project.config.server)?.is_none() {
         anyhow::bail!(
-            "not signed in to {} — run `docli login`",
+            "not signed in to {} - run `docli login`",
             project.config.server
         );
     }
@@ -200,11 +348,49 @@ mod tests {
         assert!(long.contains(env!("CARGO_PKG_VERSION")), "{long}");
         assert!(long.contains("Docli CLI"), "{long}");
         assert!(long.contains("docli.ru"), "{long}");
-        assert!(long.contains("\u{a9} 2026 OOO Agitek"), "{long}");
+        assert!(long.contains("(c) 2026 OOO Agitek"), "{long}");
         assert!(long.contains("MIT"), "{long}");
         let help = cmd.render_long_help().to_string();
         assert!(help.contains("docli.ru"), "{help}");
         assert!(help.contains("OOO Agitek"), "{help}");
+    }
+
+    #[test]
+    fn the_cli_speaks_one_language_and_it_is_english() {
+        // The CLI is a developer tool, and developer tools speak English — the convention this
+        // segment already follows (Yandex Cloud's `yc` and Timeweb's own `twc` both ship an
+        // English CLI with Russian documentation). It also keeps the output pure ASCII, which
+        // is what makes it safe in a terminal that cannot render Cyrillic. The RUSSIAN surface
+        // is the product: README.ru.md, the site, the app.
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        let help = cmd.render_long_help().to_string();
+        let mut rendered = vec![help];
+        for name in [
+            "init",
+            "sync",
+            "search",
+            "status",
+            "list",
+            "logout",
+            "uninstall",
+        ] {
+            rendered.push(
+                cmd.find_subcommand_mut(name)
+                    .unwrap_or_else(|| panic!("{name} exists"))
+                    .render_long_help()
+                    .to_string(),
+            );
+        }
+        for text in rendered {
+            assert!(
+                text.is_ascii(),
+                "the fallback help must stay ASCII so it renders anywhere:\n{text}"
+            );
+        }
+        // …and the richer spelling is available for terminals that can show it.
+        assert!(!ABOUT_UNICODE.is_ascii());
+        assert!(ABOUT_UNICODE.contains("read-only docli workspace mirrors"));
     }
 
     #[test]

@@ -54,6 +54,11 @@ pub struct Discrepancy {
 }
 
 pub fn run(project: &Project, api: &Api, json: bool) -> Result<i32> {
+    if json {
+        crate::ui::machine_mode();
+    } else {
+        crate::ui::report_mode();
+    }
     let all = collect(project, api)?;
     let total: usize = all.iter().map(|(_, d)| d.len()).sum();
     if json {
@@ -88,7 +93,16 @@ pub fn run(project: &Project, api: &Api, json: bool) -> Result<i32> {
 /// The reconcile itself, exposed apart from the rendering so the e2e suite can assert CLASSES,
 /// not just the exit code.
 pub fn collect(project: &Project, api: &Api) -> Result<Vec<(String, Vec<Discrepancy>)>> {
-    validate_geometry(&project.root, &project.config)?;
+    if let Err(e) = validate_geometry(&project.root, &project.config) {
+        // A missing `.gitignore` line is the one geometry failure with a one-keystroke fix;
+        // offer it, then re-validate so every OTHER geometry rule still refuses as before.
+        // Under `--json` this cannot prompt: the entry point set machine mode, which closes
+        // `ui::interactive` — the caller is a script, and a question it cannot answer is a hang.
+        if !crate::wizard::offer_missing_ignores(&project.root, &project.config)? {
+            return Err(e);
+        }
+        validate_geometry(&project.root, &project.config)?;
+    }
     let rules = FsRules::native();
     let control = ControlRoot::new(&project.root);
     let mut all: Vec<(String, Vec<Discrepancy>)> = Vec::new();
@@ -103,11 +117,14 @@ pub fn collect(project: &Project, api: &Api) -> Result<Vec<(String, Vec<Discrepa
                 path: mount.dir.clone(),
                 detail: crate::sync_cmd::no_access_message(mount.display_name()),
             }],
+            // A DISTINCT class: the surrounding code already separates entitlement (402) from
+            // access (403) because asking the workspace owner cannot fix the former, and a
+            // `--json` consumer branching on the class deserves the same distinction.
             Err(e) if e.downcast_ref::<crate::sync_cmd::NotEntitled>().is_some() => {
                 vec![Discrepancy {
-                    class: "no-access",
+                    class: "not-entitled",
                     path: mount.dir.clone(),
-                    detail: "синхронизация не включена для вашего аккаунта".into(),
+                    detail: "sync is not enabled for your account".into(),
                 }]
             }
             Err(e) => return Err(e.context(format!("mount `{}`", mount.display_name()))),
@@ -167,7 +184,7 @@ fn server_tree(api: &Api, ws: Uuid) -> Result<BTreeMap<Uuid, WireNode>> {
             if live != out.len() as i64 {
                 anyhow::bail!(
                     "the workspace changed mid-scan (server live count {live} vs {} collected) \
-                     — the reconciliation is inconclusive; run `docli doctor` again",
+                     - the reconciliation is inconclusive; run `docli doctor` again",
                     out.len()
                 );
             }
@@ -178,7 +195,7 @@ fn server_tree(api: &Api, ws: Uuid) -> Result<BTreeMap<Uuid, WireNode>> {
         resp = match api.pull(&req)? {
             Ok(r) => r,
             Err(ApiFailure::EpochChanged { .. }) => {
-                anyhow::bail!("the workspace was resynced mid-scan — run `docli doctor` again")
+                anyhow::bail!("the workspace was resynced mid-scan - run `docli doctor` again")
             }
             // The typed classification survives past page one too (Codex round 12): access
             // revoked between pages must still land in the partial-success arm.
@@ -207,7 +224,7 @@ fn doctor_mount(
             class: "missing-local",
             path: mount.dir.clone(),
             detail: "this mount has never been synced (neither the mirror nor its ownership \
-                     marker exists) — run `docli sync`"
+                     marker exists) - run `docli sync`"
                 .into(),
         }]);
     }
@@ -228,7 +245,7 @@ fn doctor_mount(
             out.push(Discrepancy {
                 class: "state-missing",
                 path: mount.dir.clone(),
-                detail: "the workspace state file is missing but the mirror still exists — \
+                detail: "the workspace state file is missing but the mirror still exists - \
                          run `docli sync` to rebuild the state and repair the mirror"
                     .into(),
             });
@@ -242,7 +259,7 @@ fn doctor_mount(
         out.push(Discrepancy {
             class: "repair-pending",
             path: mount.dir.clone(),
-            detail: "the durable state says a sync/repair has not completed — run `docli sync`"
+            detail: "the durable state says a sync/repair has not completed - run `docli sync`"
                 .into(),
         });
     }
@@ -335,7 +352,7 @@ fn doctor_mount(
                     path: path.to_string(),
                     detail: format!(
                         "server node {} is present at this local path but the workspace state \
-                         does not track it there — an interrupted sync or a manually created \
+                         does not track it there - an interrupted sync or a manually created \
                          file; run `docli sync --full`",
                         node.path
                     ),
@@ -470,7 +487,7 @@ fn doctor_mount(
                     path: loser_path,
                     detail: format!(
                         "this server path maps to the same physical path as node {winner_id} \
-                         on this filesystem — `docli sync` will leave one of the conflicting \
+                         on this filesystem - `docli sync` will leave one of the conflicting \
                          nodes unmaterialized"
                     ),
                 });
@@ -518,13 +535,13 @@ fn doctor_mount(
                 let (class, detail) = if crate::mountfs::is_write_temp(leaf.as_ref()) {
                     (
                         "crash-residue",
-                        "a temporary file left by an interrupted docli write — \
+                        "a temporary file left by an interrupted docli write - \
                          `docli sync --full` removes it",
                     )
                 } else {
                     (
                         "missing-remote",
-                        "stray relocated marker — no server attachment names it; \
+                        "stray relocated marker - no server attachment names it; \
                          `docli sync --full` removes it",
                     )
                 };
@@ -588,7 +605,7 @@ fn scan_disk(
                     out.push(Discrepancy {
                         class: "crash-residue",
                         path: rel.clone(),
-                        detail: "a temporary file left by an interrupted docli write — \
+                        detail: "a temporary file left by an interrupted docli write - \
                                  `docli sync --full` removes it"
                             .into(),
                     });

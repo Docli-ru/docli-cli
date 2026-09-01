@@ -31,16 +31,60 @@ verified against a key pinned inside the binary).
 ## Quick start
 
 ```sh
-docli login                  # browser sign-in via loopback OAuth; stores a device credential
-docli init                   # writes docli.toml + the agent skill, lists your workspaces
-docli init --workspace <id> --dir notes-mirror
-docli sync                   # one-shot sync of every mount
-docli search "what you need" # server search, local paths
+docli init                   # guided setup: sign-in, workspace, directory, agents
+```
+
+One command walks the whole way: if the device is not connected yet, `docli init` offers to sign
+in, then you pick a workspace from a list (arrow keys — no UUIDs to type), the mirror directory,
+which agent configurations to wire, and whether to append the `.gitignore` lines.
+
+The same steps separately, and for scripts where nothing may ask a question:
+
+```sh
+docli login                              # browser sign-in via loopback OAuth
+docli list                               # every workspace; the ones mounted here are marked *
+docli init --workspace <id> --dir docli-mirror/notes --gitignore
+docli sync                               # one-shot sync of every mount
+docli search "what you need"             # server search, local paths
+docli status                             # sign-in, mounts, mirror freshness, wired agents
+docli doctor                             # server / disk / state reconciliation
+docli logout                             # disconnect this device and drop the credential
 ```
 
 Commit `docli.toml`: it identifies workspaces by ID, never by handle, and grants no access.
-The mirror directories and `.docli/` must be listed in `.gitignore`; otherwise `docli sync`
-refuses to run.
+
+**Git is not required.** If the project is not a git repository, there is no `.gitignore`
+requirement and everything simply works. The rule applies exactly when a mirror lands inside a
+git work tree: there the mirror directories and `.docli/` must be listed in `.gitignore`, or
+`docli sync` refuses to run — one `git add -A` would otherwise push somebody else's notes to a
+remote. `docli init --gitignore` appends the lines for you (the guided setup asks).
+
+## Interactive and non-interactive
+
+Every command works both ways. Questions are asked only at an attended terminal; in a pipe, in
+CI, or under `--no-input` nothing is asked, and when an answer is genuinely required the refusal
+names the flag that replaces it (`docli uninstall --yes`).
+
+| Flag | Effect |
+| --- | --- |
+| `--no-input` | Never ask anything (scripts, CI) |
+| `-q`, `--quiet` | Drop the narration; results and warnings stay |
+| `--no-color` | No colour; so do `NO_COLOR`, `TERM=dumb`, and a non-TTY stdout |
+| `--json` | Machine-readable output for `list`, `status`, `search`, `doctor` |
+
+Streams are split: results go to stdout, progress and warnings to stderr — so
+`docli search … | grep`, `docli status --json | jq` and `docli sync 2>/dev/null` all behave.
+
+## Uninstalling
+
+```sh
+docli uninstall              # removes the binary and ~/.docli, disconnecting the device first
+docli uninstall --purge      # also removes this project's mirrors and .docli/
+```
+
+Everything that will be deleted is listed before you confirm. Without `--purge` the project's
+files stay: a mirror is rebuildable, but it lives in your repository and that call is yours.
+`docli.toml` and your agent configurations are never touched.
 
 ## Wiring coding agents
 
@@ -49,7 +93,9 @@ standard path defined by the open Agent Skills specification, read natively by C
 Codex, Gemini CLI, Cursor, Windsurf, Zed, GitHub Copilot in VS Code, Copilot CLI, OpenCode,
 and Amp.
 
-It can also — **only if you ask** — add this project's docli MCP connection to your agents'
+In the guided setup, wiring agents is a step of its own: the configurations found here arrive
+pre-ticked, and only what stays ticked is written. It can also — **only if you ask** — add this
+project's docli MCP connection to your agents'
 configs: `docli init --mcp auto` (detected agents), `--mcp claude,codex,…` (a list), or the
 prompt shown during an interactive run. The generated docli entry contains the URL and any
 client-required transport fields, but no token or other credential: each agent authorizes

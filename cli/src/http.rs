@@ -60,10 +60,22 @@ struct ErrBody {
 
 impl Api {
     pub fn new(server: &str, creds: CredsStore) -> Result<Self> {
+        Self::with_timeout(server, creds, std::time::Duration::from_secs(120))
+    }
+
+    /// A client with a SHORT timeout, for probes whose answer is a nicety rather than the
+    /// command's purpose. `docli status` is offline-by-default, and a captive portal that
+    /// blackholes packets would otherwise make it sit for the full two minutes before printing
+    /// state it already had on disk.
+    pub fn with_timeout(
+        server: &str,
+        creds: CredsStore,
+        timeout: std::time::Duration,
+    ) -> Result<Self> {
         Ok(Api {
             server: server.trim_end_matches('/').to_string(),
             http: reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
+                .timeout(timeout)
                 .build()
                 .context("building the HTTP client")?,
             creds,
@@ -198,13 +210,66 @@ impl Api {
         self.post_sync("/api/sync/search", req)
     }
 
+    /// Who this device is signed in as, for `docli status` — the display name when the account
+    /// has one, else the email. `viewer` self-introspection is open to a sync-scoped PAT by
+    /// design (`deny_scoped_pat_via_graphql` deliberately does not gate it), so this needs no
+    /// scope the login round did not already take.
+    ///
+    /// Errors are the CALLER's to swallow: status renders offline, and a failed identity probe
+    /// must degrade one line rather than fail the command.
+    pub fn viewer_label(&self) -> Result<String> {
+        let v: serde_json::Value =
+            self.graphql_no_refresh("{ viewer { email displayName } }", "reading the account")?;
+        let viewer = &v["data"]["viewer"];
+        let name = viewer["displayName"].as_str().unwrap_or("").trim();
+        let email = viewer["email"].as_str().unwrap_or("").trim();
+        let (name, email) = (crate::ui::sanitize(name), crate::ui::sanitize(email));
+        let (name, email) = (name.trim(), email.trim());
+        match (name.is_empty(), email.is_empty()) {
+            (false, false) => Ok(format!("{name} <{email}>")),
+            (true, false) => Ok(email.to_string()),
+            (false, true) => Ok(name.to_string()),
+            (true, true) => bail!("the server returned no account identity"),
+        }
+    }
+
     /// Workspace enumeration for `docli init` — `viewer.workspaces`, deliberately exempt from
     /// `deny_scoped_pat_via_graphql` and filtered to the PAT's pin set.
-    pub fn workspaces(&self) -> Result<Vec<WorkspaceInfo>> {
-        let mut token = self.bearer()?;
-        // Same 401 discipline as the sync surface (Codex round 3): a locally fresh but
-        // server-rejected token must rotate once, and any other failure must SAY so — a
-        // swallowed error here reads as «you have no workspaces», which is worse than an error.
+    /// One GraphQL round-trip with the sync surface's 401 discipline (Codex round 3): a
+    /// locally fresh but server-rejected token rotates ONCE, and any other failure SAYS so —
+    /// a swallowed error here reads as «you have no workspaces», which is worse than an error.
+    ///
+    /// Both GraphQL callers share this: a second hand-rolled copy of the rotation loop is the
+    /// «two readers of the same question» shape that has bitten this codebase before.
+    fn graphql(&self, query: &str, what: &str) -> Result<serde_json::Value> {
+        self.graphql_inner(query, what, true)
+    }
+
+    /// The same round-trip with the 401 ROTATION disabled — for callers that must be bounded in
+    /// time. A refresh can meet `503 Retry-After`, and the shared path then sleeps up to three
+    /// times (two minutes each): fine for a command that needs the credential, wrong for
+    /// `docli status`, which is a reader with a five-second budget.
+    fn graphql_no_refresh(&self, query: &str, what: &str) -> Result<serde_json::Value> {
+        self.graphql_inner(query, what, false)
+    }
+
+    fn graphql_inner(
+        &self,
+        query: &str,
+        what: &str,
+        allow_refresh: bool,
+    ) -> Result<serde_json::Value> {
+        // `bearer()` refreshes on its own when the stored token is near expiry, which re-opens
+        // the very sleep loop `allow_refresh: false` exists to avoid: the pre-check upstream can
+        // see 61 seconds of life and `bearer` see 59. A no-refresh caller reads the stored token
+        // as it is and fails honestly if it will not do.
+        let mut token = if allow_refresh {
+            self.bearer()?
+        } else {
+            self.creds
+                .stored_token(&self.server)?
+                .context("no usable token - run `docli login`")?
+        };
         let mut rotated = false;
         let resp = loop {
             let resp = self
@@ -212,13 +277,11 @@ impl Api {
                 .post(format!("{}/api/graphql", self.server))
                 .header("authorization", format!("Bearer {token}"))
                 .header("x-docli-cli-version", env!("CARGO_PKG_VERSION"))
-                .json(&serde_json::json!({
-                    "query": "{ viewer { workspaces { id handle name } } }"
-                }))
+                .json(&serde_json::json!({ "query": query }))
                 .send()
-                .context("listing workspaces")?;
+                .with_context(|| what.to_string())?;
             let status = resp.status();
-            if status.as_u16() == 401 && !rotated {
+            if status.as_u16() == 401 && !rotated && allow_refresh {
                 rotated = true;
                 token = self.creds.refresh_single_flight(
                     &self.server,
@@ -228,19 +291,27 @@ impl Api {
                 continue;
             }
             if !status.is_success() {
-                bail!("listing workspaces failed ({status})");
+                bail!("{what} failed ({status})");
             }
             break resp;
         };
-        let v: serde_json::Value = resp.json().context("parsing the workspace list")?;
+        let v: serde_json::Value = resp.json().with_context(|| format!("parsing: {what}"))?;
         if let Some(errs) = v.get("errors").and_then(|e| e.as_array()) {
             if !errs.is_empty() {
                 bail!(
-                    "listing workspaces failed: {}",
+                    "{what} failed: {}",
                     errs[0]["message"].as_str().unwrap_or("GraphQL error")
                 );
             }
         }
+        Ok(v)
+    }
+
+    pub fn workspaces(&self) -> Result<Vec<WorkspaceInfo>> {
+        let v = self.graphql(
+            "{ viewer { workspaces { id handle name } } }",
+            "listing workspaces",
+        )?;
         let list = v["data"]["viewer"]["workspaces"]
             .as_array()
             .cloned()
@@ -248,10 +319,13 @@ impl Api {
         Ok(list
             .iter()
             .filter_map(|w| {
+                // Sanitized AT INGESTION: a workspace name is set by its owner and rendered on
+                // every member's terminal, including inside interactive pickers. Escaping at
+                // each render site is a rule someone forgets; this is a place they cannot.
                 Some(WorkspaceInfo {
                     id: w["id"].as_str()?.parse().ok()?,
-                    handle: w["handle"].as_str()?.to_string(),
-                    name: w["name"].as_str()?.to_string(),
+                    handle: crate::ui::sanitize(w["handle"].as_str()?),
+                    name: crate::ui::sanitize(w["name"].as_str()?),
                 })
             })
             .collect())

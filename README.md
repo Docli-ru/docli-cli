@@ -1,80 +1,118 @@
 # Docli CLI
 
-Локальное **зеркало только для чтения** ваших пространств [докли](https://docli.ru) — для
-опытных пользователей, которые работают преимущественно через агентов для работы с кодом
-(Claude Code, Codex и другие).
+A local **read-only mirror** of your [docli](https://docli.ru) workspaces — built for power
+users who work primarily through coding agents (Claude Code, Codex, and friends).
 
-CLI **дополняет MCP-подключение, а не заменяет его**: агент по-прежнему вносит изменения
-через MCP-подключение к докли, а CLI предоставляет ему быстрый локальный набор файлов для
-чтения и поиска через grep — без отдельного сетевого запроса на каждое чтение.
+The CLI **complements a docli MCP connection, never replaces it**: your agent still writes
+through its MCP connector; the CLI gives it a fast local corpus to read and grep — no network
+round-trip per read.
 
-- **Зеркало — это кэш, который можно пересоздать.** `docli sync` приводит его в соответствие
-  с текущим состоянием сервера; удалить зеркало и синхронизировать его заново безопасно.
-  Локальные правки не поддерживаются: они никогда не отправляются на сервер и перезаписываются
-  при следующем изменении заметки на сервере.
-- **`docli search` выполняет поиск на сервере.** Команда использует тот же BM25-поиск со
-  стеммингом для русского и английского языков, что и веб-приложение, и печатает локальные
-  пути.
-  Локальный grep может дополнить результаты серверного поиска, но отсутствие локального
-  совпадения не доказывает, что данных нет на сервере.
-- **Вложения представлены маркерами.** Каждое вложение зеркалируется как сопутствующий файл
-  `*.docli` с метаданными (ID, MIME-тип, размер, хеш SHA-256 и вики-ссылка); сами байты остаются
-  на сервере и загружаются через MCP.
-- **`docli doctor`** — трёхсторонняя сверка (сервер / диск / состояние) с классами расхождений.
+- **The mirror is a disposable cache.** `docli sync` brings it in line with the current server
+  state; deleting it and syncing again is safe. Local edits are unsupported: they are never
+  uploaded and are overwritten when the note next changes server-side.
+- **`docli search` runs server-side.** It uses the product's BM25 search with Russian and
+  English stemming and prints local paths. Local grep can supplement server results, but a
+  local miss does not prove that content is absent from the server.
+- **Attachments are represented by markers.** Each attachment is mirrored as a `*.docli`
+  metadata sidecar (ID, MIME type, size, SHA-256 digest, and wikilink); its bytes remain on
+  the server and are fetched over MCP.
+- **`docli doctor`** — a three-way reconciliation (server / disk / state) with typed discrepancies.
 
-## Установка
+## Install
 
 ```sh
 curl -fsSL https://docli.ru/install.sh | sh        # macOS / Linux
 irm https://docli.ru/install.ps1 | iex             # Windows (PowerShell)
 ```
 
-Вторичный канал: `npx @docli/cli` (npm). Обновление: `docli self-update` (подпись релиза
-проверяется ключом, зашитым в бинарник).
+Secondary channel: `npx @docli/cli` (npm). Updates: `docli self-update` (release signatures are
+verified against a key pinned inside the binary).
 
-## Быстрый старт
+## Quick start
 
 ```sh
-docli login                  # вход через браузер по loopback OAuth; сохраняет учётные данные устройства
-docli init                   # создаёт docli.toml + SKILL.md для агентов, печатает ваши пространства
-docli init --workspace <id> --dir notes-mirror
-docli sync                   # разовая синхронизация всех монтирований
-docli search "что ищем"      # серверный поиск, локальные пути
+docli init                   # guided setup: sign-in, workspace, directory, agents
 ```
 
-Файл `docli.toml` нужно коммитить: он только перечисляет пространства по ID, а не по
-хэндлам, и не предоставляет доступ. Каталоги зеркал и `.docli/` должны быть указаны в
-`.gitignore`; иначе `docli sync` откажется работать.
+One command walks the whole way: if the device is not connected yet, `docli init` offers to sign
+in, then you pick a workspace from a list (arrow keys — no UUIDs to type), the mirror directory,
+which agent configurations to wire, and whether to append the `.gitignore` lines.
 
-## Подключение агентов для работы с кодом
+The same steps separately, and for scripts where nothing may ask a question:
 
-`docli init` устанавливает контракт зеркала в `.agents/skills/docli-mirror/SKILL.md` — по
-стандартному пути из открытой спецификации Agent Skills. Этот файл нативно читают Claude
-Code, Codex, Gemini CLI, Cursor, Windsurf, Zed, GitHub Copilot в VS Code, Copilot CLI,
-OpenCode и Amp.
+```sh
+docli login                              # browser sign-in via loopback OAuth
+docli list                               # every workspace; the ones mounted here are marked *
+docli init --workspace <id> --dir docli-mirror/notes --gitignore
+docli sync                               # one-shot sync of every mount
+docli search "what you need"             # server search, local paths
+docli status                             # sign-in, mounts, mirror freshness, wired agents
+docli doctor                             # server / disk / state reconciliation
+docli logout                             # disconnect this device and drop the credential
+```
 
-Кроме того, **только по вашему запросу** `docli init` может добавить MCP-подключение этого
-проекта к докли в конфигурации агентов. Для этого используйте `docli init --mcp auto`
-(найденные агенты), `--mcp claude,codex,…` (список) или ответьте на вопрос при интерактивном
-запуске. Созданная
-запись docli содержит URL и необходимые конкретному клиенту параметры транспорта, но не
-содержит токена или других учётных данных: при первом подключении каждый агент
-самостоятельно проходит OAuth-авторизацию в браузере, и добавленную запись docli безопасно
-коммитить. URL содержит метку подключения проекта, которая сохраняется как `mcp_label` в `docli.toml`.
-Параметр `--mcp-label` задаёт собственную метку, а `--mcp-bare` использует URL `…/api/mcp`
-без метки — для клиентов, которые не передают параметр RFC 8707 `resource`. Если
-конфигурацию агента нельзя безопасно изменить автоматически, CLI печатает фрагмент для
-ручной вставки.
+Commit `docli.toml`: it identifies workspaces by ID, never by handle, and grants no access.
 
-## Репозитории
+**Git is not required.** If the project is not a git repository, there is no `.gitignore`
+requirement and everything simply works. The rule applies exactly when a mirror lands inside a
+git work tree: there the mirror directories and `.docli/` must be listed in `.gitignore`, or
+`docli sync` refuses to run — one `git add -A` would otherwise push somebody else's notes to a
+remote. `docli init --gitignore` appends the lines for you (the guided setup asks).
 
-Основной публичный репозиторий и место обсуждений — **GitVerse:
-[agitek/docli-cli](https://gitverse.ru/agitek/docli-cli)**. Зеркало на GitHub
-([Docli-ru/docli-cli](https://github.com/Docli-ru/docli-cli), README на английском) существует
-для интеграции с экосистемой (через Releases распространяются пакеты для Homebrew, Scoop и
-npm). PR принимаются в обоих репозиториях — см. CONTRIBUTING.md.
+## Interactive and non-interactive
 
-## Лицензия
+Every command works both ways. Questions are asked only at an attended terminal; in a pipe, in
+CI, or under `--no-input` nothing is asked, and when an answer is genuinely required the refusal
+names the flag that replaces it (`docli uninstall --yes`).
 
-MIT (см. LICENSE). Исходники CLI и его крейтов (`docli-sync-wire`, `docli-rules`) собираются
-автономно из этого репозитория.
+| Flag | Effect |
+| --- | --- |
+| `--no-input` | Never ask anything (scripts, CI) |
+| `-q`, `--quiet` | Drop the narration; results and warnings stay |
+| `--no-color` | No colour; so do `NO_COLOR`, `TERM=dumb`, and a non-TTY stdout |
+| `--json` | Machine-readable output for `list`, `status`, `search`, `doctor` |
+
+Streams are split: results go to stdout, progress and warnings to stderr — so
+`docli search … | grep`, `docli status --json | jq` and `docli sync 2>/dev/null` all behave.
+
+## Uninstalling
+
+```sh
+docli uninstall              # removes the binary and ~/.docli, disconnecting the device first
+docli uninstall --purge      # also removes this project's mirrors and .docli/
+```
+
+Everything that will be deleted is listed before you confirm. Without `--purge` the project's
+files stay: a mirror is rebuildable, but it lives in your repository and that call is yours.
+`docli.toml` and your agent configurations are never touched.
+
+## Wiring coding agents
+
+`docli init` installs the mirror contract at `.agents/skills/docli-mirror/SKILL.md` — the
+standard path defined by the open Agent Skills specification, read natively by Claude Code,
+Codex, Gemini CLI, Cursor, Windsurf, Zed, GitHub Copilot in VS Code, Copilot CLI, OpenCode,
+and Amp.
+
+In the guided setup, wiring agents is a step of its own: the configurations found here arrive
+pre-ticked, and only what stays ticked is written. It can also — **only if you ask** — add this
+project's docli MCP connection to your agents'
+configs: `docli init --mcp auto` (detected agents), `--mcp claude,codex,…` (a list), or the
+prompt shown during an interactive run. The generated docli entry contains the URL and any
+client-required transport fields, but no token or other credential: each agent authorizes
+itself in the browser on first connection, and the docli entry itself is safe to commit.
+The URL carries a per-project connection label (persisted as
+`mcp_label` in `docli.toml`; override with `--mcp-label`, or `--mcp-bare` for the unlabeled
+`…/api/mcp` if your client doesn't send RFC 8707 `resource`). Agents whose config we can't
+write safely get a copy-paste snippet instead.
+
+## Repositories
+
+The PRIMARY public repository and discussion venue is **GitVerse:
+[agitek/docli-cli](https://gitverse.ru/agitek/docli-cli)** (Russian README). This GitHub mirror
+([Docli-ru/docli-cli](https://github.com/Docli-ru/docli-cli)) exists for ecosystem reach
+(Releases feed brew/scoop/npm). PRs are accepted in both — see CONTRIBUTING.md.
+
+## License
+
+MIT (see LICENSE). The CLI and its crates (`docli-sync-wire`, `docli-rules`) build standalone
+from this repository.

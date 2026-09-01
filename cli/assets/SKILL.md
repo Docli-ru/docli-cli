@@ -79,3 +79,9 @@ it. ("Read-only" is a property of this CLI's behavior, not of the credential.)
 | `docli sync --full` | authoritative resync: re-derive the mirror, prune stale files |
 | `docli search "q"` | server search across mounts, local paths in the output |
 | `docli doctor` | full three-way reconciliation (server / disk / state) — slow, thorough |
+| `docli status` | one screen: sign-in, mounts, mirror freshness, wired agents |
+| `docli list` | every workspace this account reaches; `*` marks the ones mounted here |
+
+Add `--json` to `search`, `doctor`, `status` and `list` for machine-readable output, and
+`--no-input` to guarantee nothing prompts. Results go to stdout, progress and warnings to
+stderr, so parsing stdout never picks up narration.

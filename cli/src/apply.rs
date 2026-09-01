@@ -113,13 +113,13 @@ fn marker_abs(
         // workspace's subdir would delete that sibling's marker).
         let Some(leaf) = relocated_leaf(marker_path, ws) else {
             anyhow::bail!(
-                "marker path {marker_path:?} escapes this workspace's marker namespace — \
+                "marker path {marker_path:?} escapes this workspace's marker namespace - \
                  refusing (containment)"
             );
         };
         Ok(control.markers_dir().join(ws.to_string()).join(leaf))
     } else if marker_path.is_empty() {
-        anyhow::bail!("empty marker path — refusing (containment)")
+        anyhow::bail!("empty marker path - refusing (containment)")
     } else {
         contained_join(mount_root, marker_path)
     }
@@ -153,7 +153,7 @@ fn write_tracked(
         // the page: an abort never advances the cursor and wedges the mount (Codex round 4).
         if let Err(e) = fs::create_dir_all(parent) {
             return Ok(WriteOutcome::Parked(format!(
-                "cannot create the parent directory for {local} ({e}) — run `docli sync --full` \
+                "cannot create the parent directory for {local} ({e}) - run `docli sync --full` \
                  once the blocking file is gone"
             )));
         }
@@ -172,7 +172,7 @@ fn write_tracked(
                 // this page — deletions are deferred, so retry after them.
                 Some(_) => WriteOutcome::DirInTheWay,
                 None => WriteOutcome::Parked(format!(
-                    "an untracked directory occupies {local} — remove it and run `docli sync --full`"
+                    "an untracked directory occupies {local} - remove it and run `docli sync --full`"
                 )),
             });
         }
@@ -195,7 +195,7 @@ fn write_tracked(
                     Ok(WriteOutcome::Adopted)
                 } else {
                     Ok(WriteOutcome::Parked(format!(
-                        "a divergent untracked file occupies {local} — remove it and run \
+                        "a divergent untracked file occupies {local} - remove it and run \
                          `docli sync --full`"
                     )))
                 }
@@ -418,7 +418,7 @@ pub fn apply_page(
             if prefixes.iter().any(|p| rel.starts_with(p.as_str())) {
                 next.insert(
                     id,
-                    "inside a parked folder — healed by a server-side rename of the ancestor"
+                    "inside a parked folder - healed by a server-side rename of the ancestor"
                         .to_string(),
                 );
                 continue;
@@ -611,10 +611,10 @@ pub fn apply_page(
     dirs.sort_by_key(|(_, d)| std::cmp::Reverse(d.matches('/').count()));
     for (_, rel) in dirs {
         if rel.is_empty() {
-            continue; // empty resolves to the root itself — never ours (Codex round 17)
+            continue; // empty resolves to the root itself - never ours (Codex round 17)
         }
         let Ok(d) = contained_join(mount_root, &rel) else {
-            continue; // corrupted state path — nothing we materialized (Codex round 16)
+            continue; // corrupted state path - nothing we materialized (Codex round 16)
         };
         if d.exists() && fs::remove_dir(&d).is_err() {
             stats.pending_dir_removals.push(rel);
@@ -710,7 +710,7 @@ pub fn apply_page(
             blocked @ (WriteOutcome::Parked(_) | WriteOutcome::DirInTheWay) => {
                 let reason = match blocked {
                     WriteOutcome::DirInTheWay => format!(
-                        "a directory still occupies {} — remove it and run `docli sync --full`",
+                        "a directory still occupies {} - remove it and run `docli sync --full`",
                         r.local
                     ),
                     WriteOutcome::Parked(reason) => reason,
@@ -780,7 +780,7 @@ fn perform_put(
                     WriteOutcome::DirInTheWay
                 } else {
                     WriteOutcome::Parked(format!(
-                        "an untracked file occupies the folder path {local} — remove it and                          run `docli sync --full`"
+                        "an untracked file occupies the folder path {local} - remove it and                          run `docli sync --full`"
                     ))
                 });
             }
@@ -788,7 +788,7 @@ fn perform_put(
                 // Same non-fatal rule as write_tracked's ancestor mkdir (a page must never
                 // abort on a blocked path — it would replay forever).
                 return Ok(WriteOutcome::Parked(format!(
-                    "cannot create the directory {local} ({e}) — run `docli sync --full` once \
+                    "cannot create the directory {local} ({e}) - run `docli sync --full` once \
                      the blocking file is gone"
                 )));
             }
@@ -1012,10 +1012,10 @@ pub fn prune_undelivered(
     let mut pending = Vec::new();
     for (_, rel) in dirs {
         if rel.is_empty() {
-            continue; // empty resolves to the root itself — never ours (Codex round 17)
+            continue; // empty resolves to the root itself - never ours (Codex round 17)
         }
         let Ok(d) = contained_join(mount_root, &rel) else {
-            continue; // corrupted state path — nothing we materialized (Codex round 16)
+            continue; // corrupted state path - nothing we materialized (Codex round 16)
         };
         if d.exists() && fs::remove_dir(&d).is_err() {
             pending.push(rel);
@@ -1583,7 +1583,7 @@ mod tests {
         assert!(f.mount.join("X.md").is_file());
         assert!(
             !f.mount.join("a.md").exists(),
-            "the moved-from path must not orphan (it is untracked after the move — no CLI verb \
+            "the moved-from path must not orphan (it is untracked after the move - no CLI verb \
              could ever remove it)"
         );
         assert_eq!(f.state.nodes[&Uuid::from_u128(2)].local_path, "X.md");

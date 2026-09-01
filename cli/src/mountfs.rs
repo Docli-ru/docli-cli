@@ -30,7 +30,7 @@ pub fn refuse_symlinks(mount: &Path) -> Result<()> {
     let md = fs::symlink_metadata(mount).with_context(|| format!("stat {}", mount.display()))?;
     if md.file_type().is_symlink() {
         bail!(
-            "{} is a symlink — deliveries could escape the mount; refuse to sync through links",
+            "{} is a symlink - deliveries could escape the mount; refuse to sync through links",
             mount.display()
         );
     }
@@ -41,7 +41,7 @@ pub fn refuse_symlinks(mount: &Path) -> Result<()> {
             let ft = entry.file_type()?;
             if ft.is_symlink() {
                 bail!(
-                    "{} is a symlink inside the mirror — deliveries could escape the mount; \
+                    "{} is a symlink inside the mirror - deliveries could escape the mount; \
                      remove it",
                     entry.path().display()
                 );
@@ -64,12 +64,12 @@ pub fn contained_join(root: &Path, rel: &str) -> Result<PathBuf> {
     }
     let p = Path::new(rel);
     if p.is_absolute() {
-        bail!("path {rel:?} is absolute — refusing (containment)");
+        bail!("path {rel:?} is absolute - refusing (containment)");
     }
     for c in p.components() {
         match c {
             std::path::Component::Normal(_) => {}
-            _ => bail!("path {rel:?} escapes the mount root — refusing (containment)"),
+            _ => bail!("path {rel:?} escapes the mount root - refusing (containment)"),
         }
     }
     Ok(root.join(p))
@@ -114,7 +114,7 @@ pub fn claim_mount(mount: &Path, owner_docli_dir: &Path, ws: Uuid) -> Result<Mou
         .unwrap_or(false)
     {
         bail!(
-            "{} is a symlink — refuse to mount through links",
+            "{} is a symlink - refuse to mount through links",
             mount.display()
         );
     }
@@ -132,7 +132,7 @@ pub fn claim_mount(mount: &Path, owner_docli_dir: &Path, ws: Uuid) -> Result<Mou
         let occupied = fs::read_dir(&root)?.next().is_some();
         if occupied {
             bail!(
-                "{} is not empty — a mirror starts empty; point the mount at a fresh directory \
+                "{} is not empty - a mirror starts empty; point the mount at a fresh directory \
                  (or delete the leftovers deliberately)",
                 root.display()
             );
@@ -156,7 +156,7 @@ pub fn claim_mount(mount: &Path, owner_docli_dir: &Path, ws: Uuid) -> Result<Mou
         .with_context(|| format!("opening {}", marker_path.display()))?;
     if f.try_lock().is_err() {
         bail!(
-            "another docli sync/doctor is running on {} — one run per mount at a time",
+            "another docli sync/doctor is running on {} - one run per mount at a time",
             root.display()
         );
     }
@@ -165,7 +165,7 @@ pub fn claim_mount(mount: &Path, owner_docli_dir: &Path, ws: Uuid) -> Result<Mou
         .with_context(|| format!("{} is not a docli mount marker", marker_path.display()))?;
     if marker.owner != owner || marker.workspace != ws {
         bail!(
-            "{} is already claimed by another project ({} / workspace {}) — a mirror has exactly \
+            "{} is already claimed by another project ({} / workspace {}) - a mirror has exactly \
              one owner; pick a different mount dir or delete that mirror deliberately",
             root.display(),
             marker.owner,
@@ -191,7 +191,17 @@ pub fn verify_mount_identity(mount: &Path, owner_docli_dir: &Path, ws: Uuid) -> 
         .unwrap_or_else(|_| owner_docli_dir.to_path_buf())
         .display()
         .to_string();
-    let Ok(raw) = fs::read_to_string(mount.join(MOUNT_MARKER)) else {
+    // The MARKER itself must be a regular file. `read_to_string` follows symlinks, so
+    // `src/MOUNT.docli -> ../real-mirror/MOUNT.docli` would let any directory borrow another
+    // mirror's identity — and this check is what `uninstall --purge` deletes on.
+    let marker_path = mount.join(MOUNT_MARKER);
+    if !fs::symlink_metadata(&marker_path)
+        .map(|m| m.file_type().is_file())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let Ok(raw) = fs::read_to_string(&marker_path) else {
         return false;
     };
     serde_json::from_str::<MountMarker>(&raw)
@@ -309,7 +319,7 @@ pub fn write_atomic(target: &Path, bytes: &[u8]) -> Result<()> {
 /// Remove a file the CLI owns, lifting the read-only attribute first (the Windows shape).
 pub fn remove_owned_file(path: &Path) -> Result<()> {
     if !path.exists() {
-        return Ok(()); // idempotent — a crashed previous cycle may have removed it already
+        return Ok(()); // idempotent - a crashed previous cycle may have removed it already
     }
     let _ = set_readonly(path, false);
     fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
@@ -338,6 +348,35 @@ pub fn set_incomplete_marker(mount_root: &Path, incomplete: bool) -> Result<()> 
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_marker_cannot_borrow_another_mirrors_identity() {
+        // `--purge` deletes on the strength of this check: a directory that merely POINTS at a
+        // real mirror's marker must not be able to claim it.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let control = root.join(".docli");
+        fs::create_dir_all(&control).unwrap();
+        let ws = uuid::Uuid::from_u128(7);
+        let owner = fs::canonicalize(&control).unwrap().display().to_string();
+        let real = root.join("real-mirror");
+        fs::create_dir_all(&real).unwrap();
+        fs::write(
+            real.join(MOUNT_MARKER),
+            format!("{{\"owner\":\"{owner}\",\"workspace\":\"{ws}\"}}"),
+        )
+        .unwrap();
+        assert!(verify_mount_identity(&real, &control, ws));
+
+        let borrowed = root.join("src");
+        fs::create_dir_all(&borrowed).unwrap();
+        std::os::unix::fs::symlink(real.join(MOUNT_MARKER), borrowed.join(MOUNT_MARKER)).unwrap();
+        assert!(
+            !verify_mount_identity(&borrowed, &control, ws),
+            "a symlinked marker must not confer ownership"
+        );
+    }
+
     use super::*;
 
     #[test]

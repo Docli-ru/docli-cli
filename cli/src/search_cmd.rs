@@ -20,6 +20,12 @@ use crate::http::Api;
 use crate::state::{ControlRoot, TrackedKind, WsState};
 
 pub fn run(project: &Project, api: &Api, query: &str, json: bool) -> Result<i32> {
+    if json {
+        crate::ui::machine_mode();
+    } else {
+        // Hits are the product; so is the «index was incomplete» caveat printed beside them.
+        crate::ui::report_mode();
+    }
     // Request-level validation only (Codex round 24): search works without a cache, so the
     // mirror-write geometry rules must not block a server query.
     validate_config(&project.config)?;
@@ -50,7 +56,7 @@ pub fn run(project: &Project, api: &Api, query: &str, json: bool) -> Result<i32>
         // and skip rather than panicking over fifteen good outcomes.
         let Some(mount) = mounts.iter().find(|m| m.workspace == o.workspace_id) else {
             eprintln!(
-                "docli: the server answered for an unrequested workspace {} — skipping",
+                "docli: the server answered for an unrequested workspace {} - skipping",
                 o.workspace_id
             );
             continue;
@@ -67,8 +73,8 @@ pub fn run(project: &Project, api: &Api, query: &str, json: bool) -> Result<i32>
             Ok(st) => st.filter(|st| st.scope_key == mount.folder && !st.from_zero && st.at_head),
             Err(e) => {
                 eprintln!(
-                    "docli: не удалось прочитать локальный кэш ({e:#}) — показываю результаты \
-                     без локальных путей"
+                    "docli: could not read the local cache ({e:#}) - showing results without \
+                     local paths"
                 );
                 None
             }
@@ -88,26 +94,27 @@ pub fn run(project: &Project, api: &Api, query: &str, json: bool) -> Result<i32>
     if json {
         println!("{}", serde_json::to_string_pretty(&rendered)?);
     } else {
+        let show_mount = project.config.mounts.len() > 1;
         for r in &rendered {
-            print_workspace(r);
+            print_workspace(r, show_mount);
         }
         if !any_hit {
             // A REFUSED workspace was not searched at all — strictly MORE inconclusive about
             // absence than a degraded one, so it must never fold into a bare «no hits» either
             // (the split-brain rule's summary half).
             if any_refused {
-                println!(
-                    "no hits — but at least one workspace was NOT searched (see the refusal \
-                     above), so this is INCONCLUSIVE about absence"
+                crate::ui::warn(
+                    "no hits - but at least one workspace was NOT searched (see the refusal \
+                     above), so this is INCONCLUSIVE about absence",
                 );
             } else if any_degraded {
                 // Never a bare empty result on a degraded index.
-                println!(
-                    "no hits — but the note index was DEGRADED for at least one workspace, so \
-                     this is INCONCLUSIVE about absence; retry shortly"
+                crate::ui::warn(
+                    "no hits - but the note index was DEGRADED for at least one workspace, so \
+                     this is INCONCLUSIVE about absence; retry shortly",
                 );
             } else {
-                println!("no hits");
+                crate::ui::detail("no hits");
             }
         }
     }
@@ -255,7 +262,27 @@ fn render_workspace(
     }
 }
 
-fn print_workspace(r: &RenderedWorkspace) {
+/// One terminal line, ellipsised. A snippet that wraps turns a list of hits into a paragraph
+/// and costs the reader the scannable left edge.
+fn clip(s: &str) -> String {
+    let width = console::Term::stdout().size().1.clamp(40, 200) as usize;
+    let max = width.saturating_sub(8);
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push_str("...");
+    out
+}
+
+/// `show_mount` gates the `[mount]` prefix: with a single mount, the local path already
+/// starts with the mount directory, so the tag is pure repetition on every line.
+fn print_workspace(r: &RenderedWorkspace, show_mount: bool) {
+    let tag = if show_mount {
+        format!("{} ", crate::ui::dim(&format!("[{}]", r.mount)))
+    } else {
+        String::new()
+    };
     if let Some(code) = &r.refused {
         // Per-code guidance, same split as sync's arms: «попросите доступ» is ONLY for the
         // no-access class — telling a user to ask a colleague about their own entitlement
@@ -263,51 +290,66 @@ fn print_workspace(r: &RenderedWorkspace) {
         // itself comes from sync_cmd's single builder (one reader of one message).
         let line = match code.as_str() {
             "UPGRADE_REQUIRED" => {
-                "синхронизация не включена для вашего аккаунта — пространство пропущено".to_string()
+                "sync is not enabled for your account - workspace skipped".to_string()
             }
-            "INTERNAL" => "временная ошибка на сервере — повторите поиск".to_string(),
+            "INTERNAL" => "a temporary server error - run the search again".to_string(),
             _ => crate::sync_cmd::no_access_message(&r.mount),
         };
-        println!("[{}] {code}: {line}", r.mount);
+        crate::ui::refuse(&format!("[{}] {code}: {line}", r.mount));
         return;
     }
     if r.degraded {
-        println!(
-            "[{}] ВНИМАНИЕ: индекс заметок был неполон для этого запроса — отсутствие \
-             результата здесь ничего не доказывает",
+        crate::ui::warn(&format!(
+            "[{}] the note index was incomplete for this query - a missing result here proves \
+             nothing",
             r.mount
-        );
+        ));
     }
     for h in &r.hits {
+        // The PATH is the answer — bold and on its own line; the snippet is context, dimmed
+        // and clipped to one terminal line so a screenful of hits stays a list rather than a
+        // wall of prose.
         match &h.local_path {
-            Some(l) => println!("[{}] {}", r.mount, l),
-            None => println!(
-                "[{}] {} — not mirrored (run `docli sync`, then `docli doctor` if it persists)",
-                r.mount, h.server_path
-            ),
+            Some(l) => crate::ui::line(&format!("{tag}{}", console::style(l).bold())),
+            None => crate::ui::line(&format!(
+                "{tag}{} {}",
+                console::style(&h.server_path).bold(),
+                crate::ui::dim("- not mirrored (run docli sync, then docli doctor if it persists)")
+            )),
         }
         if let Some(s) = &h.snippet {
-            println!("    {}", s.replace('\n', " "));
+            crate::ui::line(&format!(
+                "    {}",
+                crate::ui::dim(&clip(&s.replace('\n', " ")))
+            ));
         }
     }
     for a in &r.attachments {
         match &a.local_path {
-            Some(l) => println!("[{}] {} (marker — bytes live on the server)", r.mount, l),
-            None => println!("[{}] {} — file, not mirrored", r.mount, a.server_path),
+            Some(l) => crate::ui::line(&format!(
+                "{tag}{} {}",
+                console::style(l).bold(),
+                crate::ui::dim("(marker - the bytes live on the server)")
+            )),
+            None => crate::ui::line(&format!(
+                "{tag}{} {}",
+                console::style(&a.server_path).bold(),
+                crate::ui::dim("- a file, not mirrored")
+            )),
         }
     }
     if r.attachments_truncated {
-        println!(
-            "[{}] file matches truncated — more files match than shown",
+        crate::ui::detail(&format!(
+            "[{}] file matches truncated - more files match than are shown",
             r.mount
-        );
+        ));
     }
     if r.attachments_query_truncated {
-        println!(
-            "[{}] file matches may be a SUPERSET (the query had more terms than the file arm \
-             applies)",
+        crate::ui::detail(&format!(
+            "[{}] file matches may be a SUPERSET of the query (it had more terms than the \
+             file arm applies)",
             r.mount
-        );
+        ));
     }
 }
 
@@ -397,7 +439,7 @@ mod tests {
             id: Uuid::from_u128(id),
             name: path.rsplit('/').next().unwrap().into(),
             path: path.into(),
-            snippet: "…".into(),
+            snippet: "...".into(),
             rank: 1.0,
         }
     }
@@ -490,11 +532,11 @@ mod tests {
         assert_eq!(r.hits[0].local_path.as_deref(), Some("mirror/docs/a.md"));
         assert_eq!(
             r.hits[1].local_path, None,
-            "stat-miss renders «not mirrored», never a path"
+            "stat-miss renders `not mirrored`, never a path"
         );
         assert_eq!(
             r.hits[2].local_path, None,
-            "an untracked hit renders «not mirrored»"
+            "an untracked hit renders `not mirrored`"
         );
     }
 
@@ -558,7 +600,7 @@ mod tests {
         assert!(r.attachments[0].local_path.is_none());
         assert!(
             any,
-            "hits still count as hits — absence of a PATH is not absence of the note"
+            "hits still count as hits - absence of a PATH is not absence of the note"
         );
     }
 
@@ -567,7 +609,7 @@ mod tests {
     #[test]
     fn the_search_refusal_copy_never_says_token() {
         let msg = crate::sync_cmd::no_access_message("книга продаж");
-        assert!(!msg.to_lowercase().contains("токен"), "{msg}");
-        assert!(msg.contains("попросите доступ"), "{msg}");
+        assert!(!msg.to_lowercase().contains("token"), "{msg}");
+        assert!(msg.contains("ask the workspace owner"), "{msg}");
     }
 }

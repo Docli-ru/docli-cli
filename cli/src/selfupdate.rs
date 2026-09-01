@@ -65,7 +65,7 @@ pub fn verify_manifest(manifest_bytes: &[u8], sig: &str, pubkey_b64: &str) -> Re
     let key = pubkey_b64.trim();
     if key.is_empty() {
         bail!(
-            "this build carries no pinned release key — self-update is disabled until the \
+            "this build carries no pinned release key - self-update is disabled until the \
              release keypair is minted (reinstall via docli.ru/install.sh instead)"
         );
     }
@@ -74,7 +74,7 @@ pub fn verify_manifest(manifest_bytes: &[u8], sig: &str, pubkey_b64: &str) -> Re
     let signature =
         minisign_verify::Signature::decode(sig).context("the manifest signature is malformed")?;
     pk.verify(manifest_bytes, &signature, false)
-        .context("the manifest SIGNATURE does not verify — refusing to update")?;
+        .context("the manifest SIGNATURE does not verify - refusing to update")?;
     serde_json::from_slice(manifest_bytes).context("parsing the verified manifest")
 }
 
@@ -103,7 +103,7 @@ pub fn run() -> Result<i32> {
 
     let current = env!("CARGO_PKG_VERSION");
     if manifest.version == current {
-        println!("docli {current} is already the latest");
+        crate::ui::ok(&format!("docli {current} is already the latest"));
         return Ok(0);
     }
     // A validly SIGNED old manifest is still a downgrade an artifacts-host attacker can replay
@@ -115,12 +115,12 @@ pub fn run() -> Result<i32> {
     match (parse_semver(&manifest.version), parse_semver(current)) {
         (Some(m), Some(c)) if m > c => {}
         (Some(_), Some(_)) => bail!(
-            "the manifest offers {} but this binary is {current} — refusing a downgrade \
+            "the manifest offers {} but this binary is {current} - refusing a downgrade \
              (reinstall via docli.ru/install.sh if you really want an older version)",
             manifest.version
         ),
         _ => bail!(
-            "the manifest version {} is not a plain x.y.z (this binary: {current}) — refusing \
+            "the manifest version {} is not a plain x.y.z (this binary: {current}) - refusing \
              (release manifests are always plain semver)",
             manifest.version
         ),
@@ -129,20 +129,22 @@ pub fn run() -> Result<i32> {
     let Some(t) = manifest.targets.get(&target) else {
         bail!("the manifest has no artifact for {target}");
     };
-    println!(
-        "updating docli {current} → {} ({target})…",
+    crate::ui::detail(&format!(
+        "updating docli {current} {} {} ({target})...",
+        crate::ui::arrow(),
         manifest.version
-    );
+    ));
     let bin = get(&t.file)?;
     let got = hex::encode(Sha256::digest(&bin));
     if got != t.sha256.to_lowercase() {
         bail!(
-            "downloaded artifact digest mismatch (manifest {}, got {got}) — refusing to install",
+            "downloaded artifact digest mismatch (manifest {}, got {got}) - refusing to \
+             install",
             t.sha256
         );
     }
     swap_binary(&bin)?;
-    println!("updated to {}", manifest.version);
+    crate::ui::ok(&format!("updated to {}", manifest.version));
     Ok(0)
 }
 
@@ -170,7 +172,7 @@ fn swap_binary(bytes: &[u8]) -> Result<()> {
             return Err(anyhow::Error::new(e).context(if restored {
                 "installing the new binary (the previous binary was restored)"
             } else {
-                "installing the new binary — AND restoring the previous one failed; \
+                "installing the new binary - AND restoring the previous one failed; \
                  re-run the installer to recover"
             }));
         }

@@ -1,6 +1,6 @@
 [package]
 name = "docli-cli"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 # MSRV for the public mirror: latest stable we build and verify with (user ruling 2026-08-30 —
 # no groveling for old toolchains). Kept uniform across the three mirror crates; clippy's
@@ -48,6 +48,11 @@ minisign-verify = "0.2"
 # Format-preserving merges into USER-owned agent configs (`agents.rs`, D12.4) — plain `toml`
 # would re-serialize and destroy the user's comments/layout.
 toml_edit = "0.25.13"
+# The interactive `docli init` journey + the one output vocabulary (`ui.rs`, 0.1.1).
+# `dialoguer` is default-features-OFF deliberately: `editor`/`password` would pull tempfile +
+# zeroize for prompts this CLI never shows.
+dialoguer = { version = "0.12", default-features = false }
+console = "0.16"
 
 [dev-dependencies]
 tempfile = "3"

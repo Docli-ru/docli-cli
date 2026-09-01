@@ -20,6 +20,11 @@ anyhow = "1.0"
 unicode-normalization = "0.1.24"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
+# Matches the monorepo's `release-cli` profile, so a binary built from this mirror is the same
+# artifact as the published one. `opt-level` stays at release's default 3 (the highest; `s`/`z`
+# trade sync throughput for a little size), and `panic` stays at unwind so a panic mid-prompt
+# still runs Drop and restores the terminal.
 [profile.release]
-strip = true
+strip = "symbols"
 lto = true
+codegen-units = 1

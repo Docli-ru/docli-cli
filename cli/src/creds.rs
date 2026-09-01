@@ -79,12 +79,42 @@ impl CredsStore {
         // …UNDER the credentials lock (Codex round 22): an unlocked rewrite could resume
         // with a stale snapshot after a concurrent refresh rotated the tokens, and the next
         // refresh would then replay a consumed refresh token into terminal lineage revocation.
+        // The REFUSAL is unconditional and comes first: a credentials entry that is not a
+        // regular file (a symlink pointing anywhere) must never be used, and that question is a
+        // no-follow stat needing no lock at all. Gating it behind the lock meant a second
+        // concurrent command skipped the check entirely and read through the symlink.
+        match fs::symlink_metadata(store.file_path()) {
+            Ok(md) if md.file_type().is_file() => {}
+            Ok(_) => bail!(
+                "{} is not a regular file - refusing to use it for credentials",
+                store.file_path().display()
+            ),
+            Err(_) => return Ok(store),
+        }
         let lock = OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
             .open(store.lock_path())?;
-        lock.lock().context("waiting for the credentials lock")?;
+        // TRY, don't wait, for the REWRITE half only. Re-hardening is best-effort maintenance,
+        // while the holder of this lock may be a concurrent refresh sleeping out a
+        // `503 Retry-After` — up to six minutes. Blocking here made merely OPENING the store
+        // (every `docli status`) inherit that wait.
+        // CONTENTION and FAILURE are different answers. `WouldBlock` means another docli
+        // command holds the lock — skip the best-effort re-hardening and carry on. Any other
+        // error (a filesystem without advisory locks, an I/O failure) means we cannot tell, and
+        // silently reading a possibly mode-0644 credentials file on that basis is the wrong
+        // trade for a file holding a refresh token.
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(store),
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "cannot lock {} to verify the credential file's permissions",
+                    store.lock_path().display()
+                )))
+            }
+        }
         let rehard = (|| {
             let existing = store.file_path();
             match fs::symlink_metadata(&existing) {
@@ -99,7 +129,7 @@ impl CredsStore {
                     restrict_file(&existing)?;
                 }
                 Ok(_) => bail!(
-                    "{} is not a regular file — refusing to use it for credentials",
+                    "{} is not a regular file - refusing to use it for credentials",
                     existing.display()
                 ),
                 Err(_) => {}
@@ -172,10 +202,37 @@ impl CredsStore {
         })
     }
 
+    /// Every server this machine holds a credential for — `docli logout --all` and
+    /// `docli uninstall` both need the list, and neither may guess it from a project file (a
+    /// dev stack's origin lives only here).
+    pub fn servers(&self) -> Result<Vec<String>> {
+        Ok(self.read()?.servers.keys().cloned().collect())
+    }
+
     pub fn remove(&self, server: &str) -> Result<()> {
         self.mutate(&|f| {
             f.servers.remove(server);
         })
+    }
+
+    /// Remove the entry for `server` ONLY while it still holds `refresh_token` — the compare
+    /// happens under the same lock as the write. `docli logout` reads a credential, revokes it
+    /// over the network, and then deletes; a `docli login` finishing inside that window would
+    /// otherwise have its fresh lineage deleted locally while staying live on the server, with
+    /// no local copy left to revoke it with. Returns false when the entry had moved on.
+    pub fn remove_if_current(&self, server: &str, refresh_token: &str) -> Result<bool> {
+        let removed = std::cell::Cell::new(false);
+        self.mutate(&|f| {
+            let current_matches = f
+                .servers
+                .get(server)
+                .is_some_and(|c| c.refresh_token == refresh_token);
+            if current_matches {
+                f.servers.remove(server);
+                removed.set(true);
+            }
+        })?;
+        Ok(removed.get())
     }
 
     /// For call sites ALREADY holding the credentials lock (`refresh_locked`): re-acquiring
@@ -230,6 +287,69 @@ impl CredsStore {
         result
     }
 
+    /// Revoke every stored credential and clear the store, ATOMICALLY with respect to any other
+    /// docli process — the whole operation runs under the same advisory lock `login` and
+    /// `refresh` take, so a credential cannot appear halfway through.
+    ///
+    /// This exists because `docli uninstall` cannot be built out of `logout`: three review
+    /// rounds went into check-then-act variants, and every one of them could still delete a
+    /// credential minted a microsecond after the last check. The rule it enforces is **never
+    /// delete a credential that was not revoked** — an entry whose revocation the server did
+    /// not confirm STAYS in the file, and its origin is returned so the caller can stop and say
+    /// so. (`logout` deliberately does the opposite: it drops what it could not revoke, because
+    /// leaving a live token on the disk of a machine you are signing out of is worse. Only
+    /// `uninstall`, which also deletes the binary, needs this stricter shape.)
+    ///
+    /// `revoke` reports whether the SERVER confirmed. Returns the origins still present.
+    pub fn revoke_all_and_clear(
+        &self,
+        revoke: &dyn Fn(&str, &ServerCreds) -> bool,
+    ) -> Result<Vec<String>> {
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.lock_path())?;
+        lock.lock().context("waiting for the credentials lock")?;
+        let result = (|| {
+            let mut f = self.read()?;
+            let entries: Vec<(String, ServerCreds)> = f
+                .servers
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            for (server, creds) in entries {
+                if revoke(&server, &creds) {
+                    f.servers.remove(&server);
+                }
+            }
+            let remaining: Vec<String> = f.servers.keys().cloned().collect();
+            if remaining.is_empty() {
+                // Removed under the SAME lock: a login waiting on it cannot slip a credential
+                // into a file we are about to delete.
+                //
+                // The LOCK FILE deliberately STAYS. Unlinking it would leave a waiter holding
+                // the now-unlinked inode while the next process creates a fresh one — two
+                // processes each believing they hold the credential lock, which is worse than
+                // an empty file left behind. The caller reports the leftover instead.
+                let _ = fs::remove_file(self.file_path());
+                let _ = fs::remove_file(self.dir.join("install_id"));
+            } else {
+                self.write(&f)?;
+            }
+            Ok(remaining)
+        })();
+        let _ = lock.unlock();
+        result
+    }
+
+    /// The stored access token AS IT IS — no refresh, no network, no lock. For readers that
+    /// must be bounded in time (`docli status`): refreshing can meet a `503 Retry-After` and
+    /// sleep for minutes, which is the wrong trade for a screen that mostly reports local state.
+    pub fn stored_token(&self, server: &str) -> Result<Option<String>> {
+        Ok(self.get(server)?.map(|c| c.access_token))
+    }
+
     /// A valid bearer for `server`, refreshing single-flight when needed.
     /// `refresh` performs the network exchange: `(refresh_token) → (access, refresh, expires_in)`.
     pub fn bearer(
@@ -238,7 +358,7 @@ impl CredsStore {
         refresh: &dyn Fn(&str) -> Result<RefreshOutcome>,
     ) -> Result<String> {
         let Some(c) = self.get(server)? else {
-            bail!("not signed in to {server} — run `docli login`");
+            bail!("not signed in to {server} - run `docli login`");
         };
         if c.expires_at > now_unix() + REFRESH_SKEW_SECS {
             return Ok(c.access_token);
@@ -285,7 +405,7 @@ impl CredsStore {
             // `rejected` set, "still fresh" is NOT enough — the stored token short-circuits
             // only when it is a DIFFERENT one than the server refused.
             let Some(c) = self.get(server)? else {
-                bail!("not signed in to {server} — run `docli login`");
+                bail!("not signed in to {server} - run `docli login`");
             };
             let usable = c.expires_at > now_unix() + REFRESH_SKEW_SECS
                 && rejected != Some(c.access_token.as_str());
@@ -311,14 +431,14 @@ impl CredsStore {
                     // Terminal: never retry (a dead lineage stays dead). The creds entry goes,
                     // so the next command says «run docli login» immediately.
                     self.remove_unlocked(server)?;
-                    bail!("your sign-in to {server} is no longer valid — run `docli login`");
+                    bail!("your sign-in to {server} is no longer valid - run `docli login`");
                 }
                 RefreshOutcome::Suspended { retry_after_secs } => {
                     attempt += 1;
                     if attempt > SUSPEND_RETRIES {
                         bail!(
-                            "{server} says the connection is suspended — try again later \
-                             (kept your credentials)"
+                            "{server} says the connection is suspended - try again later \
+                             (your credentials were kept)"
                         );
                     }
                     let wait = retry_after_secs.min(MAX_RETRY_AFTER_SECS);
@@ -417,7 +537,7 @@ fn restrict_windows(p: &Path) -> Result<()> {
         .context("running icacls to restrict the credentials file")?;
     if !status.success() {
         bail!(
-            "could not set an owner-only DACL on {} (icacls exit {status}) — refusing to store \
+            "could not set an owner-only DACL on {} (icacls exit {status}) - refusing to store \
              credentials world-readable",
             p.display()
         );
@@ -611,6 +731,28 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tok, "rotated");
+    }
+
+    #[test]
+    fn a_logout_does_not_delete_a_credential_a_concurrent_login_replaced() {
+        let (_t, s) = store();
+        seed(&s, "srv", 0);
+        // The logout read `r1`; meanwhile a login stored a fresh lineage.
+        s.put(
+            "srv",
+            ServerCreds {
+                access_token: "new-access".into(),
+                refresh_token: "r2".into(),
+                expires_at: now_unix() + 3600,
+                install_id: "i1".into(),
+            },
+        )
+        .unwrap();
+        assert!(!s.remove_if_current("srv", "r1").unwrap());
+        assert!(s.get("srv").unwrap().is_some(), "the new lineage survives");
+        // …and the honest case still removes.
+        assert!(s.remove_if_current("srv", "r2").unwrap());
+        assert!(s.get("srv").unwrap().is_none());
     }
 
     #[test]
