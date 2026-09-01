@@ -1,6 +1,6 @@
-# Docli CLI
+# docli cli
 
-A local **read-only mirror** of your [docli](https://docli.ru) workspaces — built for power
+A local **read-only mirror** of your [**docli**](https://docli.ru) workspaces — built for power
 users who work primarily through coding agents (Claude Code, Codex, and friends).
 
 The CLI **complements a docli MCP connection, never replaces it**: your agent still writes

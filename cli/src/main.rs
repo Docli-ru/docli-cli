@@ -14,18 +14,18 @@ use docli_cli::{
 /// `--version` the full block; help carries the site + copyright in the footer.
 const LONG_VERSION_UNICODE: &str = concat!(
     env!("CARGO_PKG_VERSION"),
-    "\nDocli CLI \u{2014} https://docli.ru\n\u{a9} 2026 OOO Agitek. MIT License."
+    "\ndocli cli \u{2014} https://docli.ru\n\u{a9} 2026 Agitek. MIT License."
 );
 const LONG_VERSION_ASCII: &str = concat!(
     env!("CARGO_PKG_VERSION"),
-    "\nDocli CLI - https://docli.ru\n(c) 2026 OOO Agitek. MIT License."
+    "\ndocli cli - https://docli.ru\n(c) 2026 Agitek. MIT License."
 );
 const AFTER_HELP_UNICODE: &str =
-    "Docli CLI \u{b7} https://docli.ru \u{b7} \u{a9} 2026 OOO Agitek \u{b7} MIT License";
-const AFTER_HELP_ASCII: &str = "Docli CLI | https://docli.ru | (c) 2026 OOO Agitek | MIT License";
+    "docli cli \u{b7} https://docli.ru \u{b7} \u{a9} 2026 Agitek \u{b7} MIT License";
+const AFTER_HELP_ASCII: &str = "docli cli | https://docli.ru | (c) 2026 Agitek | MIT License";
 const ABOUT_UNICODE: &str =
-    "Docli CLI \u{2014} read-only docli workspace mirrors for coding agents";
-const ABOUT_ASCII: &str = "Docli CLI - read-only docli workspace mirrors for coding agents";
+    "docli cli \u{2014} read-only docli workspace mirrors for coding agents";
+const ABOUT_ASCII: &str = "docli cli - read-only docli workspace mirrors for coding agents";
 
 #[derive(Parser)]
 #[command(
@@ -346,13 +346,17 @@ mod tests {
         let mut cmd = Cli::command();
         let long = cmd.render_long_version().to_string();
         assert!(long.contains(env!("CARGO_PKG_VERSION")), "{long}");
-        assert!(long.contains("Docli CLI"), "{long}");
+        // The brand is lowercase «docli», never «Docli» (user ruling 2026-09-01), and the entity
+        // is written «Agitek» in user-facing copy.
+        assert!(long.contains("docli cli"), "{long}");
+        assert!(!long.contains("Docli"), "{long}");
+        assert!(!long.contains("OOO"), "{long}");
         assert!(long.contains("docli.ru"), "{long}");
-        assert!(long.contains("(c) 2026 OOO Agitek"), "{long}");
+        assert!(long.contains("(c) 2026 Agitek"), "{long}");
         assert!(long.contains("MIT"), "{long}");
         let help = cmd.render_long_help().to_string();
         assert!(help.contains("docli.ru"), "{help}");
-        assert!(help.contains("OOO Agitek"), "{help}");
+        assert!(help.contains("Agitek"), "{help}");
     }
 
     #[test]

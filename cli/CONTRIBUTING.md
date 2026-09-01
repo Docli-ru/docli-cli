@@ -1,4 +1,4 @@
-# Contributing to Docli CLI
+# Contributing to docli cli
 
 Спасибо за интерес! / Thanks for your interest! This document is honest about how contributions
 work here, because the flow is unusual.

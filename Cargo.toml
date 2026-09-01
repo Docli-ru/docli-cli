@@ -1,4 +1,4 @@
-# The public Docli CLI workspace — three MIT crates, buildable standalone.
+# The public docli cli workspace — three MIT crates, buildable standalone.
 # The monorepo (gitverse.ru/agitek/docli) is the source of truth; this mirror is seeded per
 # release by /release-cli. PRs here are IMPORTED into the monorepo, never merged directly —
 # see cli/CONTRIBUTING.md.
