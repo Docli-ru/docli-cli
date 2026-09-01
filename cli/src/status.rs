@@ -69,6 +69,18 @@ pub struct Status {
     /// git could not answer whether a mirror is ignored (broken repository, `safe.directory`).
     /// Reported and counted as degraded: `sync` refuses on exactly this.
     pub gitignore_unknown: Vec<String>,
+    /// The two hook-capable agents and what this project carries for each (v0.28.6 D2).
+    ///
+    /// This is the COUNTERWEIGHT to the guarded hook command. Making a missing binary silent
+    /// keeps a stale entry from breaking every tool call, and the vendor docs warn about exactly
+    /// that trade — *"a mistyped path in `settings.json` leaves the gate silently disabled"*.
+    /// A disabled gate has to be noticeable somewhere, and this is the somewhere.
+    pub hooks: Vec<crate::hooks::HookStatus>,
+    /// «docli-cli 0.1.2 -> 0.1.3 - update: docli self-update», when the signed manifest advertises
+    /// a newer version (D11). A field, not just a line: machine consumers should be able to see
+    /// a stale binary, and hiding it from `--json` would be the same silent-omission mistake
+    /// this whole slice is about.
+    pub update_available: Option<String>,
 }
 
 /// Long enough for a healthy round-trip, short enough that a blackholed network cannot hold an
@@ -166,6 +178,9 @@ pub fn gather(cwd: &Path, server: &str) -> Result<Status> {
         agents_wired: Vec::new(),
         gitignore_missing: Vec::new(),
         gitignore_unknown: Vec::new(),
+        hooks: Vec::new(),
+        // Cached, so this costs the network at most once a day and never fails the command.
+        update_available: crate::selfupdate::notice(),
     };
 
     let Some(root) = config::find_project(cwd) else {
@@ -205,6 +220,10 @@ pub fn gather(cwd: &Path, server: &str) -> Result<Status> {
         }
     }
     status.agents_wired = crate::agents::wired_here(&root, &project.config.server);
+    status.hooks = crate::hooks::HookAgent::all()
+        .into_iter()
+        .map(|a| crate::hooks::status(&root, a))
+        .collect();
     Ok(status)
 }
 
@@ -291,7 +310,7 @@ pub fn run(cwd: &Path, server: &str, json: bool) -> Result<i32> {
 }
 
 fn render(s: &Status) {
-    ui::heading(&format!("docli {}", s.version));
+    ui::heading(&format!("docli-cli {}", s.version));
     let w = ui::label_width(["server", "signed in", "project"]);
     ui::field("server", &s.server, w);
     match (&s.account, s.signed_in) {
@@ -311,6 +330,16 @@ fn render(s: &Status) {
             Some(why) => ui::field("signed in", &format!("unknown - {why}"), w),
             None => ui::field("signed in", &format!("no - {}", ui::cmd("docli login")), w),
         },
+    }
+    // BEFORE the early returns below, not after them. `main` exempts `status` from the general
+    // notice on the grounds that this screen renders it itself — so a return that skips it means
+    // nobody prints it at all. `docli status` from a home directory (no project) or in a project
+    // configured for another server was fetching the manifest and then saying nothing.
+    if let Some(n) = &s.update_available {
+        // On STDOUT here, deliberately: `status` runs in report mode, where the screen IS the
+        // product. The rule the notice follows is «never interleaved into another command's
+        // stdout product», not «never on stdout».
+        ui::next(n);
     }
     match &s.project_root {
         Some(root) => {
@@ -406,11 +435,40 @@ fn render(s: &Status) {
     if s.agents_wired.is_empty() {
         ui::detail(&format!(
             "the MCP connection is not wired into any configuration - {}",
-            "docli init --mcp auto"
+            ui::cmd("docli init --mcp auto")
         ));
     } else {
         for a in &s.agents_wired {
             ui::ok(a);
+        }
+    }
+    let installed: Vec<&crate::hooks::HookStatus> =
+        s.hooks.iter().filter(|h| h.installed).collect();
+    if installed.is_empty() {
+        ui::detail(&format!(
+            "no docli hooks here - the mirror is marked read-only and the contract asks agents \
+             not to edit it, but nothing refuses a write. Add enforcement: {}",
+            ui::cmd("docli init --hooks auto")
+        ));
+    } else {
+        for h in installed {
+            // The KEY is what `--json` carries (a stable identifier a script can match); the
+            // screen gets the name a person would say.
+            let name = crate::hooks::HookAgent::parse(h.agent)
+                .map(|a| a.display())
+                .unwrap_or(h.agent);
+            // A gate that cannot run is worse than no gate, because it looks like one.
+            if h.binary_resolves == Some(false) {
+                ui::warn(&format!(
+                    "{name}: hooks are installed but `docli` is not on PATH - they do nothing. \
+                     Reinstall the CLI, or run `docli uninstall` to take the entries back out."
+                ));
+            } else {
+                ui::ok(&format!(
+                    "{name}: hooks installed - writes into the mirror are refused (shell writes \
+                     are not covered)"
+                ));
+            }
         }
     }
 
@@ -450,9 +508,36 @@ mod tests {
     }
 
     #[test]
+    fn the_update_notice_is_rendered_before_every_early_return() {
+        // `main` exempts `status` from the general notice because this screen renders it
+        // itself — so a `return` that skips it means NOBODY prints it. `docli status` from a
+        // home directory, or in a project configured for another server, was fetching the
+        // signed manifest and then saying nothing about it.
+        //
+        // Asserted structurally: the notice must appear in `render` before the first `return`.
+        let src = include_str!("status.rs");
+        let body = src
+            .split_once("fn render(s: &Status) {")
+            .expect("render exists")
+            .1;
+        let notice = body
+            .find("s.update_available")
+            .expect("the notice is rendered");
+        let first_return = body
+            .find("\n                return;")
+            .expect("an early return");
+        assert!(
+            notice < first_return,
+            "the update notice must be rendered before the first early return"
+        );
+    }
+
+    #[test]
     fn status_outside_a_project_reports_no_project_and_does_not_fail() {
         let tmp = tempfile::tempdir().unwrap();
-        // DOCLI_HOME keeps the test off the developer's real credentials.
+        // DOCLI_HOME keeps the test off the developer's real credentials — and the lock
+        // keeps it off the OTHER tests that override the same process-global variable.
+        let _home = crate::creds::home_env_lock();
         let home = tmp.path().join("home");
         std::env::set_var("DOCLI_HOME", &home);
         let s = gather(tmp.path(), "https://example.invalid").unwrap();

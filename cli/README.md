@@ -1,4 +1,4 @@
-# docli cli
+# docli-cli
 
 A local **read-only mirror** of your [**docli**](https://docli.ru) workspaces — built for power
 users who work primarily through coding agents (Claude Code, Codex, and friends).
@@ -89,9 +89,38 @@ files stay: a mirror is rebuildable, but it lives in your repository and that ca
 ## Wiring coding agents
 
 `docli init` installs the mirror contract at `.agents/skills/docli-mirror/SKILL.md` — the
-standard path defined by the open Agent Skills specification, read natively by Claude Code,
-Codex, Gemini CLI, Cursor, Windsurf, Zed, GitHub Copilot in VS Code, Copilot CLI, OpenCode,
-and Amp.
+standard path defined by the open Agent Skills specification, and read there by Codex (whose
+documented scan order names it). **Claude Code does not read that path** — it reads
+`.claude/skills/`, so the contract is copied there too, with `paths:` activation globs derived
+from your mount table, so it loads automatically when an agent works with a mirrored file. Other
+agents with their own skills directory (Qwen, Cline, Trae) get their own copy. `--skills none`
+opts out; `--skills claude,codex,…` names a list.
+
+### Enforcement, and where it stops
+
+The contract is a document, and a document only helps once an agent has read it. For the two
+agents with a hook mechanism — **Claude Code and Codex** — `docli init --hooks auto` installs
+two hooks:
+
+- a `PreToolUse` hook that **refuses** writes into the mirror, with a reason that names the
+  correct alternative; and
+- a `SessionStart` hook that reports mirror freshness into the session, unprompted.
+
+They are never installed unless you ask: the offer arrives unticked in the guided setup, and
+under `--no-input` only `--hooks` writes them. Both agents also ask you to trust the project
+before any project-local hook runs.
+
+Two limits, stated rather than left to inference. **Shell writes are not covered** — a `sed -i`
+or a `>` redirect into the mirror goes through on both agents, because deciding whether a
+command string targets a mirror means parsing shell. And **no other agent gets enforcement at
+all**: for them the mirror is marked read-only and the contract asks them not to edit it, which
+is advice, not a guarantee. `docli status` reports whether the hooks are installed here and
+whether the binary they name still resolves.
+
+`docli init --instructions` additionally writes a short docli section into `AGENTS.md` (read by
+Codex, Cursor, Gemini CLI, Zed, Copilot and about fifteen other tools) and, **only when there is
+no `CLAUDE.md` to damage**, creates one containing `@AGENTS.md`. An existing `CLAUDE.md` is never
+edited; the one line to add is printed for you to paste.
 
 In the guided setup, wiring agents is a step of its own: the configurations found here arrive
 pre-ticked, and only what stays ticked is written. It can also — **only if you ask** — add this

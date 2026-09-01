@@ -137,7 +137,24 @@ enum WriteOutcome {
     DirInTheWay,
 }
 
+/// What the CLI says when its OWN delivery destroys a hand edit (v0.28.6 D1a / Step 1).
+///
+/// This path lifts the read-only bit and overwrites a tracked mirror file, and until this slice
+/// it did so with **no message at all** — the exact data-loss mechanism `docli guard` exists to
+/// prevent, happening inside our own code, unannounced. The rule it states is the guard's, byte
+/// for byte: an agent that meets the wall from either side learns the same thing.
+pub fn hand_edit_overwritten(local: &str) -> String {
+    format!(
+        "{local} had local changes and they are now gone - {}",
+        crate::guard::MIRROR_RULE
+    )
+}
+
 /// Write `bytes` at `local` under the D2 occupancy rules. `idx` and `vacated` are FOLD-keyed.
+///
+/// `prev_sha` is the digest STATE recorded for this node, when there is one. It is what makes a
+/// destroyed hand edit detectable: on-disk bytes that match neither what we last delivered nor
+/// what we are about to deliver are somebody's edit, and it is about to be lost.
 fn write_tracked(
     idx: &ClaimIndex,
     rules: &FsRules,
@@ -145,6 +162,7 @@ fn write_tracked(
     local: &str,
     bytes: &[u8],
     vacated: &std::collections::HashSet<String>,
+    prev_sha: Option<&str>,
 ) -> Result<WriteOutcome> {
     let target = contained_join(mount_root, local)?;
     if let Some(parent) = target.parent() {
@@ -180,10 +198,41 @@ fn write_tracked(
             // Our own path (an in-place body update) — or a path another TRACKED node is
             // vacating this same page (a swap): tracked either way, so the CLI owns the bytes.
             Some(_) => {
+                // Say it BEFORE it happens. `docli doctor` could always find a destroyed hand
+                // edit afterwards; nothing said so at the moment of the loss, which is the one
+                // moment the reader can still act on it.
+                // DECIDED before the write, REPORTED after it. The message is past tense —
+                // «had local changes and they are now gone» — and the write can still fail
+                // (a root-owned file, a full disk), which would leave the original untouched
+                // and the reader believing an edit was destroyed that is still sitting there.
+                // A message whose whole value is that it can be trusted must not be one of
+                // those.
+                let lost = prev_sha.filter(|p| !p.is_empty()).and_then(|prev| {
+                    match fs::read(&target) {
+                        Ok(on_disk) => {
+                            let now = sha_hex(&on_disk);
+                            // Neither what we last delivered nor what we are delivering now:
+                            // somebody edited it by hand.
+                            (now != prev && now != sha_hex(bytes))
+                                .then(|| hand_edit_overwritten(local))
+                        }
+                        // Overwriting a file we could not read. Silence would be worst in
+                        // exactly the case where a local change is MOST likely — somebody
+                        // locked the file down on purpose.
+                        Err(e) => Some(format!(
+                            "{local} could not be read before being overwritten ({e}), so any \
+                             local changes in it are gone unchecked - {}",
+                            crate::guard::MIRROR_RULE
+                        )),
+                    }
+                });
                 // Lift read-only first (Windows refuses a rename OVER a read-only target),
                 // then the atomic swap — the temp carries the read-only bit through.
                 set_readonly(&target, false)?;
                 crate::mountfs::write_atomic(&target, bytes)?;
+                if let Some(msg) = lost {
+                    crate::ui::warn(&msg);
+                }
                 Ok(WriteOutcome::Written)
             }
             None => {
@@ -196,7 +245,8 @@ fn write_tracked(
                 } else {
                     Ok(WriteOutcome::Parked(format!(
                         "a divergent untracked file occupies {local} - remove it and run \
-                         `docli sync --full`"
+                         `docli sync --full`; if its content should BE that note, write it \
+                         through your docli MCP connection first (the mirror never pushes)"
                     )))
                 }
             }
@@ -528,6 +578,14 @@ pub fn apply_page(
                     bytes,
                     marker_path,
                     &pre_locals,
+                    // ONLY when the previous state describes THIS PATH. The occupant arm below
+                    // is also entered for the swap shape (`a→b` + `b→a`, see `write_tracked`),
+                    // where the bytes on disk belong to the OTHER node — comparing them against
+                    // this node's old digest would warn «your edit is gone» about a file nobody
+                    // touched, and that message's entire value is that it is trustworthy.
+                    prev.as_ref()
+                        .filter(|p| fold_key(&p.local_path, rules) == fold_key(local, rules))
+                        .map(|p| p.content_sha256.as_str()),
                 )?;
                 match outcome {
                     WriteOutcome::DirInTheWay => {
@@ -640,6 +698,10 @@ pub fn apply_page(
             &r.bytes,
             &r.marker_path,
             &pre_locals,
+            r.prev
+                .as_ref()
+                .filter(|p| fold_key(&p.local_path, rules) == fold_key(&r.local, rules))
+                .map(|p| p.content_sha256.as_str()),
         )?;
         match outcome {
             ok @ (WriteOutcome::Written | WriteOutcome::Adopted) => {
@@ -767,6 +829,7 @@ fn perform_put(
     bytes: &[u8],
     marker_path: &Option<String>,
     pre_locals: &std::collections::HashSet<String>,
+    prev_sha: Option<&str>,
 ) -> Result<WriteOutcome> {
     match kind {
         TrackedKind::Folder => {
@@ -780,7 +843,8 @@ fn perform_put(
                     WriteOutcome::DirInTheWay
                 } else {
                     WriteOutcome::Parked(format!(
-                        "an untracked file occupies the folder path {local} - remove it and                          run `docli sync --full`"
+                        "an untracked file occupies the folder path {local} - remove it and \
+                         run `docli sync --full`"
                     ))
                 });
             }
@@ -794,7 +858,9 @@ fn perform_put(
             }
             Ok(WriteOutcome::Written)
         }
-        TrackedKind::Note => write_tracked(idx, rules, mount_root, local, bytes, pre_locals),
+        TrackedKind::Note => {
+            write_tracked(idx, rules, mount_root, local, bytes, pre_locals, prev_sha)
+        }
         TrackedKind::Attachment => {
             let mp = marker_path
                 .as_deref()
@@ -820,7 +886,7 @@ fn perform_put(
                 crate::mountfs::write_atomic(&abs, bytes)?;
                 Ok(WriteOutcome::Written)
             } else {
-                write_tracked(idx, rules, mount_root, mp, bytes, pre_locals)
+                write_tracked(idx, rules, mount_root, mp, bytes, pre_locals, prev_sha)
             }
         }
     }
@@ -1779,6 +1845,7 @@ mod tests {
             b"m",
             &Some(".docli/markers/../../evil.docli".to_string()),
             &std::collections::HashSet::new(),
+            None,
         )
         .unwrap_err()
         .to_string();

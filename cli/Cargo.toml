@@ -1,6 +1,6 @@
 [package]
 name = "docli-cli"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 # MSRV for the public mirror: latest stable we build and verify with (user ruling 2026-08-30 —
 # no groveling for old toolchains). Kept uniform across the three mirror crates; clippy's
@@ -9,7 +9,7 @@ rust-version = "1.94"
 # MIT — the whole public mirror (apps/cli + packages/sync-wire + packages/docli-rules) builds
 # standalone under it (v0.28.0 D1/D11).
 license = "MIT"
-description = "docli CLI — a read-only agent cache over the docli sync plane"
+description = "docli-cli — a read-only agent cache over the docli sync plane"
 repository = "https://gitverse.ru/agitek/docli-cli"
 publish = false
 

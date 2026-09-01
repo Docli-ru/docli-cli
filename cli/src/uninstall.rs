@@ -139,7 +139,7 @@ pub fn run(cwd: &Path, purge: bool, assume_yes: bool) -> Result<i32> {
         Err(_) => Vec::new(),
     };
 
-    ui::heading("Uninstalling docli");
+    ui::heading("Uninstalling docli-cli");
     ui::detail("This will be removed:");
     ui::line(&format!("  {}", ui::path(&shown(&exe))));
     if let Some(h) = &home {
@@ -176,7 +176,7 @@ pub fn run(cwd: &Path, purge: bool, assume_yes: bool) -> Result<i32> {
             return Ok(1);
         }
         if !Confirm::with_theme(&crate::wizard::prompt_theme())
-            .with_prompt("Remove docli from this device?")
+            .with_prompt("Remove docli-cli from this device?")
             .default(false)
             .interact()?
         {
@@ -320,11 +320,21 @@ pub fn run(cwd: &Path, purge: bool, assume_yes: bool) -> Result<i32> {
         }
     }
 
+    // 3a. The hook entries, ALWAYS — not only under `--purge` (v0.28.6 Step 8a).
+    //
+    // This is a deliberate exception to «agent configurations are shared files», and the reason
+    // is that these entries are not configuration for somebody else's server: they name THIS
+    // binary, which is about to be gone. Leaving them is leaving litter that resolves to
+    // nothing. The guarded command form makes a dangling entry harmless rather than broken,
+    // which is what lets this be tidy-up instead of a rescue — and only OUR elements are
+    // touched; the user's own hooks, and every other key in the file, are untouched.
+    remove_hooks(cwd);
+
     // 4. The binary itself, last — everything above needs it running. A root-owned install
     // directory is the ordinary case, not an error, but it must not be reported as a completed
     // uninstall: the credentials are gone and the binary is still on PATH.
     if remove_self(&exe)? {
-        ui::ok("docli removed.");
+        ui::ok("docli-cli removed.");
         // The one case this command genuinely cannot close: a `docli login` already waiting on
         // its browser callback will write a fresh credential when the user finishes it, which
         // is AFTER every check here and after the binary is gone. Nothing detectable
@@ -341,6 +351,70 @@ pub fn run(cwd: &Path, purge: bool, assume_yes: bool) -> Result<i32> {
     }
     ui::warn("Credentials removed, but the executable is still installed - remove it by hand.");
     Ok(1)
+}
+
+/// Take back the hook entries `docli init` wrote in the project we are standing in, reporting
+/// what could not be removed rather than failing the uninstall over it.
+///
+/// Nothing here is fatal: an unwritable or hand-rewritten agent config is the user's file, and
+/// «I could not tidy up» must not stop a credential from being revoked.
+fn remove_hooks(cwd: &Path) {
+    let Some(root) = crate::config::find_project(cwd) else {
+        return;
+    };
+    for agent in crate::hooks::HookAgent::all() {
+        let rel = agent.config_path();
+        let abs = root.join(rel);
+        let body = match std::fs::read_to_string(&abs) {
+            Ok(b) => b,
+            // Absent is the ordinary case: nothing of ours can be in a file that is not there.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            // Anything else — permissions, an ACL, a transient I/O error — means we do not KNOW
+            // whether live entries are in there, and the binary they name is about to be
+            // deleted. Silence would leave the user with hooks pointing at nothing and no way
+            // to have learned it.
+            Err(e) => {
+                ui::warn(&format!(
+                    "{rel} could not be read ({e}), so docli's hooks were not removed from it - \
+                     if it has entries whose command contains `docli guard --agent` or \
+                     `docli sync --check --agent`, delete them by hand (they name a binary that \
+                     will not exist)."
+                ));
+                continue;
+            }
+        };
+        let cleaned = match crate::hooks::remove(agent, &body) {
+            crate::hooks::RemoveOutcome::Removed(c) => c,
+            crate::hooks::RemoveOutcome::NothingOfOurs => continue,
+            // «I could not look» is not «there was nothing there». The textual locator refuses
+            // shapes it cannot be sure of — a duplicated key, or any backslash-escaped
+            // top-level string, which a Windows path in `statusLine` is enough to produce — and
+            // treating that as «nothing of ours» deleted the binary while leaving live entries
+            // naming it, with nobody told.
+            crate::hooks::RemoveOutcome::Refused => {
+                ui::warn(&format!(
+                    "docli's hooks in {rel} could not be removed safely - the file has a shape \
+                     this cannot edit without guessing. Delete the two entries whose command \
+                     contains `docli guard --agent` and `docli sync --check --agent` by hand \
+                     (they name a binary that will not exist)."
+                ));
+                continue;
+            }
+        };
+        match crate::agents::write_user_config(&abs, cleaned.as_bytes()) {
+            Ok(()) => ui::ok(&format!("removed docli's hooks from {rel}")),
+            // `warn`, not `detail`: «I left an entry pointing at a binary I am about to
+            // delete» is not narration.
+            // Names the strings that are ACTUALLY in the file. This message exists so a person
+            // can finish what the CLI could not, and it pointed at an identity marker the CLI
+            // stopped writing — they would have searched and found nothing.
+            Err(e) => ui::warn(&format!(
+                "could not remove docli's hooks from {rel} ({e:#}) - they name a binary that \
+                 will not exist. Delete the two entries whose command contains \
+                 `docli guard --agent` and `docli sync --check --agent`."
+            )),
+        }
+    }
 }
 
 /// Returns whether the binary is actually gone.
@@ -386,6 +460,7 @@ mod tests {
 
     #[test]
     fn home_dir_honours_the_override() {
+        let _home = crate::creds::home_env_lock();
         std::env::set_var("DOCLI_HOME", "/tmp/docli-home-probe");
         assert_eq!(home_dir(), Some(PathBuf::from("/tmp/docli-home-probe")));
         std::env::remove_var("DOCLI_HOME");

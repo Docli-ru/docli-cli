@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: MIT
 
 //! `docli init` (v0.28.0 goal 5 + D12) — create/extend `docli.toml`, offer the gitignore
-//! lines, drop the bundled SKILL.md teaching agents the contract (at the Agent Skills open
-//! standard path `.agents/skills/`, read natively by Claude Code, Codex, Gemini, Cursor, Zed,
-//! both Copilots, OpenCode and Amp), and — opt-in only — wire agent MCP configs (`agents.rs`).
+//! lines, drop the bundled SKILL.md teaching agents the contract, and — opt-in only — wire
+//! agent MCP configs (`agents.rs`). The SKILL.md goes to the Agent Skills open-standard path
+//! `.agents/skills/` unconditionally, and additionally to any per-agent path in the picker
+//! table. Which agents actually READ the standard path is a per-vendor fact that has to be
+//! verified, not assumed: Claude Code does not (corrected 2026-09-01 — it reads
+//! `.claude/skills/`), and the rest of the table's claims are unverified.
 //! Workspace enumeration uses
 //! `viewer.workspaces` (deliberately exempt from `deny_scoped_pat_via_graphql`, filtered to the
 //! PAT's pin set).
@@ -19,6 +22,38 @@ use crate::config::{load_project, validate_geometry, DocliToml, Mount, CONFIG_NA
 use crate::http::Api;
 
 pub const SKILL_MD: &str = include_str!("../assets/SKILL.md");
+
+/// The frontmatter `description:` value, and NOTHING after it.
+///
+/// v0.28.6 D12: the first version of this took «everything between `description:` and the end of
+/// frontmatter», which is a slice that silently GROWS as keys are added below it — a
+/// `when_to_use:` block would have sat inside it and kept `description.contains("докли")` green
+/// while the trigger had actually been moved out of the field a skill fires on. A pin that
+/// measures more than it claims to is worse than no pin, so the extractor stops at the next
+/// frontmatter key.
+///
+/// YAML folded/indented continuation lines belong to the value and are kept.
+pub fn skill_description(skill_md: &str) -> Option<String> {
+    let body = skill_md.strip_prefix("---\n")?;
+    let front = &body[..body.find("\n---")?];
+    let mut lines = front.lines();
+    let first = lines
+        .by_ref()
+        .find_map(|l| l.strip_prefix("description:"))?;
+    let mut out = first.trim().to_string();
+    for line in lines {
+        // A new key at column zero ends the value; an indented line continues it.
+        let is_key = line
+            .split_once(':')
+            .is_some_and(|(k, _)| !k.is_empty() && !k.starts_with(char::is_whitespace));
+        if is_key || line.trim().is_empty() {
+            break;
+        }
+        out.push(' ');
+        out.push_str(line.trim());
+    }
+    Some(out)
+}
 
 #[derive(Clone)]
 pub struct InitArgs {
@@ -49,6 +84,26 @@ pub struct InitArgs {
     /// half of the wizard's confirmation, so a CI setup can reach the same end state without
     /// a terminal. Absent, `.gitignore` is never touched (it is the user's file).
     pub write_gitignore: bool,
+    /// Which agents get the mirror contract in their OWN skills directory (v0.28.6 D4):
+    /// `auto` (detected here — the default), `none`, or a comma list of agent keys.
+    ///
+    /// **Deliberately not tied to `--mcp`.** The skill used to ride along with the MCP wiring,
+    /// which meant `--mcp none` delivered the contract to `.agents/skills/` ONLY — the one path
+    /// Claude Code does not read, which is the entire defect this slice exists to fix. It is
+    /// also a lighter act than the others here: `init` already drops the same file at the
+    /// open-standard path unconditionally, so a copy into an agent's own skills directory is
+    /// the same class of write, which is why this one defaults to `auto` while hooks and
+    /// instruction files do not.
+    pub skills: Option<String>,
+    /// Which of the two hook-capable agents get hooks (v0.28.6 D6): `none` (the default),
+    /// `auto` (detected here), or a comma list of `claude`/`codex`.
+    ///
+    /// Offered UNTICKED interactively and never written under `--no-input` without this flag: a
+    /// config entry names a server, a hook runs a program. Different acts, different defaults.
+    pub hooks: Option<String>,
+    /// Write the `AGENTS.md` section, and a `CLAUDE.md` importing it when none exists (D5).
+    /// Never edits an existing `CLAUDE.md`.
+    pub instructions: bool,
 }
 
 /// The validated `--mcp` intent, resolved BEFORE anything touches the disk.
@@ -207,6 +262,38 @@ pub fn run(cwd: &Path, api: Option<&Api>, args: &InitArgs) -> Result<i32> {
     if mcp_selection.is_empty() && (args.mcp_label.is_some() || args.mcp_bare) {
         crate::ui::detail("--mcp-label/--mcp-bare do not apply: no agents were selected");
     }
+    // Resolved here, with the rest of the intent, so a bad value refuses over an UNTOUCHED
+    // tree rather than a half-initialized one (the F9 pin, extended to the new flags).
+    let detected = || crate::agents::detect(cwd, std::env::home_dir().as_deref());
+    let skills_selection: Vec<&'static str> = match args.skills.as_deref().map(str::trim) {
+        Some("none") | Some("") => Vec::new(),
+        // Absent means AUTO — see `InitArgs::skills` for why this one default differs from the
+        // heavier writes beside it.
+        None | Some("auto") => detected(),
+        Some(list) => parse_agent_list(list, "--skills")?,
+    };
+    let hook_agents: Vec<crate::hooks::HookAgent> = match args.hooks.as_deref().map(str::trim) {
+        None | Some("none") | Some("") => Vec::new(),
+        Some("auto") => {
+            let d = detected();
+            crate::hooks::HookAgent::all()
+                .into_iter()
+                .filter(|a| d.contains(&a.key()))
+                .collect()
+        }
+        Some(list) => {
+            let mut out = Vec::new();
+            for k in list.split(',').map(str::trim).filter(|k| !k.is_empty()) {
+                let a = crate::hooks::HookAgent::parse(k).map_err(|e| {
+                    anyhow::anyhow!("--hooks: {e} (only these two agents have a hook mechanism)")
+                })?;
+                if !out.contains(&a) {
+                    out.push(a);
+                }
+            }
+            out
+        }
+    };
     if !mcp_selection.is_empty() && config.server.chars().any(|c| c.is_control()) {
         // Codex round 1: the committed server value is printed raw in the wiring output — a
         // control character in it is terminal-escape injection (\u{1b}[2J + forged lines),
@@ -348,14 +435,13 @@ pub fn run(cwd: &Path, api: Option<&Api>, args: &InitArgs) -> Result<i32> {
                 crate::ui::cmd("docli init --gitignore")
             ));
         }
-        crate::ui::next(&format!("Sync: {}", crate::ui::cmd("docli sync")));
     }
     if let Some((url, labeled)) = mcp_url {
         let selected: Vec<&crate::agents::AgentDef> = mcp_selection
             .iter()
             .filter_map(|k| crate::agents::agent(k))
             .collect();
-        crate::agents::wire(cwd, &selected, &url, labeled, SKILL_MD);
+        crate::agents::wire(cwd, &selected, &url, labeled);
         if config.mounts.len() > 1 {
             crate::ui::detail(&format!(
                 "This project mounts {} but uses ONE MCP connection: which of them the agent \
@@ -363,6 +449,58 @@ pub fn run(cwd: &Path, api: Option<&Api>, args: &InitArgs) -> Result<i32> {
                 crate::ui::plural(config.mounts.len(), "workspace", "workspaces")
             ));
         }
+    }
+
+    // The contract into each selected agent's OWN skills directory — INDEPENDENT of whether any
+    // MCP config was written (D4). The activation globs come from the mount table, so this is a
+    // template rather than a copy.
+    let skill_agents: Vec<&crate::agents::AgentDef> = skills_selection
+        .iter()
+        .filter_map(|k| crate::agents::agent(k))
+        .collect();
+    if !skill_agents.is_empty() {
+        crate::agents::install_skills(
+            cwd,
+            &skill_agents,
+            SKILL_MD,
+            &crate::agents::skill_globs(cwd, &config.mounts),
+        );
+    }
+
+    // Hooks last, and only where they were explicitly asked for (D6).
+    if !hook_agents.is_empty() {
+        crate::ui::heading("Hooks");
+        // The hook files go through the SAME atomic writer as the MCP configs, so a crashed
+        // earlier run leaves the same `.docli-cfg-*.tmp` residue beside them. `wire`'s sweep
+        // covers it only when MCP wiring happened at all — `docli init --mcp none --hooks
+        // claude` writes into `.claude/` with nothing to clean it. An empty selection sweeps
+        // exactly the hook directories.
+        crate::agents::sweep_cfg_temps(cwd, &[]);
+        for line in crate::hooks::consent_summary(&hook_agents) {
+            crate::ui::detail(&line);
+        }
+        for agent in &hook_agents {
+            crate::hooks::install(cwd, *agent)?;
+        }
+        // D9: enforcement language appears ONLY for agents that got a hook, and it states the
+        // limit in the same breath. Every other agent is advisory, and a user who wired Cursor
+        // and read «the mirror is protected» would be wrong in exactly the way that costs a note.
+        crate::ui::detail(
+            "docli will now refuse writes into the mirror from these agents' file-editing \
+             tools. Shell writes (`sed -i`, `>`) are NOT covered, on either agent, and no other \
+             agent gets enforcement at all - they get the contract as advice.",
+        );
+    }
+    if args.instructions {
+        crate::ui::heading("Instructions");
+        crate::instructions::install(cwd)?;
+    }
+
+    // The next command, LAST — v0.28.6 Step 1. It used to be printed before the agent wiring,
+    // so «→ Sync: docli sync» arrived in the middle of the screen with three more sections of
+    // writing after it, which reads as «and then some other stuff happened».
+    if !config.mounts.is_empty() {
+        crate::ui::next(&format!("Sync: {}", crate::ui::cmd("docli sync")));
     }
     if hint_mcp {
         crate::ui::next(&format!(
@@ -426,6 +564,29 @@ fn plan_mcp(args: &InitArgs) -> Result<McpPlan> {
     }
 }
 
+/// A comma list of agent keys, refused (never silently dropped) on an unknown one.
+fn parse_agent_list(list: &str, flag: &str) -> Result<Vec<&'static str>> {
+    let mut keys = Vec::new();
+    for k in list.split(',').map(str::trim).filter(|k| !k.is_empty()) {
+        match crate::agents::agent(k) {
+            Some(def) => {
+                if !keys.contains(&def.key) {
+                    keys.push(def.key);
+                }
+            }
+            None => bail!(
+                "unknown agent {k:?} in {flag} - valid: {}",
+                crate::agents::AGENTS
+                    .iter()
+                    .map(|a| a.key)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+    Ok(keys)
+}
+
 /// One TTY prompt: Enter = detected set, `n` = skip, else a comma list. Unknown keys are
 /// reported and dropped (interactive forgiveness; the FLAG path refuses instead).
 fn prompt_selection(detected: &[&'static str]) -> Result<Option<Vec<&'static str>>> {
@@ -439,7 +600,7 @@ fn prompt_selection(detected: &[&'static str]) -> Result<Option<Vec<&'static str
 }
 
 fn config_header() -> &'static str {
-    "# docli.toml - the mount table for the docli CLI (committed; names workspaces, grants nothing).\n\
+    "# docli.toml - the mount table for docli-cli (committed; names workspaces, grants nothing).\n\
      # Mounts are keyed by stable workspace IDs, never by @handles (which can be renamed).\n\
      # The mirror dirs and .docli/ must be git-ignored; only this file is committed.\n\n"
 }
@@ -464,6 +625,9 @@ mod tests {
             allow_prompt: false,
             clear_folder: false,
             write_gitignore: false,
+            skills: Some("none".into()),
+            hooks: None,
+            instructions: false,
         };
         run(tmp.path(), None, &base).unwrap();
         // Same command again: idempotent, not a duplicate mount (which geometry would refuse).
@@ -511,6 +675,9 @@ mod tests {
             allow_prompt: false,
             clear_folder: false,
             write_gitignore: false,
+            skills: Some("none".into()),
+            hooks: None,
+            instructions: false,
         };
         run(tmp.path(), None, &scoped).unwrap();
 
@@ -554,6 +721,9 @@ mod tests {
             allow_prompt: false,
             clear_folder: false,
             write_gitignore: false,
+            skills: Some("none".into()),
+            hooks: None,
+            instructions: false,
         };
         run(tmp.path(), None, &bare).unwrap();
         assert_eq!(
@@ -617,6 +787,9 @@ mod tests {
             allow_prompt: false,
             clear_folder: false,
             write_gitignore: false,
+            skills: Some("none".into()),
+            hooks: None,
+            instructions: false,
         };
         run(tmp.path(), None, &args).unwrap();
         let p = load_project(tmp.path()).unwrap();
@@ -634,6 +807,111 @@ mod tests {
         // D12.3 — the write-discipline paragraph ships in the contract.
         assert!(SKILL_MD.contains("prefer `edit_note`"));
         assert!(SKILL_MD.contains("conflictSiblingId"));
+        // 2026-09-01 — a skill fires on its `description` (and, on Claude Code, on the `paths`
+        // globs injected at copy time — D4, which is why the description is now the FALLBACK
+        // rather than the only door). Two things still have to be IN the description.
+        let description = skill_description(SKILL_MD).expect("frontmatter description");
+        let description = description.as_str();
+        // (a) The Russian spelling. «докли» is the product's PRIMARY name, so a request is at
+        // least as likely to say it as `docli`; an all-Latin description matches neither the
+        // user's words nor the brand rule.
+        assert!(
+            description.contains("докли"),
+            "the description must match the Russian spelling: {description}"
+        );
+        // (b) The surfaces that identify this project as a mirror. A description that only
+        // names the CONTRACT makes the model leap from \"find my note about X\" to \"docli
+        // read-only mirror\" unaided.
+        for marker in ["docli.toml", "docli-mirror/", ".docli"] {
+            assert!(
+                description.contains(marker),
+                "the description must name {marker}: {description}"
+            );
+        }
+        // …and the extractor measures what it claims to: a key added BELOW `description` must
+        // not join the slice and keep the pins above green while the trigger moved out of it.
+        let with_extra = SKILL_MD.replacen(
+            "\nallowed-tools:",
+            "\nwhen_to_use: |\n  найди в докли docli.toml docli-mirror/ .docli\nallowed-tools:",
+            1,
+        );
+        let d = skill_description(&with_extra).expect("still parses");
+        assert!(
+            !d.contains("when_to_use") && !d.contains("найди"),
+            "the description slice must stop at the next key: {d}"
+        );
+    }
+
+    #[test]
+    fn the_shared_asset_carries_no_qualified_tool_name() {
+        // D12: an earlier draft directed every mention to `docli:edit_note`, citing
+        // cross-product guidance. That would have shipped a WRONG contract into the one asset
+        // this slice exists to fix — Claude Code's MCP namespace is `mcp__<server>__<tool>`
+        // (observed: the live tools are literally `mcp__docli__edit_note`), so `docli:edit_note`
+        // matches neither the bare name nor the real qualified one, and the qualified form is
+        // platform-specific besides, while this asset must read correctly on Codex too. Bare
+        // names with the server named in prose is what demonstrably resolves.
+        assert!(
+            !SKILL_MD.contains("docli:"),
+            "no `docli:`-qualified tool names in the shared asset"
+        );
+        assert!(
+            SKILL_MD.contains("docli MCP connection"),
+            "the server is named in prose"
+        );
+    }
+
+    #[test]
+    fn the_asset_frontmatter_stays_inside_the_agent_skills_six() {
+        // `.agents/skills/` is the open-standard path, where an out-of-set key is a HARD
+        // packaging error, not an ignored field. Claude-Code-only keys are injected per
+        // destination by `agents::copy_skill` (D4) and must never be written into the asset.
+        const SPEC_FIELDS: [&str; 6] = [
+            "name",
+            "description",
+            "license",
+            "compatibility",
+            "metadata",
+            "allowed-tools",
+        ];
+        let body = SKILL_MD.strip_prefix("---\n").expect("frontmatter");
+        let front = &body[..body.find("\n---").expect("frontmatter ends")];
+        for line in front.lines() {
+            let Some((key, _)) = line.split_once(':') else {
+                continue;
+            };
+            if key.starts_with(char::is_whitespace) || key.is_empty() {
+                continue; // a continuation line, not a key
+            }
+            assert!(
+                SPEC_FIELDS.contains(&key),
+                "`{key}` is outside the Agent Skills six and would fail packaging: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_body_is_written_as_standing_rules_not_a_session_start_procedure() {
+        // D12: Claude Code does not re-read the skill file on later turns, so a document that
+        // opens with «At session start: 1. Run …» is a one-time procedure living in a file
+        // loaded once, mid-task. The rewrite states rules that hold for the whole task — and
+        // the freshness PROCEDURE now has a mechanism that can actually run it (the
+        // SessionStart hook, D3).
+        assert!(!SKILL_MD.contains("At session start"), "the wrong mood");
+        // One term throughout: the body called the same thing a «mirror» and a «cache for
+        // reading», and inconsistent terminology is called out by the authoring guidance.
+        assert!(!SKILL_MD.contains("cache for reading"));
+        // The five body pins, preserved VERBATIM through the rewrite rather than deleted to go
+        // green (SPEC §7's failing-test rule).
+        for pin in [
+            "never synced and never protected",
+            "only a non-degraded server search",
+            "sync --check",
+            "prefer `edit_note`",
+            "conflictSiblingId",
+        ] {
+            assert!(SKILL_MD.contains(pin), "the rewrite must preserve: {pin}");
+        }
     }
 
     #[test]
@@ -651,6 +929,9 @@ mod tests {
             allow_prompt: false,
             clear_folder: false,
             write_gitignore: false,
+            skills: Some("none".into()),
+            hooks: None,
+            instructions: false,
         };
         run(tmp.path(), None, &args).unwrap();
         let mcp: serde_json::Value =
@@ -679,6 +960,9 @@ mod tests {
             allow_prompt: false,
             clear_folder: false,
             write_gitignore: false,
+            skills: Some("none".into()),
+            hooks: None,
+            instructions: false,
         };
         let err = run(tmp.path(), None, &args).unwrap_err().to_string();
         assert!(err.contains("unknown agent"), "{err}");
@@ -719,6 +1003,9 @@ mod tests {
             allow_prompt: false,
             clear_folder: false,
             write_gitignore: false,
+            skills: Some("none".into()),
+            hooks: None,
+            instructions: false,
         };
         run(tmp.path(), None, &args).unwrap();
         // The chosen label lands in docli.toml…
@@ -754,6 +1041,9 @@ mod tests {
             allow_prompt: false,
             clear_folder: false,
             write_gitignore: false,
+            skills: Some("none".into()),
+            hooks: None,
+            instructions: false,
         };
         run(tmp.path(), None, &args).unwrap();
         let mcp: serde_json::Value =
@@ -792,6 +1082,9 @@ mod tests {
             allow_prompt: false,
             clear_folder: false,
             write_gitignore: false,
+            skills: Some("none".into()),
+            hooks: None,
+            instructions: false,
         };
         let err = run(tmp.path(), None, &args).unwrap_err().to_string();
         assert!(err.contains("is invalid"), "{err}");
@@ -816,6 +1109,9 @@ mod tests {
             allow_prompt: false,
             clear_folder: false,
             write_gitignore: false,
+            skills: Some("none".into()),
+            hooks: None,
+            instructions: false,
         };
         let err = run(tmp.path(), None, &args).unwrap_err().to_string();
         assert!(err.contains("control characters"), "{err}");
@@ -838,11 +1134,135 @@ mod tests {
             allow_prompt: false,
             clear_folder: false,
             write_gitignore: false,
+            skills: Some("none".into()),
+            hooks: None,
+            instructions: false,
         };
         run(tmp.path(), None, &args).unwrap();
         for f in [".mcp.json", ".codex/config.toml", ".gemini/settings.json"] {
             assert!(!tmp.path().join(f).exists(), "{f} must not exist");
         }
+    }
+
+    /// The v0.28.6 baseline: a mounted project, no MCP wiring at all.
+    fn mounted(skills: Option<&str>, hooks: Option<&str>, instructions: bool) -> InitArgs {
+        InitArgs {
+            workspace: Some(Uuid::from_u128(41)),
+            dir: Some("docli-mirror/notes".into()),
+            folder: None,
+            name: None,
+            server: Some("https://docli.ru".into()),
+            mcp: Some("none".into()),
+            mcp_label: None,
+            mcp_bare: false,
+            allow_prompt: false,
+            clear_folder: false,
+            write_gitignore: false,
+            skills: skills.map(str::to_string),
+            hooks: hooks.map(str::to_string),
+            instructions,
+        }
+    }
+
+    #[test]
+    fn the_skill_reaches_claude_code_even_when_no_mcp_config_is_written() {
+        // THE defect this slice exists to fix (D4). `agents::wire` was the only writer of
+        // `.claude/skills/` and it ran only inside `if let Some(url) = mcp_url` — so
+        // `docli init --mcp none`, or a guided run where the user ticks no agent, delivered the
+        // contract to `.agents/skills/` ONLY: the one path Claude Code does not read.
+        let tmp = tempfile::tempdir().unwrap();
+        run(tmp.path(), None, &mounted(Some("claude"), None, false)).unwrap();
+        let skill = tmp.path().join(".claude/skills/docli-mirror/SKILL.md");
+        assert!(
+            skill.exists(),
+            "the contract must not be hostage to the MCP offer"
+        );
+        // …and it carries the ACTIVATION globs, derived from the mount table rather than
+        // guessed, so a `--dir` the user chose is not silently inert.
+        let body = fs::read_to_string(&skill).unwrap();
+        assert!(
+            body.contains(r#"paths: ["docli-mirror/notes/**"]"#),
+            "{body}"
+        );
+        // No MCP config was written at all.
+        assert!(!tmp.path().join(".mcp.json").exists());
+    }
+
+    #[test]
+    fn no_input_writes_no_hooks_unless_the_flag_names_agents() {
+        // D6: a hook runs a program, so it never rides along with anything else.
+        let tmp = tempfile::tempdir().unwrap();
+        run(tmp.path(), None, &mounted(Some("none"), None, false)).unwrap();
+        for f in [".claude/settings.json", ".codex/hooks.json"] {
+            assert!(!tmp.path().join(f).exists(), "{f} must not exist");
+        }
+        // …and `--hooks none` is the same.
+        run(
+            tmp.path(),
+            None,
+            &mounted(Some("none"), Some("none"), false),
+        )
+        .unwrap();
+        assert!(!tmp.path().join(".claude/settings.json").exists());
+        // An unknown key REFUSES rather than being silently dropped, and only the two agents
+        // with a hook mechanism are nameable.
+        let err = run(
+            tmp.path(),
+            None,
+            &mounted(Some("none"), Some("cursor"), false),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--hooks"), "{err}");
+        assert!(!tmp.path().join(".claude/settings.json").exists());
+    }
+
+    #[test]
+    fn hooks_and_instructions_are_written_on_request_and_are_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = mounted(Some("none"), Some("claude,codex"), true);
+        run(tmp.path(), None, &args).unwrap();
+        let settings = tmp.path().join(".claude/settings.json");
+        let codex = tmp.path().join(".codex/hooks.json");
+        assert!(settings.exists() && codex.exists());
+        let before: Vec<String> = [&settings, &codex, &tmp.path().join("AGENTS.md")]
+            .iter()
+            .map(|p| fs::read_to_string(p).unwrap())
+            .collect();
+
+        // «Run twice, diff» — no duplicate hook entries, no duplicated AGENTS.md section.
+        run(tmp.path(), None, &args).unwrap();
+        let after: Vec<String> = [&settings, &codex, &tmp.path().join("AGENTS.md")]
+            .iter()
+            .map(|p| fs::read_to_string(p).unwrap())
+            .collect();
+        assert_eq!(
+            before, after,
+            "init must be idempotent across the new surfaces"
+        );
+        let v: serde_json::Value = serde_json::from_str(&after[0]).unwrap();
+        assert_eq!(v["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+        assert_eq!(v["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
+        // The CLAUDE.md bridge was created because there was nothing to damage.
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap(),
+            "@AGENTS.md\n"
+        );
+    }
+
+    #[test]
+    fn an_existing_claude_md_is_never_touched_by_init() {
+        // The COMMON case, this repository included: D5 delivers automatically for the
+        // AGENTS.md readers and BY INSTRUCTION for Claude Code.
+        let tmp = tempfile::tempdir().unwrap();
+        let mine = "# Careful instructions\n";
+        fs::write(tmp.path().join("CLAUDE.md"), mine).unwrap();
+        run(tmp.path(), None, &mounted(Some("none"), None, true)).unwrap();
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap(),
+            mine
+        );
+        assert!(tmp.path().join("AGENTS.md").exists());
     }
 
     #[test]
@@ -860,6 +1280,9 @@ mod tests {
             allow_prompt: false,
             clear_folder: false,
             write_gitignore: false,
+            skills: Some("none".into()),
+            hooks: None,
+            instructions: false,
         };
         let err = run(tmp.path(), None, &args).unwrap_err().to_string();
         assert!(err.contains("docli.toml or .docli/ directory"), "{err}");

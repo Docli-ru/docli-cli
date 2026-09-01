@@ -183,6 +183,22 @@ pub fn next(text: &str) {
     chatter(format!("{} {text}", style(next_marker()).cyan()));
 }
 
+/// The update notice (v0.28.6 D11) — ONE renderer, so all three surfaces say the same thing.
+///
+/// Always stderr, even under [`report_mode`]: the rule is that the notice is never interleaved
+/// into another command's stdout PRODUCT, so piping stays parseable. `docli status` is the
+/// deliberate exception and renders it itself, as a field, because there the screen IS the
+/// product — which is why this function is not what that command calls.
+///
+/// Suppressed by `--quiet`, unlike a warning: nothing is wrong, and a version number is exactly
+/// the narration that flag exists to drop.
+pub fn update_notice(text: &str) {
+    if quiet() {
+        return;
+    }
+    eprintln!("{} {text}", style(next_marker()).cyan());
+}
+
 /// Something needs attention but nothing failed. Survives `--quiet`: a warning the reader
 /// asked not to see is a warning that will be missed.
 pub fn warn(text: &str) {
@@ -343,8 +359,23 @@ impl Progress {
 mod tests {
     use super::*;
 
+    /// This module's state is PROCESS-GLOBAL — `QUIET`, `NO_INPUT`, `REPORT`, `MACHINE` and the
+    /// locale environment are all one set of statics — and `cargo test` runs these in parallel
+    /// threads of one process. Every test that writes them takes this lock, so they cannot
+    /// interleave and read each other's values. Without it the suite fails a few runs in a
+    /// hundred, which is worse than a slow suite: a flake teaches people to re-run rather than
+    /// to look.
+    static UI_STATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The lock, poison-tolerant: one failing test must not cascade into «every other UI test
+    /// also failed», which hides the one that actually broke.
+    fn ui_guard() -> std::sync::MutexGuard<'static, ()> {
+        UI_STATE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn markers_degrade_to_ascii_without_a_utf8_locale() {
+        let _guard = ui_guard();
         // The check reads the environment's own declaration: a `✓` in a Latin-1 terminal
         // arrives as mojibake, and a `+` is the honest substitute.
         let saved: Vec<(String, Option<String>)> = ["LC_ALL", "LC_CTYPE", "LANG"]
@@ -414,6 +445,7 @@ mod tests {
 
     #[test]
     fn machine_mode_closes_the_prompt_door_too() {
+        let _guard = ui_guard();
         // `docli doctor --json` reaches the same `.gitignore` offer as a plain run, through a
         // helper that cannot see the flag — so the flag has to live where `interactive` looks.
         configure(false, false, false);
@@ -424,6 +456,7 @@ mod tests {
 
     #[test]
     fn no_input_closes_the_prompt_door() {
+        let _guard = ui_guard();
         // The wizard, the agent picker and uninstall's confirmation all gate on this; a stale
         // `true` here is a hung pipeline.
         configure(false, false, true);
@@ -433,6 +466,7 @@ mod tests {
 
     #[test]
     fn report_mode_survives_quiet() {
+        let _guard = ui_guard();
         // `docli status --quiet` must still print the status: the report IS the product, and a
         // flag meant to drop narration must not blank it.
         configure(true, false, false);
@@ -445,6 +479,7 @@ mod tests {
 
     #[test]
     fn quiet_is_scoped_to_chatter() {
+        let _guard = ui_guard();
         // Not an output assertion (the macros write to the real streams) — the pin is that the
         // flag reaches the one place the chatter helpers consult, and that warnings/refusals
         // never read it.

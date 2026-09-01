@@ -103,7 +103,7 @@ pub fn run() -> Result<i32> {
 
     let current = env!("CARGO_PKG_VERSION");
     if manifest.version == current {
-        crate::ui::ok(&format!("docli {current} is already the latest"));
+        crate::ui::ok(&format!("docli-cli {current} is already the latest"));
         return Ok(0);
     }
     // A validly SIGNED old manifest is still a downgrade an artifacts-host attacker can replay
@@ -130,7 +130,7 @@ pub fn run() -> Result<i32> {
         bail!("the manifest has no artifact for {target}");
     };
     crate::ui::detail(&format!(
-        "updating docli {current} {} {} ({target})...",
+        "updating docli-cli {current} {} {} ({target})...",
         crate::ui::arrow(),
         manifest.version
     ));
@@ -181,6 +181,160 @@ fn swap_binary(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// The update NOTICE (v0.28.6 D11) — a new version made visible, to the human and to the agent
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+//
+// Today a new version is invisible unless someone runs `self-update` on a hunch: 0.1.0 → 0.1.1 →
+// 0.1.2 all shipped inside three days and nobody on 0.1.0 had any reason to know. The check
+// compares the local version against the SIGNED manifest we already publish and already verify —
+// no new endpoint, no new trust root, and RU-resident S3, so it is reachable without a VPN.
+//
+// Three rules, and each of them is what keeps a version check from becoming a nuisance:
+//
+// * **Cached, not per-command.** The network is touched at most once per 24 h. A CLI that hits
+//   the network on every invocation is a CLI people stop putting in scripts.
+// * **Never blocks and never fails a command.** Short timeout; any error, offline included, is
+//   silence. A version check must not be able to break `docli sync`.
+// * **Only ever announces strictly newer.** A manifest older than the local build — a rollback,
+//   a developer build — says nothing.
+//
+// And the message NAMES THE COMMAND. Not «a new version is available» but
+// «docli-cli 0.1.2 -> 0.1.3 - update: docli self-update». An agent that reads a state and a verb can
+// act; an agent that reads a complaint cannot. We announce; we never replace the binary on our
+// own — an update that happens by itself is a supply-chain event the user did not schedule, and
+// «the agent decided to» is not consent from the person whose machine it is.
+
+/// One network call per this long.
+const CHECK_INTERVAL_SECS: i64 = 24 * 60 * 60;
+
+/// Short enough that a blackholed network cannot hold a command hostage; the freshness hook
+/// never pays it at all (it reads the cache only).
+const CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+#[derive(Debug, Default, serde::Serialize, Deserialize)]
+struct UpdateCache {
+    /// When the network was last consulted — stamped on failure too, so an offline machine
+    /// retries once a day rather than on every invocation.
+    #[serde(default)]
+    checked_at: i64,
+    /// The newest version the manifest offered, whatever it was.
+    #[serde(default)]
+    latest: Option<String>,
+}
+
+fn cache_path() -> Option<std::path::PathBuf> {
+    crate::uninstall::home_dir().map(|h| h.join("update-check.json"))
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// A poisoned or absent cache file is an empty cache, never an error: this whole subsystem is
+/// allowed to know nothing.
+fn read_cache() -> UpdateCache {
+    cache_path().map(|p| read_cache_at(&p)).unwrap_or_default()
+}
+
+/// The pure half. Separated so its pin does not depend on `DOCLI_HOME`, which is a
+/// PROCESS-GLOBAL env var that several other tests in this crate set and clear — a test that
+/// reached through it passed alone and raced under `cargo test`.
+fn read_cache_at(path: &std::path::Path) -> UpdateCache {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn write_cache(c: &UpdateCache) {
+    let Some(p) = cache_path() else { return };
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(body) = serde_json::to_string(c) {
+        let _ = std::fs::write(p, body);
+    }
+}
+
+/// Is the network due? The 24 h bound as a DECISION, so it can be pinned without a network.
+///
+/// A clock that moved backwards (a laptop waking, an NTP correction) must not park the check
+/// forever on a `checked_at` in the FUTURE — hence the negative arm. It is `< 0`, not `<= 0`:
+/// an age of exactly zero is a cache written THIS SECOND, and two invocations inside one
+/// wall-clock second must not each hit the network.
+fn due(checked_at: i64, now: i64) -> bool {
+    let age = now - checked_at;
+    !(0..CHECK_INTERVAL_SECS).contains(&age)
+}
+
+/// The notice for a known-newer version, or `None`. The comparison is [`parse_semver`]'s, so a
+/// manifest version that is not plain `x.y.z` announces nothing — the same fail-closed posture
+/// the update path itself takes.
+pub fn notice_for(latest: &str, current: &str) -> Option<String> {
+    match (parse_semver(latest), parse_semver(current)) {
+        (Some(l), Some(c)) if l > c => Some(format!(
+            "docli-cli {current} -> {latest} - update: docli self-update"
+        )),
+        _ => None,
+    }
+}
+
+/// The notice from the CACHE only — no network, no timeout, no failure mode.
+///
+/// This is what the `SessionStart` hook uses: the freshness probe owns that hook's 2 s budget
+/// (D3), so a cold cache is skipped there and left for the next hand-run `docli` invocation to
+/// warm. The limitation that follows is real and named rather than papered over: an agent-only
+/// user who never runs `docli` by hand learns about a new version on the first session AFTER any
+/// hand invocation.
+pub fn cached_notice() -> Option<String> {
+    let cache = read_cache();
+    notice_for(cache.latest.as_deref()?, env!("CARGO_PKG_VERSION"))
+}
+
+/// The notice, refreshing the cache over the network at most once per 24 h.
+///
+/// Every failure — offline, a bad signature, a malformed manifest, an unwritable cache — is
+/// silence. Nothing here can make a command fail.
+pub fn notice() -> Option<String> {
+    let mut cache = read_cache();
+    if due(cache.checked_at, now_unix()) {
+        // Stamped BEFORE the attempt, so a machine that is offline for a week makes one call a
+        // day rather than one per invocation.
+        cache.checked_at = now_unix();
+        if let Some(v) = fetch_latest_version() {
+            cache.latest = Some(v);
+        }
+        write_cache(&cache);
+    }
+    notice_for(cache.latest.as_deref()?, env!("CARGO_PKG_VERSION"))
+}
+
+/// Fetch + VERIFY the manifest, and return the version it advertises. The signature check is the
+/// same one `run` performs and is not optional here either: an unsigned answer would be a
+/// bucket-controlled string we then print as advice.
+fn fetch_latest_version() -> Option<String> {
+    let base = artifacts_base();
+    let http = reqwest::blocking::Client::builder()
+        .timeout(CHECK_TIMEOUT)
+        .build()
+        .ok()?;
+    let fetch = |path: &str| -> Option<Vec<u8>> {
+        let resp = http.get(format!("{base}/{path}")).send().ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        Some(resp.bytes().ok()?.to_vec())
+    };
+    let manifest_bytes = fetch("manifest.json")?;
+    let sig = String::from_utf8(fetch("manifest.json.minisig")?).ok()?;
+    let manifest = verify_manifest(&manifest_bytes, &sig, RELEASE_PUBKEY_B64).ok()?;
+    Some(manifest.version)
+}
+
 /// Windows leftover cleanup, called at startup (harmless elsewhere).
 pub fn cleanup_stale_binary() {
     if let Ok(exe) = std::env::current_exe() {
@@ -211,6 +365,79 @@ mod tests {
         for bad in ["0.2.0-beta.1", "0.2", "0.2.0.1", "v0.2.0", " 9.0.0 ", ""] {
             assert_eq!(parse_semver(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn the_notice_announces_strictly_newer_and_names_the_command() {
+        // «docli 0.1.2 -> 0.1.3 - update: docli self-update». An agent that reads a state and a
+        // VERB can act; an agent that reads a complaint cannot.
+        let n = notice_for("0.1.3", "0.1.2").expect("newer announces");
+        assert!(n.contains("0.1.2") && n.contains("0.1.3"), "{n}");
+        assert!(n.contains("docli self-update"), "{n}");
+        // ONE naming rule across every message the CLI prints: it names ITSELF `docli-cli`, and
+        // a command you type stays the bare `docli`. Both halves are in this single line, which
+        // is why it is the one pinned — «docli-cli 0.1.2 -> 0.1.3 - update: docli self-update».
+        assert!(
+            n.starts_with("docli-cli "),
+            "the product names itself hyphenated: {n}"
+        );
+        assert!(
+            n.contains(" update: docli self-update"),
+            "…and the command stays bare: {n}"
+        );
+        // Equal and OLDER stay silent: a rollback or a developer build is not news.
+        assert_eq!(notice_for("0.1.2", "0.1.2"), None);
+        assert_eq!(notice_for("0.1.1", "0.1.2"), None);
+        assert_eq!(notice_for("0.9.9", "1.0.0"), None);
+        // …and anything that is not plain x.y.z announces nothing, the same fail-closed
+        // posture the update path itself takes.
+        for bad in ["0.2.0-beta.1", "", "v9.9.9", "9.9"] {
+            assert_eq!(notice_for(bad, "0.1.2"), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_network_is_touched_at_most_once_a_day() {
+        // Pinned against the CACHE, never the network — a CLI that hits the network on every
+        // invocation is a CLI people stop putting in scripts.
+        let day = CHECK_INTERVAL_SECS;
+        assert!(due(0, day), "a never-checked cache is due");
+        assert!(
+            !due(1_000_000, 1_000_000),
+            "a cache written THIS second is not due - two invocations inside one second must \
+             not each hit the network"
+        );
+        assert!(!due(1_000_000, 1_000_000 + 60), "a minute later: not due");
+        assert!(
+            !due(1_000_000, 1_000_000 + day - 1),
+            "one second short of a day: still not due"
+        );
+        assert!(due(1_000_000, 1_000_000 + day), "a day later: due");
+        // A stamp in the FUTURE (a clock correction, a copied home directory) must not park
+        // the check forever.
+        assert!(due(2_000_000, 1_000_000));
+    }
+
+    #[test]
+    fn a_poisoned_cache_is_ignored_rather_than_fatal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("update-check.json");
+        // Absent, and then unreadable: both read as an EMPTY cache — no panic, no error, no
+        // notice. This whole subsystem is allowed to know nothing.
+        assert_eq!(read_cache_at(&p).latest, None);
+        std::fs::write(&p, "not json at all{{").unwrap();
+        assert_eq!(read_cache_at(&p).latest, None);
+        assert_eq!(read_cache_at(&p).checked_at, 0);
+        // A well-formed one round-trips, and the 24 h bound is measured against the FILE, not
+        // the network: a fresh `checked_at` is what keeps `notice()` from building a client.
+        std::fs::write(&p, r#"{"checked_at": 9999999999, "latest": "99.0.0"}"#).unwrap();
+        let c = read_cache_at(&p);
+        assert_eq!(c.latest.as_deref(), Some("99.0.0"));
+        assert!(
+            now_unix() - c.checked_at < CHECK_INTERVAL_SECS,
+            "still fresh"
+        );
+        assert!(notice_for(c.latest.as_deref().unwrap(), "0.1.2").is_some());
     }
 
     #[test]

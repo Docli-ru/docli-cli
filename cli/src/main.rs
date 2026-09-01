@@ -6,30 +6,47 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use docli_cli::{
-    config, creds, doctor, http, init_cmd, list_cmd, login, logout, search_cmd, selfupdate, status,
-    sync_cmd, ui, uninstall, wizard,
+    config, creds, doctor, guard, hooks, http, init_cmd, list_cmd, login, logout, search_cmd,
+    selfupdate, status, sync_cmd, ui, uninstall, wizard,
 };
 
-/// D12.5 - the identity block: name, version, site, copyright. `-V` prints the short line,
-/// `--version` the full block; help carries the site + copyright in the footer.
+/// D12.5 - the identity block: name, version, site, copyright.
+///
+/// The NAME comes from clap's `display_name`, not from these strings, so `-V` prints
+/// `docli-cli 0.1.3` on one line — the shape the neighbouring tool uses (`codex-cli 0.144.6`) and
+/// the reason the hyphen was adopted. `Usage:` still says `docli`, because that is what you type:
+/// the product has a name and the command has a spelling, and they are allowed to differ.
+///
+/// The version is repeated in the HELP footer deliberately. Help output is what people paste into
+/// a bug report, and a paste with no version in it costs a round trip to find out.
 const LONG_VERSION_UNICODE: &str = concat!(
     env!("CARGO_PKG_VERSION"),
-    "\ndocli cli \u{2014} https://docli.ru\n\u{a9} 2026 Agitek. MIT License."
+    "\nread-only docli workspace mirrors for coding agents",
+    "\nhttps://docli.ru \u{b7} \u{a9} 2026 Agitek \u{b7} MIT License"
 );
 const LONG_VERSION_ASCII: &str = concat!(
     env!("CARGO_PKG_VERSION"),
-    "\ndocli cli - https://docli.ru\n(c) 2026 Agitek. MIT License."
+    "\nread-only docli workspace mirrors for coding agents",
+    "\nhttps://docli.ru | (c) 2026 Agitek | MIT License"
 );
-const AFTER_HELP_UNICODE: &str =
-    "docli cli \u{b7} https://docli.ru \u{b7} \u{a9} 2026 Agitek \u{b7} MIT License";
-const AFTER_HELP_ASCII: &str = "docli cli | https://docli.ru | (c) 2026 Agitek | MIT License";
+const AFTER_HELP_UNICODE: &str = concat!(
+    "docli-cli ",
+    env!("CARGO_PKG_VERSION"),
+    " \u{b7} https://docli.ru \u{b7} \u{a9} 2026 Agitek \u{b7} MIT License"
+);
+const AFTER_HELP_ASCII: &str = concat!(
+    "docli-cli ",
+    env!("CARGO_PKG_VERSION"),
+    " | https://docli.ru | (c) 2026 Agitek | MIT License"
+);
 const ABOUT_UNICODE: &str =
-    "docli cli \u{2014} read-only docli workspace mirrors for coding agents";
-const ABOUT_ASCII: &str = "docli cli - read-only docli workspace mirrors for coding agents";
+    "docli-cli \u{2014} read-only docli workspace mirrors for coding agents";
+const ABOUT_ASCII: &str = "docli-cli - read-only docli workspace mirrors for coding agents";
 
 #[derive(Parser)]
 #[command(
     name = "docli",
+    display_name = "docli-cli",
     version,
     long_version = LONG_VERSION_ASCII,
     about = ABOUT_ASCII,
@@ -93,6 +110,20 @@ enum Command {
         /// Append the missing .gitignore lines (otherwise they are only named)
         #[arg(long)]
         gitignore: bool,
+        /// Copy the mirror contract into each agent's own skills directory: `auto`
+        /// (detected here - the default), `none`, or a comma-separated list of agent keys
+        #[arg(long)]
+        skills: Option<String>,
+        /// Install docli's hooks - a PreToolUse hook that refuses writes into the mirror and a
+        /// SessionStart hook that reports its freshness: `auto` (detected here), `none` (the
+        /// default), or a list of claude,codex. Never written without this flag under
+        /// --no-input
+        #[arg(long)]
+        hooks: Option<String>,
+        /// Write the docli section of AGENTS.md, and a CLAUDE.md importing it when none
+        /// exists (an existing CLAUDE.md is never edited)
+        #[arg(long)]
+        instructions: bool,
     },
     /// Bring every mount to the server's head (one-shot; never pushes)
     Sync {
@@ -102,6 +133,10 @@ enum Command {
         /// Rebuild the mirror from server state and prune stale files
         #[arg(long)]
         full: bool,
+        /// Report freshness on stdout in an agent's SessionStart hook schema, and always
+        /// exit 0 (`claude` or `codex`). Only with --check
+        #[arg(long, requires = "check", conflicts_with = "full")]
+        agent: Option<String>,
     },
     /// Server search across all mounts (results carry local paths)
     Search {
@@ -147,7 +182,18 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Remove docli from this device
+    /// The PreToolUse hook's decision, in the agent's own JSON schema. Invoked by agents,
+    /// never by people - see `docli init --hooks`.
+    #[command(hide = true)]
+    Guard {
+        /// Which agent's hook schema to answer in
+        #[arg(long)]
+        agent: String,
+        /// Where to read the hook payload: `-` for stdin
+        #[arg(long, default_value = "-")]
+        tool_input: String,
+    },
+    /// Remove docli-cli from this device
     Uninstall {
         /// Also remove this project's mirrors and .docli/
         #[arg(long)]
@@ -216,8 +262,34 @@ fn main() {
             Err(e) => e.exit(),
         }
     };
+    // The update notice (D11), surface 1 of three. Deliberately AFTER the command: a notice
+    // above the thing the reader asked for is noise, and one on stderr never interleaves into
+    // another command's stdout product, so piping stays parseable.
+    //
+    // Three commands are exempt and each for its own reason: `guard` and a hook-mode `sync`
+    // must emit nothing but their machine output; `status` renders the notice ITSELF, as a
+    // field on stdout, because there the screen is the product; and `self-update` has just
+    // finished answering this exact question.
+    let announce_update = !matches!(
+        cli.command,
+        Command::Guard { .. }
+            | Command::Status { .. }
+            | Command::SelfUpdate
+            // …and `uninstall`, which is not about noise: the notice WRITES its cache into
+            // `~/.docli`, so announcing after a successful uninstall recreates the very
+            // directory the command just removed — and does it even when the fetch fails,
+            // because the attempt is stamped either way.
+            | Command::Uninstall { .. }
+    ) && !matches!(cli.command, Command::Sync { agent: Some(_), .. });
     match run(cli) {
-        Ok(code) => std::process::exit(code),
+        Ok(code) => {
+            if announce_update {
+                if let Some(n) = selfupdate::notice() {
+                    ui::update_notice(&n);
+                }
+            }
+            std::process::exit(code)
+        }
         Err(e) => {
             if interrupted(&e) {
                 std::process::exit(130);
@@ -249,6 +321,9 @@ fn run(cli: Cli) -> Result<i32> {
             mcp_bare,
             clear_folder,
             gitignore,
+            skills,
+            hooks,
+            instructions,
         } => {
             let origin = resolve_server(server.as_deref(), &cwd)?;
             let args = init_cmd::InitArgs {
@@ -263,6 +338,9 @@ fn run(cli: Cli) -> Result<i32> {
                 allow_prompt: true,
                 clear_folder,
                 write_gitignore: gitignore,
+                skills,
+                hooks,
+                instructions,
             };
             // A bare `docli init` at a terminal is the guided journey; any flag, or a pipe,
             // keeps the scriptable path an agent can drive.
@@ -275,7 +353,22 @@ fn run(cli: Cli) -> Result<i32> {
             });
             init_cmd::run(&cwd, api.as_ref(), &args)
         }
-        Command::Sync { check, full } => {
+        Command::Sync { check, full, agent } => {
+            // The HOOK path resolves everything itself and always exits 0. It cannot go through
+            // the branch below: `api_for` bails before `sync` is reached at all, so «not signed
+            // in» would leave a SessionStart hook emitting an anyhow error to stderr and
+            // NOTHING to the channel the agent actually reads (D3).
+            if let Some(agent) = agent {
+                let agent = hooks::HookAgent::parse(&agent)?;
+                // The PROCESS cwd, deliberately — unlike `guard`, which reads `cwd` out of its
+                // payload. The asymmetry is real and neither side is guessing: both agents
+                // document that a hook command runs in the session's working directory, so
+                // this is correct; `guard` reads the payload's copy because it is already
+                // parsing that payload and the field costs nothing. What this path must NOT do
+                // is read stdin for it — a person typing `docli sync --check --agent claude`
+                // in a terminal would hang on a pipe that never delivers a line.
+                return Ok(sync_cmd::hook_check(&cwd, agent));
+            }
             let project = config::load_project(&cwd)?;
             let api = api_for(&project)?;
             sync_cmd::run(&project, &api, &sync_cmd::SyncOptions { check, full })
@@ -320,6 +413,10 @@ fn run(cli: Cli) -> Result<i32> {
             let server = resolve_server(server.as_deref(), &cwd)?;
             status::run(&cwd, &server, json)
         }
+        Command::Guard { agent, tool_input } => {
+            let agent = hooks::HookAgent::parse(&agent)?;
+            guard::run(agent, &tool_input)
+        }
         Command::Uninstall { purge, yes } => uninstall::run(&cwd, purge, yes),
     }
 }
@@ -348,15 +445,34 @@ mod tests {
         assert!(long.contains(env!("CARGO_PKG_VERSION")), "{long}");
         // The brand is lowercase «docli», never «Docli» (user ruling 2026-09-01), and the entity
         // is written «Agitek» in user-facing copy.
-        assert!(long.contains("docli cli"), "{long}");
+        assert!(long.contains("docli-cli"), "{long}");
         assert!(!long.contains("Docli"), "{long}");
         assert!(!long.contains("OOO"), "{long}");
         assert!(long.contains("docli.ru"), "{long}");
         assert!(long.contains("(c) 2026 Agitek"), "{long}");
         assert!(long.contains("MIT"), "{long}");
+        // The NAME and the VERSION share the first line — the shape the neighbouring tool uses
+        // (`codex-cli 0.144.6`), which is the evidence the hyphenated spelling rests on. It comes
+        // from clap's `display_name`, so a rename that only touched these constants would not
+        // move it; asserting the rendered line is what makes the two agree.
+        let first = long.lines().next().unwrap_or_default();
+        assert_eq!(
+            first,
+            concat!("docli-cli ", env!("CARGO_PKG_VERSION")),
+            "name and version belong on one line: {long}"
+        );
+        // …while `Usage:` still names the COMMAND. The product has a name and the command has a
+        // spelling, and conflating them would tell people to type something that does not exist.
         let help = cmd.render_long_help().to_string();
+        assert!(help.contains("Usage: docli "), "{help}");
         assert!(help.contains("docli.ru"), "{help}");
         assert!(help.contains("Agitek"), "{help}");
+        // The version is in the HELP footer too, deliberately: help output is what people paste
+        // into a bug report, and a paste with no version costs a round trip to establish one.
+        assert!(
+            help.contains(concat!("docli-cli ", env!("CARGO_PKG_VERSION"))),
+            "the help footer must carry the version: {help}"
+        );
     }
 
     #[test]

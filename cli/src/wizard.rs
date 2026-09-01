@@ -33,7 +33,7 @@ use crate::config::{self, DocliToml, Mount};
 use crate::http::{Api, WorkspaceInfo};
 use crate::{creds, init_cmd, login, ui};
 
-const STEPS: usize = 6;
+const STEPS: usize = 7;
 
 /// What the wizard decided, ready to apply.
 pub struct Plan {
@@ -49,6 +49,13 @@ pub struct Plan {
     /// absent `--folder` there means «leave what is recorded».
     pub clear_folder: bool,
     pub agents: Vec<&'static str>,
+    /// Which of the two hook-capable agents the reader agreed to install hooks for (v0.28.6 D6).
+    /// Offered UNTICKED, unlike the detected agent configurations: a config entry names a
+    /// server, a hook runs a program.
+    pub hooks: Vec<crate::hooks::HookAgent>,
+    /// The reader agreed to the `AGENTS.md` section (and a `CLAUDE.md` importing it, when there
+    /// is none to damage — D5).
+    pub instructions: bool,
     pub sync_now: bool,
 }
 
@@ -346,7 +353,15 @@ pub fn offer_missing_ignores(project_root: &Path, config: &DocliToml) -> Result<
             Ok(true)
         }
         Err(e) => {
-            ui::refuse(&format!("could not write .gitignore: {e:#}"));
+            // Every refusal names the alternative (v0.28.6 D1a): the reader still has to get
+            // these lines in, and the command that refuses is not the only way to do it.
+            ui::refuse(&format!(
+                "could not write .gitignore ({e:#}) - add these lines to it yourself:\n    {}",
+                want.iter()
+                    .map(|f| f.label(project_root))
+                    .collect::<Vec<_>>()
+                    .join("\n    ")
+            ));
             Ok(false)
         }
     }
@@ -374,6 +389,12 @@ pub fn has_intent(args: &init_cmd::InitArgs) -> bool {
         // question. `--clear-folder` is the same kind of instruction.
         || args.write_gitignore
         || args.clear_folder
+        // The v0.28.6 flags are intent too: `docli init --hooks claude` asks for one specific
+        // thing, and starting the whole guided journey instead would be answering a different
+        // question — the same reasoning `--gitignore` already carries.
+        || args.hooks.is_some()
+        || args.skills.is_some()
+        || args.instructions
 }
 
 /// The ONE agent picker: every configuration on one screen, the ones detected here already
@@ -400,6 +421,79 @@ pub fn pick_agents(detected: &[&'static str]) -> Result<Vec<&'static str>> {
         .defaults(&checked)
         .interact()?;
     Ok(chosen.into_iter().map(|i| all[i].key).collect())
+}
+
+/// Step 6 — the two heavier writes, offered UNTICKED (v0.28.6 D6).
+///
+/// Both agents refuse to run project-local hooks until the user accepts a trust dialog, so
+/// `docli init` writing one cannot smuggle execution onto a machine: the platform holds the
+/// gate. We ask anyway, and harder than for MCP, because a config entry names a server while a
+/// hook runs a program — different acts, different defaults. The offer states plainly what will
+/// be written, to which file, and that the agent will ask before any of it runs.
+///
+/// Only the two agents that HAVE a hook mechanism appear here. D9's asymmetry is stated rather
+/// than left to inference: a user who wired Cursor and read «the mirror is protected» would be
+/// wrong in exactly the way that costs a note.
+fn pick_enforcement(
+    cwd: &Path,
+    detected: &[&'static str],
+) -> Result<(Vec<crate::hooks::HookAgent>, bool)> {
+    let candidates: Vec<crate::hooks::HookAgent> = crate::hooks::HookAgent::all()
+        .into_iter()
+        .filter(|a| detected.contains(&a.key()))
+        .collect();
+    let mut chosen = Vec::new();
+    if candidates.is_empty() {
+        ui::detail(
+            "No agent with a hook mechanism was found here (only Claude Code and Codex have \
+             one). The mirror stays marked read-only and the contract asks agents not to edit \
+             it, but nothing refuses a write.",
+        );
+    } else {
+        ui::detail("Hooks make the mirror unwritable in fact, not only in prose:");
+        for line in crate::hooks::consent_summary(&candidates) {
+            ui::detail(&format!("  {line}"));
+        }
+        ui::detail(
+            "  Shell writes (`sed -i`, `>`) are NOT covered, and no other agent gets \
+             enforcement at all.",
+        );
+        let items: Vec<String> = candidates.iter().map(|a| a.display().to_string()).collect();
+        // UNTICKED. This is the one selection in the whole wizard that starts empty.
+        let picked = MultiSelect::with_theme(&prompt_theme())
+            .with_prompt("Install docli's hooks (nothing is ticked - space to opt in)")
+            .items(&items)
+            .defaults(&vec![false; items.len()])
+            .interact()?;
+        chosen = picked.into_iter().map(|i| candidates[i]).collect();
+    }
+
+    // DISCLOSED, because it is a write the reader did not tick. Step 5 governs MCP configs;
+    // the contract file follows DETECTION instead (D4 — declining a config edit must not cost
+    // you the contract), and `init` already drops the same file at the open-standard path
+    // unconditionally. That makes it the lightest write here, not an invisible one.
+    let skill_dirs: Vec<&str> = crate::agents::AGENTS
+        .iter()
+        .filter(|a| detected.contains(&a.key))
+        .filter_map(|a| a.skill_copy_dir)
+        .collect();
+    if !skill_dirs.is_empty() {
+        ui::detail(&format!(
+            "The mirror contract will also be copied into {} (a document, nothing executable). \
+             Skip it with `docli init --skills none`.",
+            skill_dirs.join(", ")
+        ));
+    }
+
+    ui::detail("Instruction files put the contract where each agent already looks:");
+    for line in crate::instructions::consent_summary(cwd) {
+        ui::detail(&format!("  {line}"));
+    }
+    let instructions = Confirm::with_theme(&prompt_theme())
+        .with_prompt("Write these instruction files?")
+        .default(false)
+        .interact()?;
+    Ok((chosen, instructions))
 }
 
 pub fn run(cwd: &Path, server_flag: Option<&str>) -> Result<i32> {
@@ -561,6 +655,11 @@ pub fn run(cwd: &Path, server_flag: Option<&str>) -> Result<i32> {
     // only the geometry rules (overlap, control plane, vault, containment) are checked here.
     if let Err(e) = config::validate_geometry_paths_only(cwd, &probe) {
         ui::refuse(&format!("{e:#}"));
+        // Nothing was written, and the answer that caused this is one prompt back.
+        ui::next(&format!(
+            "Run {} again and choose a different mirror directory",
+            ui::cmd("docli init")
+        ));
         return Ok(1);
     }
 
@@ -573,8 +672,12 @@ pub fn run(cwd: &Path, server_flag: Option<&str>) -> Result<i32> {
     );
     let agents = pick_agents(&detected)?;
 
-    // ── 6. Git и первая синхронизация ────────────────────────────────────────────────────
-    ui::step(6, STEPS, "Git and the first sync");
+    // ── 6. Правила и хуки ────────────────────────────────────────────────────────────────
+    ui::step(6, STEPS, "Rules and enforcement");
+    let (hook_agents, instructions) = pick_enforcement(cwd, &detected)?;
+
+    // ── 7. Git и первая синхронизация ────────────────────────────────────────────────────
+    ui::step(7, STEPS, "Git and the first sync");
     // Every line the consent will actually cause to be written — `init_cmd` writes for EVERY
     // mount, so showing only the selected one asked for agreement to a smaller change than the
     // one performed (and could touch a nested repository's file the reader never saw named).
@@ -611,6 +714,8 @@ pub fn run(cwd: &Path, server_flag: Option<&str>) -> Result<i32> {
         folder,
         clear_folder,
         agents,
+        hooks: hook_agents,
+        instructions,
         gitignore,
         sync_now,
     };
@@ -640,6 +745,19 @@ fn apply(cwd: &Path, api: &Api, plan: Plan) -> Result<i32> {
             mcp_label: None,
             mcp_bare: false,
             allow_prompt: false,
+            // The skill goes to every DETECTED agent's own directory regardless of what the
+            // reader ticked for MCP (D4): declining a config write must not silently cost them
+            // the contract too, and `init` already drops the same file at the open-standard
+            // path unconditionally.
+            skills: Some("auto".to_string()),
+            hooks: (!plan.hooks.is_empty()).then(|| {
+                plan.hooks
+                    .iter()
+                    .map(|a| a.key())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }),
+            instructions: plan.instructions,
             // Consent was collected in step 6; the WRITE belongs to `init_cmd`, which does it
             // once the whole configuration has passed the gate.
             write_gitignore: plan.gitignore,
@@ -904,6 +1022,9 @@ mod tests {
             allow_prompt: true,
             clear_folder: false,
             write_gitignore: false,
+            skills: None,
+            hooks: None,
+            instructions: false,
         };
         // `has_intent`, not `should_run`: a test run has no TTY, so `should_run` is false for
         // every variant and would pass even if the intent check were deleted.
@@ -924,9 +1045,26 @@ mod tests {
             folder: Some("docs".into()),
             ..bare.clone()
         }));
+        // The v0.28.6 flags are intent too — each asks for one specific thing, and starting
+        // the whole guided journey instead would answer a different question.
+        assert!(has_intent(&init_cmd::InitArgs {
+            hooks: Some("claude".into()),
+            ..bare.clone()
+        }));
+        assert!(has_intent(&init_cmd::InitArgs {
+            skills: Some("none".into()),
+            ..bare.clone()
+        }));
+        assert!(has_intent(&init_cmd::InitArgs {
+            instructions: true,
+            ..bare.clone()
+        }));
         // `docli init --gitignore` must perform the advertised fix, not open the wizard.
         assert!(has_intent(&init_cmd::InitArgs {
             write_gitignore: true,
+            skills: Some("none".into()),
+            hooks: None,
+            instructions: false,
             ..bare.clone()
         }));
     }

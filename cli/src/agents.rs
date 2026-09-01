@@ -139,8 +139,18 @@ pub struct AgentDef {
     /// $HOME-relative markers meaning "installed on this machine".
     home_markers: &'static [&'static str],
     adapter: McpAdapter,
-    /// Off-standard skills dir (project-relative) for agents that don't read `.agents/skills/`.
+    /// Where to copy `SKILL.md` (project-relative), for any agent that does not pick it up from
+    /// `.agents/skills/`. `None` means the agent is BELIEVED to read the standard path — and that
+    /// belief is only as good as the last verification (see the Claude Code note below).
     pub skill_copy_dir: Option<&'static str>,
+    /// Does this agent's skill frontmatter accept Claude Code's own keys (v0.28.6 D4)?
+    ///
+    /// `.agents/skills/` is the open-standard path, where a key outside the spec's six is a hard
+    /// packaging error rather than an ignored field — which is why the shared asset stays
+    /// spec-clean and `copy_skill` injects per destination instead. Only `.claude/skills/` takes
+    /// the extension today; every other row is `false` because nothing verifies otherwise, which
+    /// is exactly the posture D10 mints.
+    pub accepts_claude_frontmatter: bool,
 }
 
 /// The picker table. Tier-1 adapters write; the rest print. `.mcp.json` serves Claude Code AND
@@ -156,7 +166,16 @@ pub const AGENTS: &[AgentDef] = &[
             top_key: "mcpServers",
             entry_shape: JsonShape::TypeHttpUrl,
         },
-        skill_copy_dir: None,
+        // Claude Code does NOT read `.agents/skills/` (verified 2026-09-01 against its own docs
+        // and by observation: the file was in place, `/reload-skills` reported "no changes", the
+        // skill never appeared). Its documented project path is `.claude/skills/`, which Copilot
+        // in VS Code also reads. Getting this wrong was silent in the worst way: `docli init`
+        // reported Claude Code configured, and for MCP it truly was.
+        skill_copy_dir: Some(".claude/skills/docli-mirror"),
+        // `.claude/skills/` is Claude Code's own path, so it takes Claude Code's own frontmatter
+        // — including `paths` glob activation (verified 2026-09-01,
+        // `code.claude.com/docs/en/skills`, frontmatter reference table).
+        accepts_claude_frontmatter: true,
     },
     AgentDef {
         key: "codex",
@@ -166,7 +185,14 @@ pub const AGENTS: &[AgentDef] = &[
         adapter: McpAdapter::CodexToml {
             path: ".codex/config.toml",
         },
+        // Codex DOES read `.agents/skills/` — the one `None` in this table that carries a dated
+        // vendor-doc verification (2026-09-01, `learn.chatgpt.com/docs/build-skills.md`, which
+        // lists the scan order verbatim: `$CWD/.agents/skills`, `$CWD/../.agents/skills`,
+        // `$REPO_ROOT/.agents/skills`, `$HOME/.agents/skills`, `/etc/codex/skills`). The
+        // unconditional drop `init_cmd` makes was correct for Codex and wrong only about Claude
+        // Code. Its frontmatter documents `name` and `description` only, so no injection.
         skill_copy_dir: None,
+        accepts_claude_frontmatter: false,
     },
     AgentDef {
         key: "gemini",
@@ -179,6 +205,7 @@ pub const AGENTS: &[AgentDef] = &[
             entry_shape: JsonShape::HttpUrl,
         },
         skill_copy_dir: None,
+        accepts_claude_frontmatter: false,
     },
     AgentDef {
         key: "cursor",
@@ -191,6 +218,7 @@ pub const AGENTS: &[AgentDef] = &[
             entry_shape: JsonShape::UrlOnly,
         },
         skill_copy_dir: None,
+        accepts_claude_frontmatter: false,
     },
     AgentDef {
         key: "vscode",
@@ -203,6 +231,7 @@ pub const AGENTS: &[AgentDef] = &[
             entry_shape: JsonShape::TypeHttpUrl,
         },
         skill_copy_dir: None,
+        accepts_claude_frontmatter: false,
     },
     AgentDef {
         key: "opencode",
@@ -215,6 +244,7 @@ pub const AGENTS: &[AgentDef] = &[
             entry_shape: JsonShape::OpencodeRemote,
         },
         skill_copy_dir: None,
+        accepts_claude_frontmatter: false,
     },
     AgentDef {
         key: "qwen",
@@ -223,6 +253,7 @@ pub const AGENTS: &[AgentDef] = &[
         home_markers: &[".qwen"],
         adapter: McpAdapter::Print,
         skill_copy_dir: Some(".qwen/skills/docli-mirror"),
+        accepts_claude_frontmatter: false,
     },
     AgentDef {
         key: "cline",
@@ -231,6 +262,7 @@ pub const AGENTS: &[AgentDef] = &[
         home_markers: &[".cline"],
         adapter: McpAdapter::Print,
         skill_copy_dir: Some(".cline/skills/docli-mirror"),
+        accepts_claude_frontmatter: false,
     },
     AgentDef {
         key: "trae",
@@ -239,12 +271,14 @@ pub const AGENTS: &[AgentDef] = &[
         home_markers: &[".trae"],
         adapter: McpAdapter::Print,
         skill_copy_dir: Some(".trae/skills/docli-mirror"),
+        accepts_claude_frontmatter: false,
     },
     // The remaining print-only set (D12.4): reachable by key so every named agent's user can
     // get their snippet — Zed's project-level MCP placement is undocumented, Windsurf's config
     // is global-only, SourceCraft's and Junie's remote-MCP OAuth is unconfirmed. Zed and
     // Windsurf read `.agents/skills/` natively, so no skill copy; SourceCraft and Junie have
-    // no skills mechanism at all.
+    // no skills mechanism at all. NOTE (2026-09-01): the "reads `.agents/skills/` natively"
+    // claim below is UNVERIFIED — the same claim was false for Claude Code.
     AgentDef {
         key: "zed",
         display: "Zed (snippet)",
@@ -252,6 +286,7 @@ pub const AGENTS: &[AgentDef] = &[
         home_markers: &[".config/zed"],
         adapter: McpAdapter::Print,
         skill_copy_dir: None,
+        accepts_claude_frontmatter: false,
     },
     AgentDef {
         key: "windsurf",
@@ -260,6 +295,7 @@ pub const AGENTS: &[AgentDef] = &[
         home_markers: &[".codeium/windsurf"],
         adapter: McpAdapter::Print,
         skill_copy_dir: None,
+        accepts_claude_frontmatter: false,
     },
     AgentDef {
         key: "sourcecraft",
@@ -268,6 +304,7 @@ pub const AGENTS: &[AgentDef] = &[
         home_markers: &[],
         adapter: McpAdapter::Print,
         skill_copy_dir: None,
+        accepts_claude_frontmatter: false,
     },
     AgentDef {
         key: "junie",
@@ -276,9 +313,11 @@ pub const AGENTS: &[AgentDef] = &[
         home_markers: &[".junie"],
         adapter: McpAdapter::Print,
         skill_copy_dir: None,
+        accepts_claude_frontmatter: false,
     },
     // Tier-2 (research doc): documented project config + confirmed OAuth, smaller audience —
-    // snippet-only until demand shows; reads `.agents/skills/` natively, so no skill copy.
+    // snippet-only until demand shows. The "reads `.agents/skills/` natively" claim behind this
+    // `None` is UNVERIFIED (2026-09-01) — it was false for Claude Code.
     AgentDef {
         key: "amp",
         display: "Amp (snippet)",
@@ -286,6 +325,7 @@ pub const AGENTS: &[AgentDef] = &[
         home_markers: &[".config/amp"],
         adapter: McpAdapter::Print,
         skill_copy_dir: None,
+        accepts_claude_frontmatter: false,
     },
 ];
 
@@ -411,7 +451,7 @@ fn ensure_trailing_newline(s: &mut String) {
 /// «Isn't sure» includes a DUPLICATED depth-1 key: serde_json keeps the LAST duplicate while a
 /// first-match splice would edit the object the agent ignores — so any second candidate match
 /// makes the whole locate refuse.
-fn top_level_value_brace(text: &str, key: &str) -> Option<usize> {
+pub(crate) fn top_level_value_brace(text: &str, key: &str) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut depth = 0usize;
     let mut i = 0usize;
@@ -466,7 +506,7 @@ fn top_level_value_brace(text: &str, key: &str) -> Option<usize> {
 }
 
 /// Index just past the closing quote's content: `bytes[start..ret]` is the raw string body.
-fn scan_string(bytes: &[u8], start: usize) -> Option<usize> {
+pub(crate) fn scan_string(bytes: &[u8], start: usize) -> Option<usize> {
     let mut i = start;
     while i < bytes.len() {
         match bytes[i] {
@@ -495,7 +535,11 @@ fn replace_docli_entry(text: &str, top_key: &str, entry: &str) -> Option<String>
 /// Locate the value span of `key` as a DIRECT member of the object opening at `obj_open`
 /// (byte index of its `{`). Same discipline as [`top_level_value_brace`]: strings and escapes
 /// respected, a duplicated key refuses, any doubt returns `None`.
-fn value_of_key_in_object(text: &str, obj_open: usize, key: &str) -> Option<(usize, usize)> {
+pub(crate) fn value_of_key_in_object(
+    text: &str,
+    obj_open: usize,
+    key: &str,
+) -> Option<(usize, usize)> {
     let bytes = text.as_bytes();
     let mut depth = 0usize;
     let mut i = obj_open;
@@ -552,7 +596,7 @@ fn value_of_key_in_object(text: &str, obj_open: usize, key: &str) -> Option<(usi
 }
 
 /// End (exclusive) of the JSON value starting at `start` (first byte of the value).
-fn json_value_extent(bytes: &[u8], start: usize) -> Option<usize> {
+pub(crate) fn json_value_extent(bytes: &[u8], start: usize) -> Option<usize> {
     match *bytes.get(start)? {
         b'"' => scan_string(bytes, start + 1).map(|e| e + 1),
         b'{' | b'[' => {
@@ -736,7 +780,7 @@ pub fn snippet(def: &AgentDef, url: &str) -> String {
 /// the bare-URL fallback note: the audience fence is byte-exact, so an agent that omits RFC
 /// 8707 `resource` gets a bare-audience token the labeled route refuses — the note tells the
 /// user the escape hatch instead of leaving them at an opaque `invalid_token`.
-pub fn wire(project_root: &Path, selected: &[&AgentDef], url: &str, labeled: bool, skill_md: &str) {
+pub fn wire(project_root: &Path, selected: &[&AgentDef], url: &str, labeled: bool) {
     crate::ui::heading("This project's MCP connection");
     crate::ui::line(&format!("  {}", crate::ui::path(url)));
     crate::ui::detail(
@@ -756,13 +800,6 @@ pub fn wire(project_root: &Path, selected: &[&AgentDef], url: &str, labeled: boo
                 def.display,
                 snippet(def, url)
             ));
-        }
-        if let Some(dir) = def.skill_copy_dir {
-            if let Err(e) = copy_skill(project_root, dir, skill_md) {
-                crate::ui::refuse(&format!("{}: could not copy SKILL.md ({e:#})", def.display));
-            } else {
-                crate::ui::detail(&format!("wrote {dir}/SKILL.md"));
-            }
         }
     }
 }
@@ -997,7 +1034,7 @@ fn resolve_config_dest(target: &Path) -> std::path::PathBuf {
     p
 }
 
-fn write_user_config(target: &Path, bytes: &[u8]) -> Result<()> {
+pub fn write_user_config(target: &Path, bytes: &[u8]) -> Result<()> {
     use rand::RngCore;
     let dest = resolve_config_dest(target);
     let existing_perms = fs::metadata(&dest).ok().map(|m| m.permissions());
@@ -1078,7 +1115,7 @@ fn is_cfg_temp(name: &str) -> bool {
 /// Best-effort cleanup of `.docli-cfg-*.tmp` strays a crashed earlier `init` may have left in
 /// the directories we are about to write into (round-5 F2 — the residue would otherwise be
 /// unowned: no doctor class runs in a user project dir, and `git add -A` would commit it).
-fn sweep_cfg_temps(project_root: &Path, selected: &[&AgentDef]) {
+pub fn sweep_cfg_temps(project_root: &Path, selected: &[&AgentDef]) {
     let mut dirs: Vec<std::path::PathBuf> = selected
         .iter()
         .filter_map(|def| match def.adapter {
@@ -1086,6 +1123,13 @@ fn sweep_cfg_temps(project_root: &Path, selected: &[&AgentDef]) {
             McpAdapter::CodexToml { path } => Some(path),
             McpAdapter::Print => None,
         })
+        // The hook files are written by the SAME atomic writer, so a crashed `init` leaves the
+        // same residue beside them (v0.28.6). One sweep, both writers.
+        .chain(
+            crate::hooks::HookAgent::all()
+                .iter()
+                .map(|a| a.config_path()),
+        )
         .filter_map(|rel| {
             // The SAME resolution the writer applies (round-6 facet B; ONE fn since Codex
             // round 2): a symlinked config — dangling included — puts the temp beside the
@@ -1109,12 +1153,159 @@ fn sweep_cfg_temps(project_root: &Path, selected: &[&AgentDef]) {
     }
 }
 
-fn copy_skill(project_root: &Path, dir: &str, skill_md: &str) -> Result<()> {
+/// Write the shared contract into one agent's skills directory, injecting the frontmatter keys
+/// that agent's schema admits (v0.28.6 D4).
+///
+/// **One body, never a fork.** `apps/cli/assets/SKILL.md` is a single compile-time constant with
+/// a single set of pins, and it is written to the Agent Skills open-standard path
+/// byte-for-byte — that path is spec-constrained, and a key outside the six the spec allows
+/// (`name, description, license, compatibility, metadata, allowed-tools`) is a HARD packaging
+/// error there, not an ignored field. Claude-Code-only keys are therefore injected AT COPY TIME,
+/// for the destinations whose schema admits them, rather than written into the asset.
+///
+/// The key that earns its place is `paths` — *"Glob patterns that limit when this skill is
+/// activated. When set, Claude loads the skill automatically only when working with files
+/// matching the patterns"* (verified 2026-09-01, `code.claude.com/docs/en/skills`, frontmatter
+/// reference). That inverts what the description was carrying alone: **`paths` is the primary
+/// activation path and the description is the fallback.** The case that carries the data-loss
+/// risk — an agent about to edit a mirrored file — now activates structurally instead of by
+/// judgement, and the description still covers requests that touch no mirror file at all
+/// («найди в докли заметку про X»).
+///
+/// The globs come from the MOUNT TABLE, so this is a template, not a copy: `docli init --dir
+/// <custom>` means `docli-mirror/**` is not a safe static guess — it would be silently inert for
+/// exactly the users who customised.
+///
+/// Two limits carry over from the guard, and neither is a defect to fix here: an absolute mount
+/// outside the project root cannot be expressed as a project-relative glob, and path activation
+/// triggers on files the agent WORKS WITH, so a write to a brand-new path inside the mirror may
+/// not activate it. That second one is precisely why the guard exists and the activation does
+/// not replace it — **activation informs, the hook enforces.**
+pub fn copy_skill(project_root: &Path, dir: &str, skill_md: &str, globs: &[String]) -> Result<()> {
     let d = project_root.join(dir);
     fs::create_dir_all(&d)?;
-    fs::write(d.join("SKILL.md"), skill_md)
+    let body = if globs.is_empty() {
+        skill_md.to_string()
+    } else {
+        inject_frontmatter(skill_md, "paths", globs)
+    };
+    fs::write(d.join("SKILL.md"), body)
         .with_context(|| format!("writing {}/SKILL.md", d.display()))?;
     Ok(())
+}
+
+/// Add `key: [values]` to a YAML frontmatter block, leaving the body untouched.
+///
+/// Values are emitted as a YAML LIST of double-quoted scalars, which is one of the two spellings
+/// the field documents. A glob comes from a user-chosen directory name, so it goes through JSON
+/// string escaping — YAML's double-quoted scalar shares JSON's escape rules for the two
+/// characters that matter (`"` and `\`), and an unescaped one would break the whole frontmatter
+/// block rather than just this key.
+fn inject_frontmatter(skill_md: &str, key: &str, values: &[String]) -> String {
+    let rendered: Vec<String> = values
+        .iter()
+        .map(|v| serde_json::Value::String(v.clone()).to_string())
+        .collect();
+    let line = format!(
+        "{key}: [{}]
+",
+        rendered.join(", ")
+    );
+    // The frontmatter is the block between the first two `---` lines. Anything else is left
+    // exactly as it is — a body without frontmatter is not something to repair here.
+    let Some(rest) = skill_md.strip_prefix(
+        "---
+",
+    ) else {
+        return skill_md.to_string();
+    };
+    let Some(end) = rest.find(
+        "
+---",
+    ) else {
+        return skill_md.to_string();
+    };
+    format!(
+        "---
+{}
+{line}---{}",
+        &rest[..end],
+        &rest[end + 4..]
+    )
+}
+
+/// The activation globs for this project's mirrors, project-relative.
+///
+/// An ABSOLUTE mount contributes nothing: a project-relative glob cannot express it, and a
+/// silently wrong pattern is worse than an absent one.
+pub fn skill_globs(project_root: &Path, mounts: &[crate::config::Mount]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for m in mounts {
+        let p = Path::new(&m.dir);
+        let rel = if p.is_absolute() {
+            match crate::config::mount_abs(project_root, m).strip_prefix(project_root) {
+                Ok(r) => r.to_string_lossy().into_owned(),
+                Err(_) => continue,
+            }
+        } else {
+            m.dir.trim_end_matches('/').to_string()
+        };
+        if rel.is_empty() {
+            continue;
+        }
+        let rel = rel.replace('\\', "/");
+        // A directory whose NAME contains glob metacharacters contributes nothing, for the same
+        // reason an absolute mount outside the project does: a pattern that is silently wrong is
+        // worse than an absent one. `mirror[prod]/**` reads `[prod]` as a character class, so it
+        // would fail to activate for the real directory AND could activate for others. Escaping
+        // is not available to us either — the field documents «the same format as path-specific
+        // rules» without naming an escape syntax, and inventing one would be exactly the
+        // unverified-vendor-claim mistake D10 exists to stop. The guard still covers these
+        // mounts; only the automatic ACTIVATION does not, and activation informs where the hook
+        // enforces.
+        if rel.contains(['*', '?', '[', ']', '{', '}', '!']) {
+            continue;
+        }
+        let glob = format!("{rel}/**");
+        if !out.contains(&glob) {
+            out.push(glob);
+        }
+    }
+    out
+}
+
+/// Deliver the contract to every selected agent that needs its own copy.
+///
+/// **Deliberately NOT inside [`wire`]** (v0.28.6 D4). `wire` is called only when an MCP URL was
+/// produced, and that made the skill hostage to the MCP offer: `docli init --mcp none`, or a
+/// guided run where the user ticks no agent, delivered the contract to `.agents/skills/` ONLY —
+/// the one path Claude Code does not read, which is the entire defect this slice exists to fix.
+/// A cautious user declining a config write must not silently lose the contract too.
+pub fn install_skills(
+    project_root: &Path,
+    selected: &[&AgentDef],
+    skill_md: &str,
+    globs: &[String],
+) {
+    for def in selected {
+        let Some(dir) = def.skill_copy_dir else {
+            continue;
+        };
+        // Only agents whose frontmatter schema admits the key get it (D4).
+        let g: &[String] = if def.accepts_claude_frontmatter {
+            globs
+        } else {
+            &[]
+        };
+        match copy_skill(project_root, dir, skill_md, g) {
+            Ok(()) => crate::ui::detail(&format!("wrote {dir}/SKILL.md")),
+            Err(e) => crate::ui::refuse(&format!(
+                "{}: could not write {dir}/SKILL.md ({e:#}) - the mirror contract is not \
+                 installed for it; copy the file by hand or re-run `docli init`",
+                def.display
+            )),
+        }
+    }
 }
 
 /// `Err(reason)` means «a file exists there but we can't take its text» (unreadable, not
@@ -1529,6 +1720,79 @@ mod tests {
         }
     }
 
+    // ---- the skill copy (D4) ----
+
+    #[test]
+    fn the_shared_asset_stays_spec_clean_and_claude_gets_the_extension() {
+        // ONE body, never a fork: `.agents/skills/` is the open-standard path, where a key
+        // outside the spec's six is a HARD packaging error rather than an ignored field. The
+        // Claude-Code-only `paths` is injected at COPY TIME, for the one destination whose
+        // schema admits it.
+        let tmp = tempfile::tempdir().unwrap();
+        let asset = "---\nname: docli-mirror\ndescription: x\n---\n\n# body\n";
+        let globs = vec!["docli-mirror/**".to_string()];
+        let claude = agent("claude").unwrap();
+        let qwen = agent("qwen").unwrap();
+        assert!(claude.accepts_claude_frontmatter);
+        assert!(!qwen.accepts_claude_frontmatter);
+        install_skills(tmp.path(), &[claude, qwen], asset, &globs);
+
+        let c =
+            fs::read_to_string(tmp.path().join(".claude/skills/docli-mirror/SKILL.md")).unwrap();
+        assert!(c.contains("paths: [\"docli-mirror/**\"]"), "{c}");
+        assert!(
+            c.contains("name: docli-mirror") && c.ends_with("# body\n"),
+            "{c}"
+        );
+        // Everything else gets the asset byte for byte.
+        let q = fs::read_to_string(tmp.path().join(".qwen/skills/docli-mirror/SKILL.md")).unwrap();
+        assert_eq!(q, asset);
+    }
+
+    #[test]
+    fn the_globs_come_from_the_mount_table_not_a_static_guess() {
+        // `docli init --dir <custom>` means `docli-mirror/**` is not a safe guess — it would be
+        // silently inert for exactly the users who customised.
+        use crate::config::Mount;
+        let root = Path::new("/proj");
+        let m = |dir: &str| Mount {
+            workspace: uuid::Uuid::from_u128(1),
+            dir: dir.into(),
+            folder: None,
+            name: None,
+        };
+        assert_eq!(
+            skill_globs(root, &[m("notes"), m("docli-mirror/agitek")]),
+            vec!["notes/**".to_string(), "docli-mirror/agitek/**".to_string()]
+        );
+        // An ABSOLUTE mount inside the project resolves; one outside contributes nothing,
+        // because a project-relative glob cannot express it and a silently wrong pattern is
+        // worse than an absent one (the same limit the guard states).
+        assert_eq!(skill_globs(root, &[m("/proj/inside")]), vec!["inside/**"]);
+        assert!(skill_globs(root, &[m("/var/tmp/outside")]).is_empty());
+        // …and so does a name carrying glob metacharacters: `mirror[prod]/**` reads `[prod]` as
+        // a character class, which would miss the real directory and could match others. A
+        // silently wrong pattern is worse than an absent one, and no escape syntax is
+        // documented for this field to reach for.
+        for meta in ["mirror[prod]", "a*b", "q?", "{x,y}", "!neg"] {
+            assert!(skill_globs(root, &[m(meta)]).is_empty(), "{meta}");
+        }
+    }
+
+    #[test]
+    fn a_glob_that_would_break_the_frontmatter_is_escaped() {
+        // The glob comes from a user-chosen directory name; an unescaped quote would break the
+        // whole block rather than just this key.
+        let asset = "---\nname: x\n---\nbody\n";
+        let out = inject_frontmatter(asset, "paths", &["we\"ird/**".to_string()]);
+        assert!(out.contains(r#"paths: ["we\"ird/**"]"#), "{out}");
+        // A body with no frontmatter is left alone rather than "repaired".
+        assert_eq!(
+            inject_frontmatter("no frontmatter\n", "paths", &["a".into()]),
+            "no frontmatter\n"
+        );
+    }
+
     // ---- wire() end to end ----
 
     #[test]
@@ -1544,7 +1808,8 @@ mod tests {
             .iter()
             .map(|k| agent(k).unwrap())
             .collect();
-        wire(root, &selected, URL, true, "SKILLBODY");
+        wire(root, &selected, URL, true);
+        install_skills(root, &selected, "SKILLBODY", &[]);
 
         let mcp: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(root.join(".mcp.json")).unwrap()).unwrap();
@@ -1568,7 +1833,8 @@ mod tests {
         // the URL alone. Generate every write outcome and scan for credential-shaped keys.
         let tmp = tempfile::tempdir().unwrap();
         let selected: Vec<&AgentDef> = AGENTS.iter().collect();
-        wire(tmp.path(), &selected, URL, true, "S");
+        wire(tmp.path(), &selected, URL, true);
+        install_skills(tmp.path(), &selected, "S", &[]);
         for entry in walkdir(tmp.path()) {
             let body = fs::read_to_string(&entry)
                 .unwrap_or_default()
@@ -1741,7 +2007,7 @@ mod tests {
         let mut p = fs::metadata(&stray).unwrap().permissions();
         p.set_readonly(true);
         fs::set_permissions(&stray, p).unwrap();
-        wire(tmp.path(), &[agent("claude").unwrap()], URL, true, "S");
+        wire(tmp.path(), &[agent("claude").unwrap()], URL, true);
         assert!(!stray.exists(), "wire must sweep its own stale temps");
 
         // Round-6 facet B: with a SYMLINKED config, the sweep visits the resolved dir.
@@ -1756,7 +2022,7 @@ mod tests {
                 .unwrap();
             let resolved_stray = shared_dir.join(".docli-cfg-feedfacefeedface.tmp");
             fs::write(&resolved_stray, b"partial").unwrap();
-            wire(tmp.path(), &[agent("claude").unwrap()], URL, true, "S");
+            wire(tmp.path(), &[agent("claude").unwrap()], URL, true);
             assert!(
                 !resolved_stray.exists(),
                 "the sweep must visit the RESOLVED dir"
@@ -1774,7 +2040,7 @@ mod tests {
             .unwrap();
             let dangle_stray = dangle_dir.join(".docli-cfg-0123456789abcdef.tmp");
             fs::write(&dangle_stray, b"partial").unwrap();
-            wire(tmp.path(), &[agent("claude").unwrap()], URL, true, "S");
+            wire(tmp.path(), &[agent("claude").unwrap()], URL, true);
             assert!(!dangle_stray.exists(), "dangling-link dirs are swept too");
             assert!(
                 fs::symlink_metadata(tmp.path().join(".mcp.json"))
@@ -1826,7 +2092,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let user_file = tmp.path().join(".docli-cfg-manual-backup.tmp");
         fs::write(&user_file, b"the user's own file").unwrap();
-        wire(tmp.path(), &[agent("claude").unwrap()], URL, true, "S");
+        wire(tmp.path(), &[agent("claude").unwrap()], URL, true);
         assert!(
             user_file.exists(),
             "non-16-hex names are not ours to delete"
@@ -1903,10 +2169,30 @@ mod tests {
         fs::write(tmp.path().join(".mcp.json"), [0xFF, 0xFE, 0x00, 0x80]).unwrap();
         let selected = vec![agent("claude").unwrap()];
         // Best-effort: wire() must not panic/error, and must not touch the bytes.
-        wire(tmp.path(), &selected, URL, true, "S");
+        wire(tmp.path(), &selected, URL, true);
+        install_skills(tmp.path(), &selected, "S", &[]);
         assert_eq!(
             fs::read(tmp.path().join(".mcp.json")).unwrap(),
             [0xFF, 0xFE, 0x00, 0x80]
+        );
+    }
+
+    #[test]
+    fn claude_code_gets_its_skill_at_the_documented_path() {
+        // Regression pin, 2026-09-01. This row said `None`, on a research claim that Claude Code
+        // reads `.agents/skills/` natively. It does not: its docs list four skill locations and
+        // `.agents` is not among them, and in the field the file sat in `.agents/skills/` while
+        // `/reload-skills` kept reporting "no changes". The failure was SILENT — `docli init`
+        // reported the agent configured, which was true of MCP and false of the skill.
+        //
+        // A test cannot check what another program reads, so what is pinned here is the decision:
+        // Claude Code gets an explicit copy at its documented path. If someone reverts this to
+        // `None`, they have to delete this test and read why first.
+        let claude = agent("claude").expect("the claude row");
+        assert_eq!(
+            claude.skill_copy_dir,
+            Some(".claude/skills/docli-mirror"),
+            "Claude Code needs an explicit skill copy; it does not read `.agents/skills/`"
         );
     }
 

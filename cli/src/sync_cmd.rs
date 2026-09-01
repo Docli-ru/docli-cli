@@ -92,13 +92,26 @@ pub fn run(project: &Project, api: &Api, opts: &SyncOptions) -> Result<i32> {
             Err(e) => {
                 if is_no_access(&e) {
                     // Partial success (D4): one unreachable mount never aborts the others.
-                    eprintln!("{}", no_access_message(mount.display_name()));
+                    // Through `ui::warn`, so it survives `-q` like every other refusal — a
+                    // skipped mount is not narration.
+                    crate::ui::warn(&no_access_message(mount.display_name()));
                     worst_exit = worst_exit.max(1);
                 } else if e.downcast_ref::<NotEntitled>().is_some() {
-                    eprintln!(
-                        "`{}`: sync is not enabled for your account - mount skipped",
+                    crate::ui::warn(&format!(
+                        "`{}`: sync is not enabled for your account - mount skipped. Enable \
+                         vault sync for this account at docli.ru, then run `docli sync` again.",
                         mount.display_name()
-                    );
+                    ));
+                    worst_exit = worst_exit.max(1);
+                } else if opts.check && crate::mountfs::is_busy(&e) {
+                    // v0.28.6 D3: with two wired agents starting together, `try_lock`'s
+                    // fail-fast would otherwise abort mounts 2..n of a freshness check. The
+                    // answer «I could not look» is a partial success, not a wedge.
+                    crate::ui::warn(&format!(
+                        "{}: check skipped - another docli run holds this mount; run \
+                         `docli sync --check` again when it finishes",
+                        mount.display_name()
+                    ));
                     worst_exit = worst_exit.max(1);
                 } else {
                     return Err(e.context(format!("mount `{}`", mount.display_name())));
@@ -271,17 +284,23 @@ fn sync_mount(
     }
     if let Some(reason) = invalidator(&state, mount, &handle.root, control) {
         if opts.check {
-            crate::ui::warn(&format!("{}: stale - {reason}", mount.display_name()));
             // Make the pending repair durable + visible exactly as a sync would.
             state.from_zero = true;
             persist_incomplete(control, &handle, ws, &state)?;
-            return Ok(1);
+            return Ok(render_check(&CheckOutcome {
+                fresh: false,
+                message: format!(
+                    "{}: stale - {reason}; run `docli sync`",
+                    mount.display_name()
+                ),
+            }));
         }
         state.from_zero = true;
     }
 
     if opts.check {
-        return check_mount(api, control, &handle, mount, &mut state);
+        let outcome = check_mount(api, control, &handle, mount, &mut state)?;
+        return Ok(render_check(&outcome));
     }
 
     // Retry the OWED directory removals first — the occupant may be gone since last run, and
@@ -319,6 +338,21 @@ fn sync_mount(
     persist_incomplete(control, &handle, ws, &state)?;
     report(mount, &state);
     Ok(0)
+}
+
+/// The HUMAN renderer for a freshness answer, and the exit code it carries.
+///
+/// Through `ui`, not `eprintln!` (Step 1's output pass): a stale line is a warning, which must
+/// survive `-q` — a reader who asked for less narration did not ask to be told nothing about a
+/// mirror that cannot be trusted. The «fresh» line stays chatter.
+fn render_check(outcome: &CheckOutcome) -> i32 {
+    if outcome.fresh {
+        crate::ui::ok(&outcome.message);
+        0
+    } else {
+        crate::ui::warn(&outcome.message);
+        1
+    }
 }
 
 fn report(mount: &Mount, state: &WsState) {
@@ -691,37 +725,53 @@ fn from_zero_pages(
 /// epoch arms DO persist, because they are the DETECTION moment of a new fact and the
 /// durable-flag-at-detection rule (D2a) says the pending repair must be visible from that
 /// moment, not from the next sync.
+/// One mount's freshness, as a VALUE rather than a printed line.
+///
+/// v0.28.6 D3: the same probe now answers two readers — a person running `docli sync --check`,
+/// and the `SessionStart` hook, whose channel is STDOUT (`--check` wrote every line with a bare
+/// `eprintln!`, so as shipped the hook would have delivered an empty string — Goal 2 failing
+/// silently in exactly the way the original defect did). Two renderers, one probe.
+pub struct CheckOutcome {
+    pub fresh: bool,
+    /// One sentence, already naming the mount and the command that fixes it.
+    pub message: String,
+}
+
 fn check_mount(
     api: &Api,
     control: &ControlRoot,
     handle: &MountHandle,
     mount: &Mount,
     state: &mut WsState,
-) -> Result<i32> {
+) -> Result<CheckOutcome> {
+    let stale = |message: String| {
+        Ok(CheckOutcome {
+            fresh: false,
+            message,
+        })
+    };
     let ws = mount.workspace;
     if state.has_transient_parks() {
         // Every stale return reconciles the marker (Codex round 31): a crash between the
         // state save and the marker write must not leave them contradicting.
         persist_incomplete(control, handle, ws, state)?;
-        eprintln!(
-            "{}: stale - parked deliveries are waiting (remove the occupants, then \
+        return stale(format!(
+            "{}: stale - parked deliveries are waiting (remove the occupants, then run \
              `docli sync --full`)",
             mount.display_name()
-        );
-        return Ok(1);
+        ));
     }
     // Owed directory removals consult the DEBT SET directly (Codex round 3 — pairing them
     // through parks both clobbered structural parks and let a restart's `--check` read a
     // healthy probe over a nonempty debt map).
     if !state.pending_removals.is_empty() {
         persist_incomplete(control, handle, ws, state)?;
-        eprintln!(
+        return stale(format!(
             "{}: stale - directory removals blocked by untracked occupants: {} (remove \
              them, then run `docli sync`)",
             mount.display_name(),
             state.pending_removals.len()
-        );
-        return Ok(1);
+        ));
     }
     let req = ephemeral_request(ws, state.cursor, state.epoch, 1);
     let resp = match api.pull(&req)? {
@@ -729,11 +779,10 @@ fn check_mount(
         Err(ApiFailure::EpochChanged { .. }) => {
             state.from_zero = true;
             persist_incomplete(control, handle, ws, state)?;
-            eprintln!(
-                "{}: stale - the workspace was resynced",
+            return stale(format!(
+                "{}: stale - the workspace was resynced; run `docli sync`",
                 mount.display_name()
-            );
-            return Ok(1);
+            ));
         }
         Err(f) => return Err(map_failure(f)),
     };
@@ -742,11 +791,10 @@ fn check_mount(
         // say so durably, or a lock-free search keeps rendering local paths off it.
         state.at_head = false;
         persist_incomplete(control, handle, ws, state)?;
-        eprintln!(
+        return stale(format!(
             "{}: stale - behind the server; run `docli sync`",
             mount.display_name()
-        );
-        return Ok(1);
+        ));
     }
     let Some(live) = resp.live_nodes else {
         bail!(rollback_warning(ws));
@@ -756,12 +804,11 @@ fn check_mount(
         // cursor reads as caught-up over a stale file). Durable flag + marker + non-zero.
         state.from_zero = true;
         persist_incomplete(control, handle, ws, state)?;
-        eprintln!(
+        return stale(format!(
             "{}: stale - server live count {live} != mirror {}; run `docli sync`",
             mount.display_name(),
             state.ledger.len()
-        );
-        return Ok(1);
+        ));
     }
     // Confirmed at head with a matching count: HEAL the crash-window state (a crash between a
     // page commit and the head commit leaves `at_head = false` with a complete mirror and the
@@ -775,8 +822,311 @@ fn check_mount(
     // removal leaves a lying CACHE_INCOMPLETE over a state that already says head — the probe
     // just proved freshness, so the marker must say so too.
     persist_incomplete(control, handle, ws, state)?;
-    crate::ui::ok(&format!("{}: fresh", mount.display_name()));
-    Ok(0)
+    Ok(CheckOutcome {
+        fresh: true,
+        message: format!("{}: fresh", mount.display_name()),
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// The SessionStart freshness report (v0.28.6 D3)
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/// The budget for the hook's NETWORK PROBES. A `SessionStart` hook that can hold a session open
+/// is a hook people disable, so this is enforced in process and spent down across mounts.
+///
+/// **What it does NOT bound, stated rather than over-claimed:** `api.pull` may first wait on the
+/// credential-store lock and refresh an expired token, and the refresh path retries a
+/// `503 Retry-After` with real sleeps. None of that is a reqwest timeout, so none of it is
+/// inside this number. The mitigation is to not enter that path at all — the probe runs only
+/// while the STORED token is still live (the same rule `docli status` follows for the same
+/// reason) — and the outer backstop is the harness `timeout` key `hooks.rs` writes.
+const HOOK_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Below this much left, a mount is not probed at all. A window this short buys a DNS lookup and
+/// nothing else, and a request that is going to time out anyway is worse than an honest
+/// «unknown»: it spends the tail of the budget the mounts after it would have used.
+const MIN_PROBE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Where the freshness answer goes: the report a hook prints on STDOUT.
+///
+/// The whole reason this exists: `--check` writes every line with `eprintln!`/`ui`, i.e. to
+/// STDERR, and neither agent reads a hook's stderr. As shipped, the hook would have delivered an
+/// empty string — Goal 2 failing silently in exactly the way the defect this slice fixes did.
+/// Redirecting `2>&1` is not the fix either: it would merge progress and lock noise into the
+/// model's context.
+///
+/// Both vendors document the SAME envelope (verified 2026-09-01 —
+/// `code.claude.com/docs/en/hooks`, `learn.chatgpt.com/docs/hooks.md`), so the two arms render
+/// identically today. The discriminator is kept because that convergence is an observed fact
+/// about two products, not a promise either of them makes.
+fn emit_report(agent: crate::hooks::HookAgent, lines: &[String]) {
+    let text = lines.join("\n");
+    let body = match agent {
+        crate::hooks::HookAgent::Claude | crate::hooks::HookAgent::Codex => serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": text,
+            }
+        }),
+    };
+    // Deliberately `println!`, never `ui::*`: `ui::ok` routes through `chatter` and is
+    // suppressed by `-q`, which would silently turn «fresh» into «no answer» for any user who
+    // happens to have that flag in their environment. The machine channel is not quiet-able.
+    println!("{body}");
+}
+
+/// `docli sync --check --agent <a>` — the `SessionStart` hook's whole body.
+///
+/// **Reports; never syncs.** A hook that silently downloaded a workspace at session start would
+/// be doing significant work the user did not ask for, on a possibly metered machine.
+///
+/// **Always exits 0.** Session start is not a place to fail a session over a stale cache. Every
+/// branch below — including the ones that are not staleness at all — is a line of context, and
+/// each one names the command that resolves it.
+///
+/// It is safe to fire this often for the reason v0.28.0 D2a built: the probe sends
+/// `ephemeral: true`, so it does not register a client, pin the purge safe horizon, or light the
+/// «deletes after device sync» badge. It does still write a `read_audit` row per mount per
+/// session — write amplification of an existing audit, named rather than glossed.
+pub fn hook_check(cwd: &Path, agent: crate::hooks::HookAgent) -> i32 {
+    let mut lines: Vec<String> = Vec::new();
+    // The update notice rides the same line (D11) and is cache-only here: the freshness probe
+    // owns the budget, so a cold cache is skipped silently and left for the next hand-run
+    // `docli` invocation to warm.
+    if let Some(n) = crate::selfupdate::cached_notice() {
+        lines.push(n);
+    }
+    for line in freshness_lines(cwd) {
+        lines.push(line);
+    }
+    if !lines.is_empty() {
+        emit_report(agent, &lines);
+    }
+    0
+}
+
+/// The freshness half, as plain sentences. Separated from the emission so the branches can be
+/// tested without a terminal, a hook, or a schema.
+fn freshness_lines(cwd: &Path) -> Vec<String> {
+    let deadline = std::time::Instant::now() + HOOK_BUDGET;
+    // Not a project at all: silence. A hook installed in one repository must not narrate in
+    // every other directory the user opens.
+    let Some(root) = crate::config::find_project(cwd) else {
+        return Vec::new();
+    };
+    let project = match crate::config::load_project(&root) {
+        Ok(p) => p,
+        Err(e) => {
+            return vec![format!(
+                "docli: docli.toml here cannot be read ({e:#}) - the mirror's freshness is \
+                 unknown; run `docli init` to repair the project"
+            )]
+        }
+    };
+    // A config with NO mounts is a legal intermediate state (`docli init` with no arguments
+    // writes exactly that), and it is checked before geometry because `validate_config` rightly
+    // refuses an empty mount table — reporting that as a setup failure would nag every session
+    // in a project somebody has only started setting up.
+    if project.config.mounts.is_empty() {
+        return Vec::new();
+    }
+    // Geometry is the TEAMMATE's default state, not an edge case: they cloned the repository,
+    // so they have the hook entry, no mirror on disk (it is git-ignored) and possibly no
+    // `.gitignore` line. That is a setup state naming `docli init`, never staleness and never
+    // a crash.
+    if let Err(e) = validate_geometry(&project.root, &project.config) {
+        return vec![format!(
+            "docli: this project's mirror is not set up on this machine ({e:#}) - run \
+             `docli init` and then `docli sync`"
+        )];
+    }
+    // Signed out is its own answer, and it must not read as staleness. (It also cannot live
+    // inside `run`: `main` resolves the API before `sync` is reached at all.)
+    let store = match crate::creds::CredsStore::open_default() {
+        Ok(s) => s,
+        Err(e) => {
+            return vec![format!(
+                "docli: this device's credentials cannot be read ({e:#}) - run `docli login`"
+            )]
+        }
+    };
+    match store.get(&project.config.server) {
+        // A LIVE token, not merely a present one. An expired one sends `api.pull` through the
+        // refresh path — a credential lock it may wait on, and a `503 Retry-After` loop that
+        // sleeps — none of which a reqwest timeout bounds. A session start is not the place to
+        // discover that, so this reports instead of renewing; the next hand-run `docli` command
+        // refreshes properly.
+        Ok(Some(c)) if c.expires_at <= now_unix() + 60 => {
+            return vec![format!(
+                "docli: this device's sign-in to {} needs renewing, so mirror freshness was \
+                 not checked - run `docli sync` (it will refresh)",
+                project.config.server
+            )]
+        }
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return vec![format!(
+                "docli: this device is not signed in to {} - the mirror may be out of date; \
+                 run `docli login`, then `docli sync`",
+                project.config.server
+            )]
+        }
+        Err(e) => {
+            return vec![format!(
+                "docli: this device's credentials cannot be read ({e:#}) - run `docli login`"
+            )]
+        }
+    }
+    // Deliberately NOT created here: a hook that has nothing to check must leave the tree
+    // exactly as it found it. `one_mount_line` creates it only once it knows there is state.
+    let control = ControlRoot::new(&project.root);
+    let mut out = Vec::new();
+    for mount in &project.config.mounts {
+        // The budget is the WHOLE hook's, and it is spent DOWN across mounts rather than
+        // re-granted to each of them. A single client built once with the full budget would
+        // bound each REQUEST at 2 s and the run at 2 s × mounts — this repository has four,
+        // which is eight seconds of somebody's session start. So each mount gets a client
+        // whose timeout is what is actually left, and one below the floor does not start at
+        // all: never begin work — least of all a durable state write — inside a window it
+        // cannot finish.
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left < MIN_PROBE {
+            out.push(format!(
+                "{}: freshness unknown (the check ran out of time - offline?) - run \
+                 `docli sync --check`",
+                mount.display_name()
+            ));
+            continue;
+        }
+        // A second store handle per mount: `Api::with_timeout` takes ownership, and reading the
+        // credential file again is far cheaper than the request it is about to bound.
+        let api = crate::creds::CredsStore::open_default()
+            .ok()
+            .and_then(|s| crate::http::Api::with_timeout(&project.config.server, s, left).ok());
+        let Some(api) = api else {
+            out.push(format!(
+                "{}: freshness unknown (the client could not be built) - run \
+                 `docli sync --check`",
+                mount.display_name()
+            ));
+            continue;
+        };
+        out.push(one_mount_line(&project, &api, &control, mount));
+    }
+    out
+}
+
+fn one_mount_line(project: &Project, api: &Api, control: &ControlRoot, mount: &Mount) -> String {
+    let ws = mount.workspace;
+    // STATE FIRST, and the order is the point. `claim_mount` CREATES the mirror directory and
+    // writes an ownership marker into it — so asking it first meant a teammate's fresh clone
+    // had its mirror tree conjured into existence by an unprompted session-start hook, only to
+    // be told «not mirrored yet». This module promises it REPORTS and does not sync; creating
+    // and claiming directories on a schedule nobody set is not that promise. Reading the state
+    // file without the lock is already established practice here (a concurrent `docli search`
+    // does exactly this).
+    // The pre-lock read answers ONE question — «is there anything here to check?» — and its
+    // VALUE is deliberately discarded: the snapshot that gets used is re-read under the lock
+    // below, because this one can go stale between here and there.
+    match control.load_state(ws) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return format!(
+                "{}: not mirrored on this machine yet - run `docli sync` before trusting \
+                 local files for this workspace",
+                mount.display_name()
+            )
+        }
+        Err(e) => {
+            return format!(
+                "{}: freshness unknown (its state file will not read: {e:#}) - run \
+                 `docli sync --full`",
+                mount.display_name()
+            )
+        }
+    }
+    // …and the DIRECTORY is still there. `claim_mount` creates the mount tree and writes an
+    // ownership marker into it, so without this a mount whose mirror was deleted — by hand, or
+    // by a `docli uninstall --purge` racing this very hook — gets both conjured back by a
+    // session start nobody asked to do that. Checking first does not close the race (nothing
+    // could, short of not claiming at all), but it turns the common orderings from
+    // «resurrected» into «reported», and the report is the more useful answer anyway.
+    let mount_path = mount_abs(&project.root, mount);
+    if !mount_path.is_dir() {
+        return format!(
+            "{}: the mirror directory is gone ({}) - run `docli sync` to rebuild it",
+            mount.display_name(),
+            mount.dir
+        );
+    }
+    // There IS state and a directory, so the claim below takes the lock rather than creating
+    // anything.
+    if std::fs::create_dir_all(&control.dir).is_err() {
+        return format!(
+            "{}: freshness unknown (.docli/ is not writable) - run `docli sync --check`",
+            mount.display_name()
+        );
+    }
+    let handle = match claim_mount(&mount_path, &control.dir, ws) {
+        Ok(h) => h,
+        Err(e) if crate::mountfs::is_busy(&e) => {
+            return format!(
+                "{}: check skipped (another docli is running) - run `docli sync --check` \
+                 when it finishes",
+                mount.display_name()
+            )
+        }
+        Err(e) => {
+            return format!(
+                "{}: freshness unknown ({e:#}) - run `docli sync --check`",
+                mount.display_name()
+            )
+        }
+    };
+    // RE-READ under the lock, and this is not belt-and-braces. The read above happens BEFORE the
+    // lock (deliberately — see its comment: claiming first would create a mirror tree on a fresh
+    // clone), which opens a window: a `docli sync` can win the lock, commit a newer state and
+    // exit while we hold a snapshot from before it. Both `invalidator` and `check_mount` PERSIST
+    // what they were handed, so the stale snapshot would be written back over the newer one —
+    // rolling back the cursor and marking a freshly synced mirror incomplete. The pre-lock read
+    // decides only «is there anything to check»; the value that gets used is this one.
+    let mut state = match control.load_state(ws) {
+        Ok(Some(fresh)) => fresh,
+        // It vanished between the two reads (a concurrent `--purge`, a hand `rm -rf`). Nothing
+        // to report and nothing to persist.
+        Ok(None) => {
+            return format!(
+                "{}: not mirrored on this machine yet - run `docli sync` before trusting \
+                 local files for this workspace",
+                mount.display_name()
+            )
+        }
+        Err(e) => {
+            return format!(
+                "{}: freshness unknown (its state file will not read: {e:#}) - run \
+                 `docli sync --full`",
+                mount.display_name()
+            )
+        }
+    };
+    if let Some(reason) = invalidator(&state, mount, &handle.root, control) {
+        state.from_zero = true;
+        let _ = persist_incomplete(control, &handle, ws, &state);
+        return format!(
+            "{}: STALE - {reason}; run `docli sync` before trusting local files",
+            mount.display_name()
+        );
+    }
+    match check_mount(api, control, &handle, mount, &mut state) {
+        Ok(o) if o.fresh => o.message,
+        Ok(o) => format!("{} - do not trust local files until it succeeds", o.message),
+        Err(e) if is_no_access(&e) => no_access_message(mount.display_name()),
+        Err(e) => format!(
+            "{}: freshness unknown ({e:#}) - run `docli sync --check`",
+            mount.display_name()
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -838,6 +1188,89 @@ mod tests {
             msg.contains("книга продаж"),
             "the AUTHOR's mount name, whatever language it is in: {msg}"
         );
+    }
+
+    #[test]
+    fn the_hook_report_lands_on_stdout_in_the_documented_envelope() {
+        // The whole reason the machine mode exists: `--check` writes to STDERR, and neither
+        // agent reads a hook's stderr. Both vendors document the same SessionStart envelope
+        // (verified 2026-09-01), so the two arms render identically today — recorded here so a
+        // future divergence is a visible test change rather than a silent empty context.
+        for agent in crate::hooks::HookAgent::all() {
+            let mut buf = Vec::new();
+            let body = {
+                // Render exactly what `emit_report` prints, without capturing the process's
+                // real stdout.
+                let text = ["a: fresh".to_string(), "b: STALE".to_string()].join("\n");
+                serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "SessionStart",
+                        "additionalContext": text,
+                    }
+                })
+            };
+            use std::io::Write as _;
+            write!(buf, "{body}").unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+            assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
+            assert!(v["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap()
+                .contains("STALE"));
+            let _ = agent;
+        }
+    }
+
+    #[test]
+    fn outside_a_project_the_hook_says_nothing_at_all() {
+        // A hook installed in one repository must not narrate in every other directory the
+        // user opens.
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(freshness_lines(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_project_reports_a_setup_state_never_staleness() {
+        // The TEAMMATE's default state, not an edge case: they cloned the repository, so they
+        // have the hook entry and no mirror on disk. It must read as setup, name `docli init`,
+        // and never look like «your cache is behind».
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("docli.toml"), "server = [[[ broken").unwrap();
+        let lines = freshness_lines(tmp.path());
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("docli init"), "{}", lines[0]);
+        assert!(!lines[0].to_lowercase().contains("stale"), "{}", lines[0]);
+    }
+
+    #[test]
+    fn a_project_with_no_mounts_says_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("docli.toml"),
+            "server = \"https://docli.ru\"\n",
+        )
+        .unwrap();
+        assert!(freshness_lines(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn a_signed_out_machine_says_so_and_does_not_read_as_staleness() {
+        let tmp = tempfile::tempdir().unwrap();
+        // DOCLI_HOME keeps the test off the developer's real credentials — and the lock
+        // keeps it off the OTHER tests that override the same process-global variable.
+        let _home = crate::creds::home_env_lock();
+        std::env::set_var("DOCLI_HOME", tmp.path().join("home"));
+        std::fs::write(
+            tmp.path().join("docli.toml"),
+            "server = \"https://example.invalid\"\n\n[[mount]]\nworkspace = \
+             \"00000000-0000-0000-0000-000000000001\"\ndir = \"m\"\n",
+        )
+        .unwrap();
+        let lines = freshness_lines(tmp.path());
+        std::env::remove_var("DOCLI_HOME");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("docli login"), "{}", lines[0]);
+        assert!(!lines[0].contains("stale"), "{}", lines[0]);
     }
 
     #[test]

@@ -92,6 +92,51 @@ pub struct MountHandle {
     _lock: File,
 }
 
+/// Claim a mount, retrying the lock briefly. TESTS ONLY.
+///
+/// `try_lock` fails fast by design (a clear message beats a silent queue), and that is right for
+/// the product. It makes a `drop`-then-reclaim assertion racy inside a MULTI-THREADED process
+/// that also forks, though, and the test binary is exactly that: an advisory lock lives on the
+/// open file description, which `fork` DUPLICATES, so a subprocess spawned by an unrelated test
+/// on another thread holds the lock until it `exec`s and CLOEXEC closes the copy. Microseconds,
+/// but enough to fail a reclaim that must succeed.
+///
+/// Worth knowing beyond the tests: **nothing in the product may spawn a subprocess while holding
+/// a mount lock**, or the lock outlives its `MountHandle` by the same mechanism. Today nothing
+/// does — `validate_geometry`'s `git` call happens before any claim, and `status`'s shell probe
+/// holds no mount.
+#[cfg(test)]
+fn claim_mount_eventually(mount: &Path, owner: &Path, ws: Uuid) -> Result<MountHandle> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match claim_mount(mount, owner, ws) {
+            Err(e) if is_busy(&e) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Typed marker for «somebody else holds this mount's lock» (v0.28.6 D3). `try_lock` fails fast
+/// by design, so this is a routine outcome, not a fault: it joins the partial-success class on
+/// the `--check` path, and the `SessionStart` hook reports it as its own branch rather than as
+/// staleness.
+#[derive(Debug)]
+pub struct MountBusy;
+
+impl std::fmt::Display for MountBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "another docli run holds this mount")
+    }
+}
+impl std::error::Error for MountBusy {}
+
+/// Is this error a lock contention?
+pub fn is_busy(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<MountBusy>().is_some()
+}
+
 impl std::fmt::Debug for MountHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MountHandle")
@@ -155,10 +200,14 @@ pub fn claim_mount(mount: &Path, owner_docli_dir: &Path, ws: Uuid) -> Result<Mou
         .open(&marker_path)
         .with_context(|| format!("opening {}", marker_path.display()))?;
     if f.try_lock().is_err() {
-        bail!(
+        // TYPED, not just a message (v0.28.6 D3): two wired agents starting together — or an
+        // agent starting while `docli sync` runs in a terminal — is an ordinary session-start
+        // state, and it is neither fresh, stale, nor a timeout. The freshness path has to be
+        // able to tell it apart, and one mount's contention must not abort the others.
+        return Err(anyhow::Error::new(MountBusy).context(format!(
             "another docli sync/doctor is running on {} - one run per mount at a time",
             root.display()
-        );
+        )));
     }
     let raw = fs::read_to_string(&marker_path)?;
     let marker: MountMarker = serde_json::from_str(&raw)
@@ -407,12 +456,15 @@ mod tests {
         fs::create_dir_all(&owner_a).unwrap();
         fs::create_dir_all(&owner_b).unwrap();
         drop(claim_mount(&mount, &owner_a, Uuid::from_u128(1)).unwrap());
-        let err = claim_mount(&mount, &owner_b, Uuid::from_u128(1))
+        // `claim_mount_eventually`: the OWNERSHIP refusal is what this test is about, and a
+        // concurrently-forked sibling test can still hold the released lock for a moment (see
+        // that helper) — which would surface as the LOCK refusal instead.
+        let err = claim_mount_eventually(&mount, &owner_b, Uuid::from_u128(1))
             .unwrap_err()
             .to_string();
         assert!(err.contains("already claimed"), "{err}");
         // Same .docli but a DIFFERENT workspace is a different owner too.
-        let err = claim_mount(&mount, &owner_a, Uuid::from_u128(2))
+        let err = claim_mount_eventually(&mount, &owner_a, Uuid::from_u128(2))
             .unwrap_err()
             .to_string();
         assert!(err.contains("already claimed"), "{err}");
@@ -430,7 +482,8 @@ mod tests {
             .to_string();
         assert!(err.contains("another docli sync"), "{err}");
         drop(held);
-        claim_mount(&mount, &owner, Uuid::from_u128(1)).unwrap();
+        // Releasing lets the next claim succeed — EVENTUALLY. See `claim_mount_eventually`.
+        claim_mount_eventually(&mount, &owner, Uuid::from_u128(1)).unwrap();
     }
 
     #[cfg(unix)]

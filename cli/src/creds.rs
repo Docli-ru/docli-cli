@@ -53,6 +53,21 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// Serializes every test that overrides `DOCLI_HOME`, across the whole crate.
+///
+/// The variable is PROCESS-GLOBAL and `cargo test` runs one binary with parallel threads, so
+/// tests in `status`, `sync_cmd` and `uninstall` were each setting and clearing it under one
+/// another — one thread's `remove_var` landing between another's `set_var` and the read it was
+/// meant to cover. That is a flake whose symptom is an unrelated assertion, which is the worst
+/// kind to chase. This module owns the resolution, so it owns the lock.
+#[cfg(test)]
+pub(crate) fn home_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Poison-tolerant: one failing test must not cascade into «every test that touches the
+    // credential home also failed», which hides the one that actually broke.
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 impl CredsStore {
     /// `~/.docli` (override: `DOCLI_HOME` — tests and odd setups).
     pub fn open_default() -> Result<Self> {

@@ -186,7 +186,12 @@ fn lexical_normalize(p: &Path) -> PathBuf {
 /// mounts alias one physical dir (Codex round 9). Comparison-only — never used for IO. On
 /// case-sensitive platforms the path is untouched (`Notes` and `notes` are honestly distinct
 /// mounts there).
-fn geometry_key(p: &Path) -> PathBuf {
+///
+/// Public since v0.28.6 D2: `guard.rs` answers «is this path inside a mirror?» and a guard that
+/// skipped the fold would let `Docli-Mirror/x.md` through on APFS, and an NFD spelling through
+/// on the platforms that fold. BOTH rules — `physicalize` for the symlink half, this for the
+/// spelling half — or the deny is decorative.
+pub fn geometry_key(p: &Path) -> PathBuf {
     if !docli_rules::platform_folds_case() {
         return p.to_path_buf();
     }
@@ -205,7 +210,10 @@ fn geometry_key(p: &Path) -> PathBuf {
     out
 }
 
-fn is_ancestor_or_self(a: &Path, b: &Path) -> bool {
+/// Is `b` the same path as `a`, or inside it? Both spellings go through [`geometry_key`], so a
+/// case- or NFD-varied `b` still lands inside `a` wherever the filesystem folds them together.
+/// Public since v0.28.6 D2 — the guard asks exactly this question of a mount directory.
+pub fn is_ancestor_or_self(a: &Path, b: &Path) -> bool {
     let (a, b) = (geometry_key(a), geometry_key(b));
     b == a || b.starts_with(&a)
 }
@@ -718,6 +726,9 @@ mod tests {
                 allow_prompt: false,
                 clear_folder: false,
                 write_gitignore: false,
+                skills: Some("none".into()),
+                hooks: None,
+                instructions: false,
             },
         )
         .unwrap_err()
