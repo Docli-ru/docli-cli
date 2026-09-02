@@ -72,8 +72,11 @@ names the flag that replaces it (`docli uninstall --yes`).
 | `--no-color` | No colour; so do `NO_COLOR`, `TERM=dumb`, and a non-TTY stdout |
 | `--json` | Machine-readable output for `list`, `status`, `search`, `doctor` |
 
-Streams are split: results go to stdout, progress and warnings to stderr — so
-`docli search … | grep`, `docli status --json | jq` and `docli sync 2>/dev/null` all behave.
+Streams are split: results go to stdout, progress to stderr — so `docli search … | grep`,
+`docli status --json | jq` and `docli sync 2>/dev/null` all behave. Where a command's whole
+screen IS the result (`search`, `status`, `list`, human-readable `doctor`), its warnings go to
+stdout with it: a `docli status > file` that dropped half the screen would be worse than no
+redirect. Under `--json` nothing but the JSON reaches stdout.
 
 ## Uninstalling
 

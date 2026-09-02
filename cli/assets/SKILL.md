@@ -45,6 +45,11 @@ server holds.
   and resolve any reported error before reading from it.
 - `CACHE_INCOMPLETE.docli` at a mirror root means that mirror is currently incomplete. A file
   missing from an incomplete mirror says nothing about the server.
+- `docli search` reports, beside its results, when the local mirror needs attention — it cannot
+  supply local paths at all, the server has changes it has not applied, the workspace was resynced,
+  or its live item count says a hard delete was missed. That line describes the LOCAL mirror only.
+  It never weakens the results themselves, which came from the server, and it is not the freshness
+  gate: `docli sync --check` remains the exit code to branch on.
 
 ## Absence is a server question, never a local one
 
@@ -86,5 +91,7 @@ credential.)
 | `docli list` | every workspace this account reaches; `*` marks the ones mounted here |
 
 `--json` works on `search`, `doctor`, `status` and `list`, and `--no-input` guarantees nothing
-prompts. Results go to stdout, progress and warnings to stderr, so parsing stdout never picks up
-narration.
+prompts. **Parse `--json`, not the human output**: for those four commands the whole screen is the
+result, so their warnings — including the mirror line above — share stdout with it, and only
+`--json` guarantees stdout carries data and nothing else. Everywhere else progress and warnings go
+to stderr.

@@ -17,6 +17,8 @@
 //! - The plugin's TS mirror (`packages/sync-client/serverModel.ts` + `ports.ts`) remains the wire
 //!   definition running on users' machines; this crate does nothing for THAT drift.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -142,6 +144,30 @@ pub struct SearchRequest {
     /// Per-workspace hit limit; server-clamped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<i64>,
+    /// v0.29.0 D2d — the caller's mirror POSITION per workspace, so the answer can carry the
+    /// [`SearchWorkspaceOutcome::delta`] signal without a second round trip or a second audit
+    /// row. Present only for mounts the client considers a usable projection; ABSENCE means
+    /// "we did not ask", never "nothing to fetch".
+    ///
+    /// A `BTreeMap`, not a `HashMap`: a multi-entry byte pin over a hash map is
+    /// order-nondeterministic. Keys outside `workspaceIds` are ignored; a map larger than
+    /// [`SEARCH_WORKSPACE_CAP`] is a request-level rejection (the cap gates `workspaceIds`, and
+    /// this route carries no body limit). The field is OMITTED, never `{}`, when no mount in a
+    /// chunk qualifies — `{}` and absence are byte-different and the pin freezes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub positions: Option<BTreeMap<Uuid, MirrorPosition>>,
+}
+
+/// One mount's position on the sync keyset, plus the comparand only the client holds (v0.29.0
+/// D2a): its live-id LEDGER count. Sending it up is what lets the SERVER own the whole verdict —
+/// having both counts, it resolves the D2c precedence in one place instead of splitting it
+/// across two machines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MirrorPosition {
+    pub cursor: WireCursor,
+    pub epoch: i64,
+    pub ledger_count: i64,
 }
 
 /// One ranked note hit (the tantivy/BM25 arm).
@@ -192,6 +218,19 @@ pub struct SearchWorkspaceOutcome {
     pub attachments_truncated: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub attachments_query_truncated: bool,
+    /// v0.29.0 — the MIRROR DELTA for the position the caller sent in
+    /// [`SearchRequest::positions`]: `"none"`, `"pending"`, `"epoch_mismatch"` or
+    /// `"rebuild_required"`, all server-derived.
+    ///
+    /// **Not a freshness verdict** (D5) — `docli sync --check` remains that authority. This
+    /// answers cursor comparability, position, and cardinality agreement, and nothing else.
+    ///
+    /// A plain string rather than an enum, deliberately (D2b): an unknown value from a newer
+    /// server reaches an older client verbatim and is treated as NO ANSWER — silence, never a
+    /// wrong sentence. Absent whenever the caller did not ask, the workspace refused, or the
+    /// derivation failed; absence is never `"none"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -309,5 +348,149 @@ mod tests {
                 r#""limit":500,"ephemeral":true}"#
             )
         );
+    }
+
+    // ---- the search family's byte pins (v0.29.0 D2d) -----------------------------------------
+
+    fn ws(n: u128) -> Uuid {
+        Uuid::from_u128(n)
+    }
+
+    /// The first byte pin on the SEARCH family. Two entries, so the `BTreeMap` choice is
+    /// load-bearing here rather than stylistic: over a `HashMap` this string is
+    /// order-nondeterministic and the pin would flake.
+    #[test]
+    fn a_search_request_with_positions_is_pinned() {
+        let mut positions = BTreeMap::new();
+        positions.insert(
+            ws(1),
+            MirrorPosition {
+                cursor: WireCursor { rev: 7, id: ws(9) },
+                epoch: 3,
+                ledger_count: 12,
+            },
+        );
+        positions.insert(
+            ws(2),
+            MirrorPosition {
+                cursor: WireCursor {
+                    rev: 0,
+                    id: Uuid::nil(),
+                },
+                epoch: 1,
+                ledger_count: 0,
+            },
+        );
+        let req = SearchRequest {
+            workspace_ids: vec![ws(1), ws(2)],
+            query: "заметка".into(),
+            limit: Some(20),
+            positions: Some(positions),
+        };
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            concat!(
+                r#"{"workspaceIds":["00000000-0000-0000-0000-000000000001","#,
+                r#""00000000-0000-0000-0000-000000000002"],"query":"заметка","limit":20,"#,
+                r#""positions":{"00000000-0000-0000-0000-000000000001":{"cursor":{"rev":7,"#,
+                r#""id":"00000000-0000-0000-0000-000000000009"},"epoch":3,"ledgerCount":12},"#,
+                r#""00000000-0000-0000-0000-000000000002":{"cursor":{"rev":0,"#,
+                r#""id":"00000000-0000-0000-0000-000000000000"},"epoch":1,"ledgerCount":0}}}"#
+            )
+        );
+    }
+
+    /// No mount in the chunk qualified ⇒ the field is OMITTED, not `{}`. The two are
+    /// byte-different and «absence means we did not ask» is the contract the CLI reads.
+    #[test]
+    fn a_search_request_without_positions_omits_the_field() {
+        let req = SearchRequest {
+            workspace_ids: vec![ws(1)],
+            query: "q".into(),
+            limit: None,
+            positions: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            r#"{"workspaceIds":["00000000-0000-0000-0000-000000000001"],"query":"q"}"#
+        );
+    }
+
+    /// The request the v0.28.x CLI sends (no `positions`) still parses — the field defaults to
+    /// absent, which is exactly "did not ask".
+    #[test]
+    fn a_pre_v0_29_search_request_parses_with_no_positions() {
+        let json = concat!(
+            r#"{"workspaceIds":["00000000-0000-0000-0000-000000000001"],"query":"q","#,
+            r#""limit":5}"#
+        );
+        let req: SearchRequest = serde_json::from_str(json).unwrap();
+        assert!(req.positions.is_none());
+    }
+
+    /// The response pin, both ways: an answered outcome carries `delta` LAST, and an outcome
+    /// with no answer omits it entirely (absence is never `"none"`).
+    #[test]
+    fn a_search_outcome_pins_the_delta_field() {
+        let answered = SearchWorkspaceOutcome {
+            workspace_id: ws(1),
+            refused: None,
+            hits: vec![],
+            attachments: vec![],
+            degraded: false,
+            attachments_truncated: false,
+            attachments_query_truncated: false,
+            delta: Some("pending".into()),
+        };
+        assert_eq!(
+            serde_json::to_string(&SearchResponse {
+                workspaces: vec![answered]
+            })
+            .unwrap(),
+            concat!(
+                r#"{"workspaces":[{"workspaceId":"00000000-0000-0000-0000-000000000001","#,
+                r#""delta":"pending"}]}"#
+            )
+        );
+        let unanswered = SearchWorkspaceOutcome {
+            workspace_id: ws(1),
+            refused: Some("FORBIDDEN".into()),
+            hits: vec![],
+            attachments: vec![],
+            degraded: false,
+            attachments_truncated: false,
+            attachments_query_truncated: false,
+            delta: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&SearchResponse {
+                workspaces: vec![unanswered]
+            })
+            .unwrap(),
+            concat!(
+                r#"{"workspaces":[{"workspaceId":"00000000-0000-0000-0000-000000000001","#,
+                r#""refused":"FORBIDDEN"}]}"#
+            )
+        );
+    }
+
+    /// D2b's whole mechanism: an UNKNOWN value from a newer server deserializes verbatim. The
+    /// CLI's job is then to say nothing about it — a typed enum would either fail the parse or
+    /// need `serde(other)`, which serde documents only for tagged enums.
+    #[test]
+    fn an_unknown_delta_value_survives_deserialization_verbatim() {
+        let json = concat!(
+            r#"{"workspaces":[{"workspaceId":"00000000-0000-0000-0000-000000000001","#,
+            r#""delta":"reindex_required"}]}"#
+        );
+        let resp: SearchResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            resp.workspaces[0].delta.as_deref(),
+            Some("reindex_required")
+        );
+        // …and a pre-v0.29.0 server's answer leaves it absent.
+        let old = r#"{"workspaces":[{"workspaceId":"00000000-0000-0000-0000-000000000001"}]}"#;
+        let resp: SearchResponse = serde_json::from_str(old).unwrap();
+        assert!(resp.workspaces[0].delta.is_none());
     }
 }

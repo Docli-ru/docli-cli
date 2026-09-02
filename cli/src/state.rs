@@ -97,6 +97,12 @@ pub struct WsState {
     pub pending_removals: BTreeSet<String>,
 }
 
+/// How long a cursor may go without reaching head before the mirror stops being a projection of
+/// anything (the manifest's retention bound). Lives here rather than in `sync_cmd` because
+/// v0.29.0 D4 made it one of the shared readiness terms — `search` asks the same question
+/// `sync`'s invalidator does, and two thresholds would be two answers.
+pub const MAX_HEAD_AGE_SECS: i64 = 30 * 24 * 60 * 60;
+
 impl WsState {
     pub fn fresh(scope_key: Option<String>) -> Self {
         WsState {
@@ -118,6 +124,77 @@ impl WsState {
 
     pub fn has_transient_parks(&self) -> bool {
         self.parks.values().any(|p| p.class == ParkClass::Transient)
+    }
+
+    /// The four terms `CACHE_INCOMPLETE.docli` is written for — the codebase's own definition of
+    /// an incomplete mirror, in ONE place (v0.29.0 D4). `sync` writes the marker from it and
+    /// `status` renders its row from it; a screen disagreeing with the marker in the mirror
+    /// would be worse than no screen.
+    ///
+    /// Deliberately NOT a term here: the mount's configured folder scope, which is a property of
+    /// `docli.toml` rather than of this state — callers holding a `Mount` add it explicitly.
+    pub fn incomplete(&self) -> bool {
+        self.from_zero
+            || !self.at_head
+            || self.has_transient_parks()
+            || !self.pending_removals.is_empty()
+    }
+
+    /// Why this state forces a REBUILD FROM ZERO — the cheap half of `sync`'s invalidator, which
+    /// adds the expensive mirror-vs-manifest walk on top (v0.29.0 D4).
+    ///
+    /// One home for the three terms, because they are genuinely the same question asked by two
+    /// commands. Left as two hand-copied lists they would drift the silent way: `sync --check`
+    /// would start calling a mount stale for a term `search` never learned, and `search` would go
+    /// on asking and reporting `none` over it — the exact defect D4 exists to close, one layer up.
+    ///
+    /// `scope` is the mount's configured folder (state cannot see `docli.toml`); `now` is unix
+    /// seconds, injected so the age term is testable.
+    pub fn rebuild_reason(&self, scope: Option<&str>, now: i64) -> Option<&'static str> {
+        if self.from_zero {
+            return Some("a full rebuild is pending");
+        }
+        if self.scope_key.as_deref() != scope {
+            // The cursor advanced past out-of-scope nodes, so a widened scope must backfill.
+            return Some("the mount's folder scope changed");
+        }
+        match self.head_reached_at {
+            None => Some("it has never reached the server's head"),
+            Some(t) if now - t > MAX_HEAD_AGE_SECS => {
+                Some("its cursor last reached head more than 30 days ago")
+            }
+            _ => None,
+        }
+    }
+
+    /// Why this state is not a usable read-only projection right now, or `None` when it is
+    /// (v0.29.0 D4 — the shared readiness predicate `search` asks).
+    ///
+    /// [`Self::rebuild_reason`]'s three terms, plus the three that make a mirror incomplete
+    /// without forcing a rebuild. The set is deliberately BROADER than the render filter: a
+    /// parked or pending-removal mount that asked would receive `none` and print nothing, over a
+    /// mirror the `CACHE_INCOMPLETE.docli` contract already calls incomplete.
+    ///
+    /// **Cheap terms only**: no disk walk, no network. `search` must stay lock-less and must not
+    /// pay a manifest walk, so content removed under an intact `MOUNT.docli` — a shell `rm -rf`,
+    /// a `git clean -fd`, an agent's own `rm` — is invisible here and stays `docli doctor`'s
+    /// question. So is a STRUCTURAL park: it leaves a node unmaterialized while its id stays in
+    /// the ledger, and it is durable by nature, so treating it as unusable would fire forever
+    /// over one unmaterializable path — a signal that cannot stop firing stops informing.
+    pub fn unusable_reason(&self, scope: Option<&str>, now: i64) -> Option<&'static str> {
+        if let Some(r) = self.rebuild_reason(scope, now) {
+            return Some(r);
+        }
+        if !self.at_head {
+            return Some("the last sync did not finish");
+        }
+        if self.has_transient_parks() {
+            return Some("deliveries are parked behind untracked files");
+        }
+        if !self.pending_removals.is_empty() {
+            return Some("directory removals are blocked by untracked occupants");
+        }
+        None
     }
 
     /// Node id currently tracked at a LOCAL path (linear — the maps are small enough, and an

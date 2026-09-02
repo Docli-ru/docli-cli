@@ -242,21 +242,16 @@ fn mount_status(root: &Path, control: &ControlRoot, m: &Mount) -> MountStatus {
         folder: m.folder.clone(),
         nodes: state.as_ref().map(|s| s.nodes.len()),
         at_head: state.as_ref().is_some_and(|s| s.at_head),
-        // The same three predicates `CACHE_INCOMPLETE.docli` is written for — a status screen
-        // that disagreed with the marker in the mirror would be worse than no status screen.
-        incomplete: state.as_ref().is_some_and(|s| {
-            s.from_zero
-                || !s.at_head
-                || s.has_transient_parks()
-                // Owed-but-blocked directory removals are debt too: `sync --check` exits
-                // non-zero on them, so a status screen calling the mount healthy would
-                // contradict the very gate agents branch on.
-                || !s.pending_removals.is_empty()
-                // A folder scope edited in docli.toml since the last sync: the cursor already
-                // ran past out-of-scope nodes, so the mirror answers for a scope that is no
-                // longer configured. `sync` forces from-zero on exactly this comparison.
-                || s.scope_key != m.folder
-        }),
+        // The same predicates `CACHE_INCOMPLETE.docli` is written for — a status screen that
+        // disagreed with the marker in the mirror would be worse than no status screen. The four
+        // state-only terms are `WsState::incomplete` (v0.29.0 D4, one home shared with
+        // `persist_incomplete`); the scope term is added HERE because it compares state against
+        // `docli.toml`, which the state cannot see: a folder scope edited since the last sync
+        // means the cursor already ran past out-of-scope nodes, so the mirror answers for a
+        // scope that is no longer configured, and `sync` forces from-zero on that comparison.
+        incomplete: state
+            .as_ref()
+            .is_some_and(|s| s.incomplete() || s.scope_key != m.folder),
         parks: state.as_ref().map(|s| s.parks.len()).unwrap_or(0),
         head_age_secs: state
             .as_ref()

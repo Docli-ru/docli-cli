@@ -27,10 +27,6 @@ use crate::state::{ControlRoot, Park, ParkClass, TrackedKind, WsState};
 /// predicate (`nodes.len() < limit`) is computed by each side against the value it believes in,
 /// and a clamped limit would split them.
 const PAGE_LIMIT: i64 = 500;
-/// The manifest retention bound (D2a): a cursor that last reached head longer ago than this
-/// hard-forces from-zero (`purge` retention is 30 days — an older cursor may have missed
-/// tombstones).
-const MAX_HEAD_AGE_SECS: i64 = 30 * 24 * 60 * 60;
 
 pub struct SyncOptions {
     pub check: bool,
@@ -63,7 +59,7 @@ pub fn rollback_warning(ws: Uuid) -> String {
     )
 }
 
-fn now_unix() -> i64 {
+pub(crate) fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -181,25 +177,18 @@ fn head_reaching(resp: &PullResponse, limit: i64) -> bool {
 }
 
 /// The D2 invalidators, applied to a LOADED state. Returns the reason a from-zero is forced.
+///
+/// The three CHEAP terms live on `WsState` (v0.29.0 D4) so `search`'s readiness predicate and
+/// this one cannot drift; what stays here is the expensive half — the mirror-vs-manifest walk,
+/// which `search` must not pay.
 fn invalidator(
     state: &WsState,
     mount: &Mount,
     mount_root: &Path,
     control: &ControlRoot,
 ) -> Option<String> {
-    if state.from_zero {
-        return Some("a full rebuild is pending".into());
-    }
-    if state.scope_key != mount.folder {
-        // The cursor advanced past out-of-scope nodes, so a widened scope must backfill.
-        return Some("the mount's folder scope changed".into());
-    }
-    match state.head_reached_at {
-        None => return Some("the mirror has never reached head".into()),
-        Some(t) if now_unix() - t > MAX_HEAD_AGE_SECS => {
-            return Some("the cursor last reached head more than 30 days ago".into());
-        }
-        _ => {}
+    if let Some(r) = state.rebuild_reason(mount.folder.as_deref(), now_unix()) {
+        return Some(r.into());
     }
     // Mirror-vs-manifest: every tracked materialization must exist on disk, so `rm -rf mirror/`
     // with `.docli/` left behind reads as from-zero, never as healthy.
@@ -251,11 +240,9 @@ fn persist_incomplete(
     state: &WsState,
 ) -> Result<()> {
     control.save_state(ws, state)?;
-    let incomplete = !state.at_head
-        || state.from_zero
-        || state.has_transient_parks()
-        || !state.pending_removals.is_empty();
-    set_incomplete_marker(&handle.root, incomplete)
+    // The four terms live on `WsState` (v0.29.0 D4) — `status` renders its row from the same
+    // method, so the screen and the marker in the mirror cannot disagree.
+    set_incomplete_marker(&handle.root, state.incomplete())
 }
 
 #[allow(clippy::too_many_lines)]

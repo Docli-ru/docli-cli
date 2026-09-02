@@ -11,7 +11,12 @@
 //! * **stdout is what the command was asked to PRODUCE; stderr is how it is going.** Search
 //!   hits, status rows and `--json` go to stdout; headings, progress, successes and warnings go
 //!   to stderr. So `docli search q | grep`, `docli status --json | jq` and `docli sync 2>/dev/null`
-//!   all behave, and an agent parsing stdout never has to skip our chatter.
+//!   all behave. **With one exception, and it is not a leak — it is [`report_mode`]:** where a
+//!   command's whole screen IS the result (`search`, `status`, `list`, human `doctor`), its
+//!   warnings and details go to stdout WITH the result, because `-q` or a redirect that dropped
+//!   half the screen would drop the very thing that was asked for. So an agent parsing the human
+//!   output of those four DOES have to skip our chatter — which is why the answer for a parser is
+//!   `--json`, where [`machine_mode`] leaves `REPORT` unset and stdout carries data alone.
 //! * **Message TEXT is ASCII; only DECORATION is extended.** A sentence reads the same with a
 //!   hyphen as with an em dash, so message strings use ASCII punctuation unconditionally and
 //!   cannot arrive as mojibake. The markers, the box rule, the prompt symbols and the identity
