@@ -113,6 +113,21 @@ pub fn valid_label(label: &str) -> bool {
 
 pub mod winpath;
 
+/// The shared vector FILES, exposed as crate constants.
+///
+/// `fold.json` and `winpath.json` are consumed by this crate's own tests, where
+/// `include_str!("../vectors/…")` resolves in any layout. `graph.json` is different: its Rust
+/// consumers are OUTSIDE this crate (`apps/cli/src/graph.rs` and `packages/core/src/db/link.rs`),
+/// and a path relative to THOSE files only resolves in the monorepo — the public CLI mirror lays
+/// the three crates out flat, so the same `include_str!` there fails to compile. Reading the file
+/// where it lives and handing it out as a constant is what makes the twin's contract portable.
+///
+/// Caught by the mirror's own `cargo test`, which is the whole point of running it there.
+pub mod vectors {
+    /// v0.29.1 D7 — the note graph's five read predicates.
+    pub const GRAPH: &str = include_str!("../vectors/graph.json");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

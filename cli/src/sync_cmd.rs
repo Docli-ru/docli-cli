@@ -157,7 +157,16 @@ impl std::fmt::Display for NotEntitled {
 }
 impl std::error::Error for NotEntitled {}
 
-fn ephemeral_request(ws: Uuid, cursor: WireCursor, epoch: i64, limit: i64) -> PullRequest {
+/// `graph` is a per-CALLER intent, not a per-page one (v0.29.1 D4): the payload only ever rides
+/// the head-reaching page, but the flag has to be set on every request of the run, because which
+/// page reaches head is not knowable in advance.
+fn ephemeral_request(
+    ws: Uuid,
+    cursor: WireCursor,
+    epoch: i64,
+    limit: i64,
+    graph: bool,
+) -> PullRequest {
     PullRequest {
         workspace_id: ws,
         client_id: "ephemeral".into(),
@@ -166,6 +175,7 @@ fn ephemeral_request(ws: Uuid, cursor: WireCursor, epoch: i64, limit: i64) -> Pu
         limit: Some(limit),
         ack: None,
         ephemeral: true,
+        graph,
     }
 }
 
@@ -415,7 +425,7 @@ fn incremental_pages(
             "received: {}",
             crate::ui::plural(state.nodes.len(), "node", "nodes")
         ));
-        let req = ephemeral_request(ws, state.cursor, state.epoch, PAGE_LIMIT);
+        let req = ephemeral_request(ws, state.cursor, state.epoch, PAGE_LIMIT, true);
         let resp = match api.pull(&req)? {
             Ok(r) => r,
             Err(ApiFailure::EpochChanged { .. }) => {
@@ -480,9 +490,40 @@ fn incremental_pages(
             state.at_head = true;
             state.head_reached_at = Some(now_unix());
             settle_pending_removals(state, rules, &handle.root);
+            commit_graph(
+                control,
+                ws,
+                state,
+                state.epoch,
+                resp.cursor,
+                resp.graph.as_ref(),
+            )?;
             persist_incomplete(control, handle, ws, state)?;
             return Ok(true);
         }
+    }
+}
+
+/// Store or retire the note graph at the moment the mirror commits head (v0.29.1 D4).
+///
+/// Called with the position of the HEAD-REACHING page, and only from a run that ASKED. The two
+/// arms are equally load-bearing: a served graph is stamped and stored, and an UNSERVED one
+/// clears the cache — because keeping the previous file would pair a current mirror with whatever
+/// the last graph-serving api said, which is exactly the stale-graph pairing the stamp exists to
+/// prevent. `graph_asked` is set either way; that is what lets `read` tell «your server has no
+/// graph» from «this mirror predates the feature».
+fn commit_graph(
+    control: &ControlRoot,
+    ws: Uuid,
+    state: &mut WsState,
+    epoch: i64,
+    cursor: WireCursor,
+    graph: Option<&docli_sync_wire::WireGraph>,
+) -> Result<()> {
+    state.graph_asked = true;
+    match graph {
+        Some(g) => control.save_graph(ws, epoch, cursor, g),
+        None => control.clear_graph(ws),
     }
 }
 
@@ -616,7 +657,13 @@ fn from_zero_pages(
         id: Uuid::nil(),
     };
     // Bootstrap is the CLI's first call — the only way to learn the epoch.
-    let first = match api.bootstrap(&ephemeral_request(ws, cursor, state.epoch, PAGE_LIMIT))? {
+    let first = match api.bootstrap(&ephemeral_request(
+        ws,
+        cursor,
+        state.epoch,
+        PAGE_LIMIT,
+        true,
+    ))? {
         Ok(r) => r,
         Err(ApiFailure::EpochChanged { .. }) => {
             // A resync landing inside bootstrap's own epoch-read/pull window (Codex round 12):
@@ -681,10 +728,11 @@ fn from_zero_pages(
             state.at_head = true;
             state.head_reached_at = Some(now_unix());
             settle_pending_removals(state, rules, &handle.root);
+            commit_graph(control, ws, state, epoch, cursor, resp.graph.as_ref())?;
             persist_incomplete(control, handle, ws, state)?;
             return Ok(());
         }
-        resp = match api.pull(&ephemeral_request(ws, cursor, epoch, PAGE_LIMIT))? {
+        resp = match api.pull(&ephemeral_request(ws, cursor, epoch, PAGE_LIMIT, true))? {
             Ok(r) => r,
             Err(ApiFailure::EpochChanged { .. }) => {
                 // Mid-replay resync: an epoch bump is a normal, self-healing server event, not
@@ -760,7 +808,9 @@ fn check_mount(
             state.pending_removals.len()
         ));
     }
-    let req = ephemeral_request(ws, state.cursor, state.epoch, 1);
+    // `--check` reads no graph and runs on every session start of every wired agent, so it never
+    // asks for one (D4's opt-out).
+    let req = ephemeral_request(ws, state.cursor, state.epoch, 1, false);
     let resp = match api.pull(&req)? {
         Ok(r) => r,
         Err(ApiFailure::EpochChanged { .. }) => {
@@ -1300,6 +1350,7 @@ mod tests {
             resync_required: false,
             last_mutation_id: 0,
             live_nodes: None,
+            graph: None,
         };
         assert!(head_reaching(&resp(0), 1));
         assert!(!head_reaching(&resp(1), 1));

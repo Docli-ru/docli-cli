@@ -65,6 +65,15 @@ pub struct PullRequest {
     /// rollback shape the CLI's live-node-count detector exists to catch.
     #[serde(default, skip_serializing_if = "is_false")]
     pub ephemeral: bool,
+    /// v0.29.1 D4 — ask for the workspace GRAPH on the head-reaching page. **Opt-in, default
+    /// false**: the api ships before the CLI half, so a default-on payload would land on the
+    /// installed 0.1.4 fleet at every session start. `sync --check` and `doctor` leave it off —
+    /// neither reads the graph, and both run where a multi-megabyte body buys nothing.
+    ///
+    /// Honored on the EPHEMERAL arm only. Setting it on a registered pull is accepted and
+    /// ignored, so the shape stays one (the `client_id` precedent).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub graph: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -128,6 +137,92 @@ pub struct PullResponse {
     /// ABSENCE on a head-reaching ephemeral response is the rollback detector.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_nodes: Option<i64>,
+    /// v0.29.1 D4 — the workspace graph, present only when the request set
+    /// [`PullRequest::graph`] AND this page reached head. A new CLI against an older api gets
+    /// `None` and must say so; an older client ignores the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph: Option<WireGraph>,
+}
+
+// ---- the note graph (v0.29.1 D3/D4) ---------------------------------------------------------
+
+/// One node's IDENTITY row — and the interning dictionary: every edge and tag addresses a node by
+/// its INDEX into [`WireGraph::nodes`].
+///
+/// It carries `title`/`aliases` because the `read_note` envelope needs them and the pull page's
+/// [`WireNode`] does not have them (v0.20.0 re-homed both into typed columns). It carries
+/// `trashed` because `links` deliberately RETAINS rows whose source or target is trashed, so
+/// every predicate over the edge set has to filter liveness itself.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphNode {
+    pub id: Uuid,
+    /// The RAW DB kind string, like [`WireNode::kind`] — an unknown future kind reaches the
+    /// client verbatim rather than being coerced.
+    pub kind: String,
+    pub name: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime: Option<String>,
+    pub content_bytes: i32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub trashed: bool,
+}
+
+/// One `links` row, interned. Both endpoint columns stay DISCRIMINATED (D3): a `kind='embed'`
+/// row may resolve to a note (`dst`) or to an attachment (`att`), and collapsing them into one
+/// index would make `forward_links` and `attachment_embeds` read the same column — which is the
+/// divergence this payload exists to remove.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphEdge {
+    /// Index into [`WireGraph::nodes`] — the note the reference is written in.
+    pub src: u32,
+    /// `links.dst_node_id`, interned; absent when the ref resolved to nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dst: Option<u32>,
+    /// `links.dst_attachment_id`, interned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub att: Option<u32>,
+    /// `links.dst_ref` — the raw target text exactly as written. NOT interned: it is the one
+    /// field whose whole point is to be unresolved.
+    #[serde(rename = "ref")]
+    pub dst_ref: String,
+    /// `wikilink` | `embed` | `markdown`, raw.
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<String>,
+}
+
+/// One `note_tags` row, interned.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphTag {
+    /// Index into [`WireGraph::nodes`].
+    pub node: u32,
+    pub tag: String,
+}
+
+/// The whole workspace graph as one coherent snapshot, built in the SAME transaction and
+/// snapshot as the page it rides (D4). It has no freshness lifecycle of its own — it arrives with
+/// the page, is stored against the `(epoch, cursor)` that page reported, and dies with it. That is
+/// what makes its absence mean exactly one thing: an api that cannot serve one.
+///
+/// **Workspace-wide, not scope-limited**, deliberately: an edge's other endpoint is routinely
+/// outside a folder scope, and a scope-clipped graph would report a note as unlinked because the
+/// mount is narrow — the false-negative class D5 exists to forbid.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WireGraph {
+    pub nodes: Vec<GraphNode>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edges: Vec<GraphEdge>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<GraphTag>,
 }
 
 // ---- /api/sync/search (v0.28.0 D5) ----------------------------------------------------------
@@ -279,6 +374,7 @@ mod tests {
             resync_required: false,
             last_mutation_id: 4,
             live_nodes: None,
+            graph: None,
         };
         assert_eq!(
             serde_json::to_string(&resp).unwrap(),
@@ -307,6 +403,9 @@ mod tests {
         let resp: PullResponse = serde_json::from_str(json).unwrap();
         assert!(resp.capabilities.is_empty());
         assert!(resp.live_nodes.is_none());
+        // A pre-v0.29.1 api serves no graph, and «no graph» must not be an empty graph — the
+        // client's whole absent-is-not-empty contract rests on this being `None`.
+        assert!(resp.graph.is_none());
         let n = &resp.nodes[0];
         assert!(n.position.is_none() && n.sha256.is_none() && n.blob_generation.is_none());
     }
@@ -339,6 +438,7 @@ mod tests {
             limit: Some(500),
             ack: None,
             ephemeral: true,
+            graph: false,
         };
         assert_eq!(
             serde_json::to_string(&req).unwrap(),
@@ -472,6 +572,130 @@ mod tests {
                 r#""refused":"FORBIDDEN"}]}"#
             )
         );
+    }
+
+    // ---- the graph payload's byte pins (v0.29.1 D4) -----------------------------------------
+
+    /// The graph rides the pull page, so its bytes are pinned like the rest of it. The shape
+    /// under test is the one that actually exercises interning: a note, an attachment, one
+    /// resolved note edge, one attachment embed, one dangling ref, and a tag.
+    #[test]
+    fn a_graph_payload_is_pinned() {
+        let graph = WireGraph {
+            nodes: vec![
+                GraphNode {
+                    id: ws(1),
+                    kind: "file".into(),
+                    name: "a.md".into(),
+                    path: "a.md".into(),
+                    title: Some("A".into()),
+                    aliases: vec!["alias".into()],
+                    mime: None,
+                    content_bytes: 12,
+                    trashed: false,
+                },
+                GraphNode {
+                    id: ws(2),
+                    kind: "attachment".into(),
+                    name: "p.png".into(),
+                    path: "p.png".into(),
+                    title: None,
+                    aliases: vec![],
+                    mime: Some("image/png".into()),
+                    content_bytes: 99,
+                    trashed: false,
+                },
+            ],
+            edges: vec![
+                GraphEdge {
+                    src: 0,
+                    dst: Some(0),
+                    att: None,
+                    dst_ref: "a".into(),
+                    kind: "wikilink".into(),
+                    anchor: Some("h".into()),
+                },
+                GraphEdge {
+                    src: 0,
+                    dst: None,
+                    att: Some(1),
+                    dst_ref: "p.png".into(),
+                    kind: "embed".into(),
+                    anchor: None,
+                },
+                GraphEdge {
+                    src: 0,
+                    dst: None,
+                    att: None,
+                    dst_ref: "nowhere".into(),
+                    kind: "wikilink".into(),
+                    anchor: None,
+                },
+            ],
+            tags: vec![GraphTag {
+                node: 0,
+                tag: "проект".into(),
+            }],
+        };
+        assert_eq!(
+            serde_json::to_string(&graph).unwrap(),
+            concat!(
+                r#"{"nodes":[{"id":"00000000-0000-0000-0000-000000000001","kind":"file","#,
+                r#""name":"a.md","path":"a.md","title":"A","aliases":["alias"],"#,
+                r#""contentBytes":12},{"id":"00000000-0000-0000-0000-000000000002","#,
+                r#""kind":"attachment","name":"p.png","path":"p.png","mime":"image/png","#,
+                r#""contentBytes":99}],"#,
+                r#""edges":[{"src":0,"dst":0,"ref":"a","kind":"wikilink","anchor":"h"},"#,
+                r#"{"src":0,"att":1,"ref":"p.png","kind":"embed"},"#,
+                r#"{"src":0,"ref":"nowhere","kind":"wikilink"}],"#,
+                r#""tags":[{"node":0,"tag":"проект"}]}"#
+            )
+        );
+        // …and it round-trips, which is what the CLI's cache does to it on every read.
+        let back: WireGraph =
+            serde_json::from_str(&serde_json::to_string(&graph).unwrap()).unwrap();
+        assert_eq!(back, graph);
+    }
+
+    /// An EMPTY graph is a real answer — a workspace with no links and no tags — and must stay
+    /// byte-distinguishable from `graph: null`, which means «this api serves none».
+    #[test]
+    fn an_empty_graph_is_not_an_absent_one() {
+        let empty = serde_json::to_string(&WireGraph::default()).unwrap();
+        assert_eq!(empty, r#"{"nodes":[]}"#);
+        let held: Option<WireGraph> = serde_json::from_str(&empty).unwrap();
+        assert!(held.is_some());
+        let none: Option<WireGraph> = serde_json::from_str("null").unwrap();
+        assert!(none.is_none());
+    }
+
+    /// The request pin for the flag, and the forward-compat direction that matters: a 0.1.4-era
+    /// CLI's request parses with `graph` false, so the api's opt-in gate reads «did not ask».
+    #[test]
+    fn the_graph_flag_is_opt_in_on_the_wire() {
+        let req = PullRequest {
+            workspace_id: ws(1),
+            client_id: "ephemeral".into(),
+            cursor: WireCursor {
+                rev: 0,
+                id: Uuid::nil(),
+            },
+            epoch: 1,
+            limit: Some(500),
+            ack: None,
+            ephemeral: true,
+            graph: true,
+        };
+        assert!(serde_json::to_string(&req)
+            .unwrap()
+            .ends_with(r#""limit":500,"ephemeral":true,"graph":true}"#));
+        let old = concat!(
+            r#"{"workspaceId":"00000000-0000-0000-0000-000000000001","clientId":"c","#,
+            r#""cursor":{"rev":0,"id":"00000000-0000-0000-0000-000000000000"},"epoch":1,"#,
+            r#""ephemeral":true}"#
+        );
+        let req: PullRequest = serde_json::from_str(old).unwrap();
+        assert!(!req.graph);
     }
 
     /// D2b's whole mechanism: an UNKNOWN value from a newer server deserializes verbatim. The

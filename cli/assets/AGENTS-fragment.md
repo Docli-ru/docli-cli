@@ -9,6 +9,10 @@ not through the filesystem: it applies the mirror's freshness and digest checks,
   and node id; `docli read` prints that note — `--lines 40-80` for a range, `--json` for the
   read_note envelope, `--mount` when more than one mount holds it. **Exit 3 means only that this
   mirror does not hold the requested note or file — never that it does not exist on the server.**
+- **`docli read` answers the note's graph too** — `links`, `backlinks`, `embeds`, `unresolved`,
+  `tags`, `title`, `aliases` under `--json`, and a counts line on stderr without it. The server
+  computes it; the CLI only holds it. An empty list means empty; a `null` plus its `absent` entry
+  means the CLI does not know, and that entry names the fix.
 - **The mirror is never writable.** An edit made inside it is never synced, and it is destroyed
   with no conflict copy the next time that note changes on the server. To change a note, write
   through the docli MCP connection with `edit_note`, then run `docli sync`.
@@ -17,7 +21,8 @@ not through the filesystem: it applies the mirror's freshness and digest checks,
 - **Absence is a server question.** The mirror can be scoped, behind, or incomplete. Only a
   `docli search "…"` that does not report an incomplete index establishes that a note does not
   exist.
-- **`docli read` on a file** prints its id, MIME type, size, digest and wikilink. The bytes stay
-  on the server; `read_attachment` over the docli MCP connection fetches them.
+- **`docli read` on a file** prints its id, MIME type, size, digest, wikilink and the notes that
+  embed it. The bytes stay on the server; `read_attachment` over the docli MCP connection
+  fetches them.
 
 `docli status` reports sign-in, mounts, freshness and what is wired here.

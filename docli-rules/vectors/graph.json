@@ -1,0 +1,93 @@
+{
+  "_": [
+    "v0.29.1 D7 — the note GRAPH's five read predicates, pinned as shared vectors.",
+    "",
+    "Two implementations answer these questions on opposite ends of the sync wire: the server's",
+    "SQL (packages/core/src/db/link.rs + db/tag.rs) and the CLI's local inversion of the payload",
+    "(apps/cli/src/graph.rs). They ship on different release trains, so this file is the contract.",
+    "",
+    "MEMBERSHIP is pinned, not sequence. Both sides sort by path (or tag) for presentation, but",
+    "the server evaluates ORDER BY under the database collation (en_US.UTF-8 here — a locale",
+    "collation, not byte order) and the client cannot reproduce that without shipping a collation",
+    "engine. Both consumers therefore compare these as SETS. An order that differs is a",
+    "differently-sorted right answer; a set that differs is a wrong one.",
+    "",
+    "Node ids are SYMBOLIC keys: the server test gets whatever uuids its inserts mint, the client",
+    "test synthesizes its own. Each side maps keys to its ids and back.",
+    "",
+    "Synthetic fixture only — this crate is MIT and ships in the public CLI mirror, so real",
+    "workspace paths must never land here."
+  ],
+  "nodes": [
+    { "key": "a", "kind": "file", "name": "a.md", "path": "a.md", "title": "Alpha note", "aliases": ["Alpha", "Первая"], "mime": null, "contentBytes": 12, "trashed": false },
+    { "key": "b", "kind": "file", "name": "b.md", "path": "b.md", "title": null, "aliases": [], "mime": null, "contentBytes": 3, "trashed": false },
+    { "key": "c", "kind": "file", "name": "c.md", "path": "c.md", "title": null, "aliases": [], "mime": null, "contentBytes": 4, "trashed": true },
+    { "key": "p", "kind": "attachment", "name": "p.png", "path": "p.png", "title": null, "aliases": [], "mime": "image/png", "contentBytes": 99, "trashed": false },
+    { "key": "q", "kind": "attachment", "name": "q.png", "path": "q.png", "title": null, "aliases": [], "mime": "image/png", "contentBytes": 7, "trashed": true }
+  ],
+  "links": [
+    { "_": "plain resolved note edge", "src": "a", "ref": "b", "dst": "b", "att": null, "kind": "wikilink", "anchor": null },
+    { "_": "same target twice — DISTINCT collapses it", "src": "a", "ref": "b", "dst": "b", "att": null, "kind": "wikilink", "anchor": "heading" },
+    { "_": "SELF edge — kept by backlinks, excluded by forwardLinks", "src": "a", "ref": "a", "dst": "a", "att": null, "kind": "wikilink", "anchor": null },
+    { "_": "resolved to a TRASHED note", "src": "a", "ref": "c", "dst": "c", "att": null, "kind": "wikilink", "anchor": null },
+    { "_": "attachment embed, wikilink syntax", "src": "a", "ref": "p.png", "dst": null, "att": "p", "kind": "embed", "anchor": null },
+    { "_": "the same attachment via markdown-image syntax", "src": "a", "ref": "p.png", "dst": null, "att": "p", "kind": "image", "anchor": null },
+    { "_": "embed of a TRASHED attachment", "src": "a", "ref": "q.png", "dst": null, "att": "q", "kind": "embed", "anchor": null },
+    { "_": "dangling wikilink", "src": "a", "ref": "nowhere", "dst": null, "att": null, "kind": "wikilink", "anchor": null },
+    { "_": "dangling markdown link", "src": "a", "ref": "gone.md", "dst": null, "att": null, "kind": "markdown", "anchor": null },
+    { "_": "dangling EMBED — never reported unresolved, an embed's null node edge usually means it resolved to a file", "src": "a", "ref": "missing.png", "dst": null, "att": null, "kind": "embed", "anchor": null },
+    { "_": "empty ref — excluded by dst_ref <> ''", "src": "a", "ref": "", "dst": null, "att": null, "kind": "wikilink", "anchor": null },
+    { "_": "back the other way", "src": "b", "ref": "a", "dst": "a", "att": null, "kind": "wikilink", "anchor": null },
+    { "_": "TRASHED source — invisible to backlinks, still visible to forwardLinks", "src": "c", "ref": "b", "dst": "b", "att": null, "kind": "wikilink", "anchor": null },
+    { "_": "trashed source embedding a live file", "src": "c", "ref": "p.png", "dst": null, "att": "p", "kind": "embed", "anchor": null }
+  ],
+  "tags": [
+    { "node": "a", "tag": "work" },
+    { "node": "a", "tag": "проект" },
+    { "node": "c", "tag": "trashed-note-tag" }
+  ],
+  "expect": {
+    "backlinks": {
+      "a": ["a", "b"],
+      "b": ["a"],
+      "c": ["a"],
+      "p": [],
+      "q": []
+    },
+    "forwardLinks": {
+      "a": ["b"],
+      "b": ["a"],
+      "c": ["b"],
+      "p": [],
+      "q": []
+    },
+    "attachmentEmbeds": {
+      "a": ["p"],
+      "b": [],
+      "c": [],
+      "p": [],
+      "q": []
+    },
+    "attachmentEmbedders": {
+      "a": [],
+      "b": [],
+      "c": [],
+      "p": ["a"],
+      "q": ["a"]
+    },
+    "unresolved": {
+      "a": ["gone.md", "nowhere"],
+      "b": [],
+      "c": [],
+      "p": [],
+      "q": []
+    },
+    "tags": {
+      "a": ["work", "проект"],
+      "b": [],
+      "c": [],
+      "p": [],
+      "q": []
+    }
+  }
+}

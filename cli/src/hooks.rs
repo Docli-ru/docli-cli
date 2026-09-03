@@ -717,7 +717,7 @@ pub fn status(project_root: &Path, agent: HookAgent) -> HookStatus {
                     //
                     // Whole-entry equality answered it in both wrong directions. An entry of
                     // ours whose matcher somebody changed to `Bash` is still OURS to rewrite
-                    // but guards no Write or Edit, so «writes into the mirror are refused»
+                    // but guards no Write or Edit, so «file edits in the mirror are refused»
                     // over it is the lie this report exists to prevent. And an entry with
                     // `timeout: 20` instead of `10` works perfectly, so calling it absent
                     // would send a reader to fix a gate that is not broken.
@@ -1490,7 +1490,7 @@ mod tests {
     fn status_reports_health_not_merely_ownership() {
         // Identity and health are different questions. An entry of ours whose matcher somebody
         // changed to `Bash` is still OURS to rewrite — but it does not guard a single Write or
-        // Edit, and «writes into the mirror are refused» over it would be exactly the lie this
+        // Edit, and «file edits in the mirror are refused» over it would be exactly the lie this
         // report exists to prevent.
         let tmp = tempfile::tempdir().unwrap();
         let HookOutcome::Write(good) = merge(HookAgent::Claude, None) else {

@@ -292,6 +292,131 @@ fn first_sync_mirrors_the_tree_and_check_reports_fresh() {
     assert!(!f.mirror.join("docs/a.md").exists());
 }
 
+/// v0.29.1 Half 2 — the graph rides the head-reaching page of a run that ASKED, lands in the
+/// control root stamped with that page's position, and is then what `docli read` answers from.
+///
+/// Also pinned here, because it is the whole reason the flag is opt-in: **`--check` must not ask.**
+/// It runs at every session start of every wired agent, reads no graph, and a default-on payload
+/// would make a freshness probe the most expensive call in the system.
+#[test]
+fn the_graph_rides_the_head_page_and_check_never_asks_for_one() {
+    let mut f = fx();
+    let tree: Arc<Mutex<BTreeMap<u128, Value>>> = Arc::new(Mutex::new(BTreeMap::from([
+        (1, wire_node(1, "file", "a.md", 1, Some("# a"))),
+        (2, wire_node(2, "file", "b.md", 2, Some("# b"))),
+    ])));
+    // Every request's `graph` flag, in order, so the opt-out is observed rather than assumed.
+    let asked: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
+    let inner = tree_server(tree.clone());
+    let seen = asked.clone();
+    let server = spawn_stub(Arc::new(move |path: &str, body: &Value| {
+        if path == "/api/sync/pull" || path == "/api/sync/bootstrap" {
+            seen.lock().unwrap().push(body["graph"] == json!(true));
+        }
+        let (code, mut resp) = inner(path, body);
+        // The graph is emitted only when asked AND only on the head-reaching page.
+        if body["graph"] == json!(true) && resp["nodes"].as_array().is_some_and(|n| n.len() < 500) {
+            resp["graph"] = json!({
+                "nodes": [
+                    {"id": Uuid::from_u128(1).to_string(), "kind": "file", "name": "a.md",
+                     "path": "a.md", "title": "Alpha", "contentBytes": 3},
+                    {"id": Uuid::from_u128(2).to_string(), "kind": "file", "name": "b.md",
+                     "path": "b.md", "contentBytes": 3},
+                ],
+                "edges": [{"src": 0, "dst": 1, "ref": "b", "kind": "wikilink"}],
+                "tags": [{"node": 0, "tag": "work"}],
+            });
+        }
+        (code, resp)
+    }));
+
+    assert_eq!(sync(&mut f, &server), 0);
+    assert!(
+        asked.lock().unwrap().iter().all(|a| *a),
+        "every request of a sync run asks — which page reaches head is not knowable in advance"
+    );
+
+    let control = ControlRoot::at(&f.project.control);
+    let st = control.load_state(WS).unwrap().unwrap();
+    let held = control
+        .load_graph(WS, st.epoch, st.cursor)
+        .expect("the graph is stored against the head page's own position");
+    assert_eq!(held.graph.nodes.len(), 2);
+
+    // …and `read` answers from it.
+    let out = docli_cli::read_cmd::resolve(
+        &f.project,
+        &docli_cli::read_cmd::ReadArgs {
+            path: Some("a.md".into()),
+            id: None,
+            mount: None,
+            lines: None,
+            json: false,
+        },
+        unix_now(),
+    );
+    let docli_cli::read_cmd::Outcome::Served(s) = out else {
+        panic!("expected a served note");
+    };
+    let docli_cli::read_cmd::Envelope::Note(n) = &s.envelope else {
+        panic!("expected a note envelope");
+    };
+    assert_eq!(n.title.as_deref(), Some("Alpha"));
+    assert_eq!(n.links.as_ref().unwrap().len(), 1);
+    assert_eq!(n.tags.as_deref(), Some(&["work".to_string()][..]));
+    assert!(!n.absent.contains_key("links"), "{:?}", n.absent);
+
+    asked.lock().unwrap().clear();
+    assert_eq!(check(&mut f, &server), 0);
+    assert_eq!(
+        asked.lock().unwrap().as_slice(),
+        &[false],
+        "`--check` reads no graph, so it never pays for one"
+    );
+}
+
+/// A NEW CLI against an OLDER api: the request carries the flag, the server ignores it, and the
+/// client must say «this server serves no graph» rather than «no backlinks».
+#[test]
+fn a_server_that_serves_no_graph_degrades_to_a_named_absence() {
+    let mut f = fx();
+    let tree: Arc<Mutex<BTreeMap<u128, Value>>> = Arc::new(Mutex::new(BTreeMap::from([(
+        1,
+        wire_node(1, "file", "a.md", 1, Some("# a")),
+    )])));
+    let server = spawn_stub(tree_server(tree.clone()));
+    assert_eq!(sync(&mut f, &server), 0);
+
+    let control = ControlRoot::at(&f.project.control);
+    let st = control.load_state(WS).unwrap().unwrap();
+    assert!(st.graph_asked, "the run asked");
+    assert!(!control.graph_path(WS).exists(), "and got nothing to store");
+
+    let out = docli_cli::read_cmd::resolve(
+        &f.project,
+        &docli_cli::read_cmd::ReadArgs {
+            path: Some("a.md".into()),
+            id: None,
+            mount: None,
+            lines: None,
+            json: false,
+        },
+        unix_now(),
+    );
+    let docli_cli::read_cmd::Outcome::Served(s) = out else {
+        panic!("expected a served note");
+    };
+    let docli_cli::read_cmd::Envelope::Note(n) = &s.envelope else {
+        panic!("expected a note envelope");
+    };
+    assert!(n.backlinks.is_none(), "absent, never []");
+    assert!(
+        n.absent["backlinks"].contains("serves no note graph"),
+        "{:?}",
+        n.absent
+    );
+}
+
 #[test]
 fn check_exits_nonzero_when_behind() {
     let mut f = fx();

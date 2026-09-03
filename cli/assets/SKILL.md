@@ -36,9 +36,15 @@ server holds.
   answer about the mirror and never about the server: it may be outside the mount's folder scope,
   blocked from being written, or simply not synced yet. For a note, only a `docli search` that
   does not report an incomplete index establishes that it does not exist.
+- **`docli read` also answers the note's graph** — `links`, `backlinks`, `embeds`, `unresolved`,
+  `tags`, `title` and `aliases`, on the `--json` envelope, with a counts line on stderr in plain
+  mode. Every one of them is computed on the SERVER and delivered with the sync; the CLI resolves
+  no wikilinks of its own, so a link the server resolved is the link you get.
 - The envelope's `absent` map names every field the CLI could not fill and why. Fields it cannot
   answer are `null` and listed there — never an empty list, which would be indistinguishable from
-  a note that genuinely has none.
+  a note that genuinely has none. So `"backlinks": []` means nothing links here, while
+  `"backlinks": null` plus its `absent` entry means the CLI does not know — and that entry names
+  the fix, which is usually `docli sync`.
 - A refusal under `--json` is `{"error": {"code", "message"}}` on stdout, with the same exit code.
   `code` is `not_in_mirror` (exit 3), or `usage` / `unavailable` / `ambiguous` / `no_such_mount` /
   `ambiguous_mount` (exit 2) — a caller's mistake and a gap on our side are never the same code.
@@ -106,8 +112,9 @@ server holds.
 
 ## Files are metadata here, not bytes
 
-- `docli read` on a file prints its ID, MIME type, size, SHA-256 digest and a wikilink. The bytes
-  live on the server; `read_attachment` over the docli MCP connection fetches them.
+- `docli read` on a file prints its ID, MIME type, size, SHA-256 digest and a wikilink, plus the
+  notes that embed it (`embeddedIn`). The bytes live on the server; `read_attachment` over the
+  docli MCP connection fetches them.
 - `sha256 unknown` means the digest is genuinely unknown server-side — not zero, not empty.
   `wikilink not-expressible` means no correct wikilink exists for that path, so the `path` is the
   one to use. In `--json` both arrive as `null` with the reason named in `absent`.

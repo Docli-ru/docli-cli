@@ -412,13 +412,17 @@ fn render(s: &Status) {
         // Nothing is lost that the reader can act on: the cache is not theirs to manage, every
         // state below names its own remedy, and `docli doctor` still prints real paths because
         // reconciling the filesystem is its job.
+        // Only a BROKEN cache earns a row, and each of those names its own remedy. A healthy
+        // one had nothing to say that the green head line above had not already said.
         let cache_state = match (m.exists_on_disk, m.emptied) {
-            (false, _) => "not built yet - run docli sync",
-            (true, true) => "empty - docli sync --full rebuilds it",
-            (true, false) if !m.claimed => "not this mirror - run docli sync",
-            (true, false) => "in this machine's docli cache",
+            (false, _) => Some("not built yet - run docli sync"),
+            (true, true) => Some("empty - docli sync --full rebuilds it"),
+            (true, false) if !m.claimed => Some("not this mirror - run docli sync"),
+            (true, false) => None,
         };
-        ui::field("cache", cache_state, mw);
+        if let Some(cache_state) = cache_state {
+            ui::field("cache", cache_state, mw);
+        }
         if let Some(f) = &m.folder {
             ui::field("scope", f, mw);
         }
@@ -468,8 +472,7 @@ fn render(s: &Status) {
                 ));
             } else {
                 ui::ok(&format!(
-                    "{name}: hooks installed - writes into the mirror are refused (shell writes \
-                     are not covered)"
+                    "{name}: hooks installed - file edits in the mirror are refused"
                 ));
             }
         }

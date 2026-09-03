@@ -95,6 +95,16 @@ pub struct WsState {
     /// sync; `--check` and `CACHE_INCOMPLETE.docli` consult this set DIRECTLY.
     #[serde(default)]
     pub pending_removals: BTreeSet<String>,
+    /// Did the last completed sync ASK for the note graph (v0.29.1)? Paired with the presence of
+    /// the graph file, this is what separates the three answers `docli read` has to give:
+    ///
+    /// - file present and stamped for this `(epoch, cursor)` → the graph is HELD.
+    /// - no file, `graph_asked` → we asked and the server served none: an api too old to have one.
+    /// - no file, `!graph_asked` → we NEVER asked. `#[serde(default)]` makes this what a
+    ///   0.1.4-era state file says, which is the point: that mirror must get «run docli sync»,
+    ///   not «your server cannot serve one».
+    #[serde(default)]
+    pub graph_asked: bool,
 }
 
 /// How long a cursor may go without reaching head before the mirror stops being a projection of
@@ -119,6 +129,7 @@ impl WsState {
             ledger: BTreeSet::new(),
             parks: BTreeMap::new(),
             pending_removals: BTreeSet::new(),
+            graph_asked: false,
         }
     }
 
@@ -233,6 +244,22 @@ impl WsState {
     }
 }
 
+/// The note graph as CACHED (v0.29.1 D4), stamped with the position of the head-reaching page it
+/// rode in on.
+///
+/// The stamp is the whole safety story. The graph has no freshness lifecycle of its own: it is
+/// served only when `(epoch, cursor)` byte-equals the state's, so a state that moved on — one more
+/// page, a new epoch, a from-zero — silently retires the cache instead of pairing a current mirror
+/// with a stale graph. That is why the file is separate from the state rather than inside it: the
+/// state is read by `search` and `status` on every invocation, and a multi-megabyte graph has no
+/// business in that path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphCache {
+    pub epoch: i64,
+    pub cursor: WireCursor,
+    pub graph: docli_sync_wire::WireGraph,
+}
+
 /// The control root: `.docli/` next to `docli.toml`. Holds `state/<ws>.json`, `markers/`, and
 /// gets the same containment discipline as the mount (D2 — two validated roots, not one).
 pub struct ControlRoot {
@@ -265,6 +292,57 @@ impl ControlRoot {
 
     pub fn markers_dir(&self) -> PathBuf {
         self.dir.join("markers")
+    }
+
+    pub fn graph_path(&self, ws: Uuid) -> PathBuf {
+        self.dir.join("state").join(format!("{ws}.graph.json"))
+    }
+
+    /// The cached graph for `ws`, or `None` when there is none, it cannot be read, or its stamp
+    /// does not match `(epoch, cursor)`.
+    ///
+    /// An unreadable or unparseable file is `None`, NOT an error: this is a derived cache whose
+    /// only remedy is the next sync, and failing a `docli read` over it would turn a cache miss
+    /// into an outage. `read` reports «not held» either way, which is true either way.
+    pub fn load_graph(&self, ws: Uuid, epoch: i64, cursor: WireCursor) -> Option<GraphCache> {
+        let raw = fs::read_to_string(self.graph_path(ws)).ok()?;
+        let c: GraphCache = serde_json::from_str(&raw).ok()?;
+        (c.epoch == epoch && c.cursor == cursor).then_some(c)
+    }
+
+    /// Persist the graph against the position of the page that carried it (tmp + rename, like
+    /// the state itself).
+    pub fn save_graph(
+        &self,
+        ws: Uuid,
+        epoch: i64,
+        cursor: WireCursor,
+        graph: &docli_sync_wire::WireGraph,
+    ) -> Result<()> {
+        let p = self.graph_path(ws);
+        fs::create_dir_all(p.parent().expect("state dir")).context("creating .docli/state")?;
+        let tmp = p.with_extension("json.tmp");
+        let cache = GraphCache {
+            epoch,
+            cursor,
+            graph: graph.clone(),
+        };
+        // Compact, not pretty: nothing reads this by eye, and pretty-printing a 10 000-node
+        // graph roughly doubles it on disk.
+        fs::write(&tmp, serde_json::to_vec(&cache)?)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        fs::rename(&tmp, &p).with_context(|| format!("committing {}", p.display()))?;
+        Ok(())
+    }
+
+    /// Drop the cache — the server served no graph, so keeping the previous one would pair a
+    /// current mirror with whatever the last graph-serving api happened to say.
+    pub fn clear_graph(&self, ws: Uuid) -> Result<()> {
+        match fs::remove_file(self.graph_path(ws)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(anyhow::Error::new(e).context("removing the cached note graph")),
+        }
     }
 
     pub fn load_state(&self, ws: Uuid) -> Result<Option<WsState>> {

@@ -11,6 +11,7 @@ pub mod apply;
 pub mod config;
 pub mod creds;
 pub mod doctor;
+pub mod graph;
 pub mod guard;
 pub mod hooks;
 pub mod http;

@@ -57,15 +57,39 @@ pub const EXIT_NOT_IN_MIRROR: i32 = 3;
 /// statement about whether the note exists). [`Miss::code`] is what separates the two.
 const EXIT_FAILED: i32 = 2;
 
-/// What Half 1 can say about the graph fields. Two constraints shape the wording.
+/// The three reasons the graph can be missing, each with the remedy that actually applies.
 ///
-/// It names NO command on purpose (D8): during Half 1 no api serves a graph, so «run `docli sync`»
-/// would be an instruction that cannot succeed. And it is SHORT, because it is repeated once per
-/// graph field in a machine surface an agent pays tokens to read — the full argument for why an
-/// empty list would be worse lives in `SKILL.md` and in this module's own header. What has to
-/// survive the compression is the distinction itself: **not held is not empty.**
-const GRAPH_ABSENT: &str = "not held - this build carries no note graph, so absence here is not \
-                            emptiness";
+/// Half 1 had one string and named no command, because no api served a graph and an instruction
+/// that cannot succeed is worse than silence. Half 2 makes the cause knowable, so the sentences
+/// split — and the split is the whole point of `WsState::graph_asked` existing. What survives in
+/// all three is the distinction itself: **not held is not empty.**
+const GRAPH_NOT_SYNCED: &str = "not held - this mirror was last synced before the note graph \
+                                existed, so absence here is not emptiness; `docli sync` fetches \
+                                it";
+
+const GRAPH_NOT_SERVED: &str = "not held - this workspace's server serves no note graph, so \
+                                absence here is not emptiness; `read_note` over the docli MCP \
+                                connection answers graph questions directly";
+
+const GRAPH_STALE: &str = "not held - the cached graph belongs to an earlier sync of this mirror, \
+                           so absence here is not emptiness; `docli sync` refreshes it";
+
+/// The graph is workspace-wide while a mount can be a folder of it, so a held graph names paths
+/// this mirror does not hold. A constant so the whitespace check below can reach it.
+const SCOPE_DISCLOSURE: &str = "this mount is scoped to a folder while the note graph covers the \
+                                whole workspace, so a linked path may not be mirrored here - \
+                                `read` exits 3 on those, which says nothing about whether they \
+                                exist";
+
+/// A rebuild is in flight, so the mirror's bytes and its stored graph describe different moments —
+/// the one case where a MATCHING stamp still must not be served.
+const GRAPH_REBUILDING: &str = "not held - a full rebuild of this mirror is pending, so a stored \
+                                graph would not describe the notes now on disk; `docli sync` \
+                                completes it";
+
+/// A note that simply declares no `title:`. The graph IS held, so this is knowledge, not a gap —
+/// but the field still renders `null`, and the envelope's invariant is that every null says why.
+const NO_TITLE: &str = "the note declares no `title:` of its own - `name` is its filename";
 
 const FRONTMATTER_ABSENT: &str =
     "not parsed by the CLI - if the note has a raw YAML block, a whole-note read carries it \
@@ -166,6 +190,9 @@ pub struct FileEnvelope {
     pub bytes: Option<u64>,
     pub sha256: Option<String>,
     pub wikilink: Option<String>,
+    /// The live notes that embed this file (`db::link::attachment_embedders`) — the fifth
+    /// predicate, and the only one whose subject is a file.
+    pub embedded_in: Option<Vec<serde_json::Value>>,
     /// Always `null`: the bytes are on the server.
     pub content: Option<String>,
     /// The marker file itself, verbatim — nothing the sidecar carries is lost to our parse.
@@ -203,6 +230,9 @@ pub struct Served {
     pub envelope: Envelope,
     /// What goes to stdout in human mode, exactly.
     pub body: String,
+    /// One optional STDERR line beside the disclosures — the graph, summarized. Never stdout:
+    /// stdout is the note, byte for byte.
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -396,6 +426,53 @@ struct Loaded {
     /// `WsState::unusable_reason` — the shared readiness predicate `search` asks. `Some` does
     /// NOT stop the read (D8: serve and disclose); it becomes a disclosure.
     unusable: Option<&'static str>,
+    /// The note graph for this workspace, or the reason there is none (v0.29.1 Half 2).
+    graph: GraphSlot,
+    /// Does this mount carry a folder scope? The graph is WORKSPACE-wide by design, so under a
+    /// scope it names notes this mirror does not hold — which `read` has to disclose rather than
+    /// let the reader discover through an exit 3.
+    scoped: bool,
+}
+
+/// Held, or absent with a sentence. There is deliberately no third state: a graph we cannot read
+/// and a graph nobody fetched are both «not held», and the sentence is the only thing that
+/// differs.
+enum GraphSlot {
+    Held(Box<crate::graph::Graph>),
+    Absent(&'static str),
+}
+
+/// Resolve the graph for a workspace against the state the mirror is currently at.
+///
+/// The stamp does the work: `load_graph` returns the cache only when its `(epoch, cursor)`
+/// byte-equals the state's, so a mirror that moved on gets `GRAPH_STALE` rather than a graph
+/// describing an earlier shape of itself. The file's mere PRESENCE is what tells a stale cache
+/// apart from no cache — which is why this reads `graph_path` after the miss instead of treating
+/// every miss the same.
+///
+/// The stamp is not sufficient on its own, though, and `from_zero` is the reason. A pending
+/// rebuild leaves `state.cursor` at its last durable value while `apply_page` rewrites the mirror
+/// toward head — so the stamp keeps MATCHING while the bytes on disk stop being the ones the
+/// graph describes. `read` would then pair new content with an old graph and answer
+/// `backlinks: []` over a link the rebuild had already delivered. That is a false negative in a
+/// relational claim, which is the one failure mode D5 exists to forbid, so it outranks the
+/// disclose-don't-refuse rule: a `mirror_not_usable` disclosure fires here too, but a caveat
+/// beside a confidently wrong list is not the same as not answering.
+fn graph_slot(control: &ControlRoot, ws: Uuid, st: &WsState) -> GraphSlot {
+    if st.from_zero {
+        return GraphSlot::Absent(GRAPH_REBUILDING);
+    }
+    if let Some(c) = control.load_graph(ws, st.epoch, st.cursor) {
+        return GraphSlot::Held(Box::new(crate::graph::Graph::new(c.graph)));
+    }
+    if control.graph_path(ws).exists() {
+        return GraphSlot::Absent(GRAPH_STALE);
+    }
+    GraphSlot::Absent(if st.graph_asked {
+        GRAPH_NOT_SERVED
+    } else {
+        GRAPH_NOT_SYNCED
+    })
 }
 
 pub fn resolve(project: &Project, args: &ReadArgs, now: i64) -> Outcome {
@@ -711,6 +788,8 @@ fn probe(
         node: node.clone(),
         bytes,
         unusable: st.unusable_reason(mount.folder.as_deref(), now),
+        graph: graph_slot(control, mount.workspace, &st),
+        scoped: mount.folder.is_some(),
     }))
 }
 
@@ -815,6 +894,18 @@ fn serve(mut l: Loaded, args: &ReadArgs) -> Result<Served, Refusal> {
                 .into(),
         });
     }
+    // The graph covers the whole workspace while this mount may be a folder of it — deliberately,
+    // since an edge's other endpoint is routinely outside the scope and a clipped graph would
+    // report a note as unlinked because the mount is narrow. Stated ONCE here, at the level of
+    // the whole answer: per-reference annotation would mean a state lookup per edge, and the
+    // reader's actual next step is already unambiguous (`docli read` on such a path exits 3,
+    // which is a fact about this mirror and never about the server).
+    if l.scoped && matches!(l.graph, GraphSlot::Held(_)) {
+        disclosures.push(Disclosure {
+            code: "graph_wider_than_mount",
+            message: SCOPE_DISCLOSURE.into(),
+        });
+    }
     if let Some(reason) = l.unusable {
         disclosures.push(Disclosure {
             code: "mirror_not_usable",
@@ -878,19 +969,47 @@ fn serve_note(
         exit: EXIT_FAILED,
     })?;
     let mut absent = BTreeMap::new();
-    for f in [
-        "title",
-        "aliases",
-        "links",
-        "unresolved",
-        "embeds",
-        "backlinks",
-        "tags",
-    ] {
-        absent.insert(f.to_string(), GRAPH_ABSENT.to_string());
+    // The graph fields are filled TOGETHER or absent together. They come from one snapshot, so a
+    // half-filled envelope would be a set of answers about different moments.
+    let mut g = GraphFields::default();
+    match &l.graph {
+        GraphSlot::Held(graph) => {
+            g.title = graph.node(l.id).and_then(|n| n.title.clone());
+            if g.title.is_none() {
+                absent.insert("title".into(), NO_TITLE.into());
+            }
+            g.aliases = Some(
+                graph
+                    .node(l.id)
+                    .map(|n| n.aliases.clone())
+                    .unwrap_or_default(),
+            );
+            g.links = Some(json_list(graph.forward_links(l.id)));
+            g.backlinks = Some(json_list(graph.backlinks(l.id)));
+            g.embeds = Some(json_list(graph.attachment_embeds(l.id)));
+            g.unresolved = Some(graph.unresolved_refs(l.id));
+            g.tags = Some(graph.tags(l.id));
+        }
+        GraphSlot::Absent(why) => {
+            for f in [
+                "title",
+                "aliases",
+                "links",
+                "unresolved",
+                "embeds",
+                "backlinks",
+                "tags",
+            ] {
+                absent.insert(f.to_string(), (*why).to_string());
+            }
+        }
     }
     absent.insert("frontmatter".into(), FRONTMATTER_ABSENT.into());
     absent.insert("relatedHint".into(), RELATED_ABSENT.into());
+    // The human surface keeps stdout EXACTLY the note (`docli read a.md > a.md` must round-trip),
+    // so the graph goes to stderr as one line beside the disclosures — visible without being in
+    // the product. Under `--json` it is the envelope that carries it.
+    let summary = g.summary();
     Ok(Served {
         envelope: Envelope::Note(NoteEnvelope {
             kind: "note",
@@ -901,20 +1020,65 @@ fn serve_note(
             workspace: l.workspace,
             content: Some(body.clone()),
             lines,
-            title: None,
-            aliases: None,
-            links: None,
-            unresolved: None,
-            embeds: None,
-            backlinks: None,
-            tags: None,
+            title: g.title,
+            aliases: g.aliases,
+            links: g.links,
+            unresolved: g.unresolved,
+            embeds: g.embeds,
+            backlinks: g.backlinks,
+            tags: g.tags,
             frontmatter: None,
             related_hint: None,
             absent,
             disclosures,
         }),
         body,
+        note: summary,
     })
+}
+
+/// The note arm's graph fields, gathered before the envelope so the stderr summary and the JSON
+/// can be built from one value.
+#[derive(Default)]
+struct GraphFields {
+    title: Option<String>,
+    aliases: Option<Vec<String>>,
+    links: Option<Vec<serde_json::Value>>,
+    backlinks: Option<Vec<serde_json::Value>>,
+    embeds: Option<Vec<serde_json::Value>>,
+    unresolved: Option<Vec<String>>,
+    tags: Option<Vec<String>>,
+}
+
+impl GraphFields {
+    /// One stderr line, or nothing when the graph is not held (the absence already has a
+    /// disclosure; repeating it as a counts line would say it twice).
+    fn summary(&self) -> Option<String> {
+        let links = self.links.as_ref()?.len();
+        let backlinks = self.backlinks.as_ref()?.len();
+        let embeds = self.embeds.as_ref()?.len();
+        let unresolved = self.unresolved.as_ref()?.len();
+        let mut parts = vec![
+            format!("links {links}"),
+            format!("backlinks {backlinks}"),
+            format!("files {embeds}"),
+        ];
+        if unresolved > 0 {
+            parts.push(format!("unresolved {unresolved}"));
+        }
+        if let Some(tags) = &self.tags {
+            if !tags.is_empty() {
+                parts.push(format!("tags {}", tags.join(", ")));
+            }
+        }
+        Some(parts.join(" · "))
+    }
+}
+
+fn json_list<T: serde::Serialize>(v: Vec<T>) -> Vec<serde_json::Value> {
+    v.into_iter()
+        .map(|x| serde_json::to_value(x).expect("a graph ref serializes"))
+        .collect()
 }
 
 fn serve_attachment(
@@ -969,6 +1133,20 @@ fn serve_attachment(
             None
         }
     };
+    // The fifth predicate, whose subject is a file: which live notes embed it.
+    let embedded_in = match &l.graph {
+        GraphSlot::Held(graph) => Some(json_list(graph.attachment_embedders(l.id))),
+        GraphSlot::Absent(why) => {
+            absent.insert("embeddedIn".into(), (*why).to_string());
+            None
+        }
+    };
+    let note = embedded_in.as_ref().map(|v| {
+        format!(
+            "embedded in {}",
+            crate::ui::plural(v.len(), "note", "notes")
+        )
+    });
     Served {
         envelope: Envelope::File(FileEnvelope {
             kind: "attachment",
@@ -981,12 +1159,14 @@ fn serve_attachment(
             bytes,
             sha256,
             wikilink,
+            embedded_in,
             content: None,
             marker: marker.clone(),
             absent,
             disclosures,
         }),
         body: marker,
+        note,
     }
 }
 
@@ -1150,6 +1330,9 @@ fn render(outcome: Outcome, json: bool) -> i32 {
             // surface a machine reads.
             for d in s.envelope.disclosures() {
                 crate::ui::warn(&d.message);
+            }
+            if let Some(n) = &s.note {
+                crate::ui::detail(n);
             }
             let written = if json {
                 match serde_json::to_string_pretty(&s.envelope) {
@@ -2018,16 +2201,293 @@ mod tests {
             assert!(obj[k].is_null(), "`{k}` must be null, never []: {value:#}");
             assert!(absent.contains_key(k), "`{k}` must be named absent");
         }
-        // Half 1 names no remedy for the graph: no api serves one yet.
+        // A mirror synced before the graph existed gets the remedy that WILL work — which is
+        // what Half 2 changed: in Half 1 no api served a graph, so naming `docli sync` would
+        // have been an instruction that could not succeed.
         assert!(
-            !absent["backlinks"].as_str().unwrap().contains("docli sync"),
-            "the Half-1 graph absence must name no command that cannot succeed"
+            absent["backlinks"].as_str().unwrap().contains("docli sync"),
+            "a never-asked mirror must name the sync that would fetch a graph: {value:#}"
         );
         // `frontmatter` and `relatedHint` are DECLARED absent, never silently missing (D2).
         for k in ["frontmatter", "relatedHint"] {
             assert!(obj.contains_key(k), "`{k}` must be present as a key");
             assert!(absent.contains_key(k), "`{k}` must be named absent");
         }
+    }
+
+    /// Seed a graph cache for `ws`, stamped at whatever position its state currently holds — the
+    /// only stamp `graph_slot` will accept.
+    fn put_graph(f: &Fx, ws: u128, graph: docli_sync_wire::WireGraph) {
+        let ws = Uuid::from_u128(ws);
+        let control = ControlRoot::new(&f.project.root);
+        let st = control.load_state(ws).unwrap().unwrap();
+        control.save_graph(ws, st.epoch, st.cursor, &graph).unwrap();
+    }
+
+    fn gnode(id: u128, kind: &str, path: &str, title: Option<&str>) -> docli_sync_wire::GraphNode {
+        docli_sync_wire::GraphNode {
+            id: Uuid::from_u128(id),
+            kind: kind.into(),
+            name: path.rsplit('/').next().unwrap().into(),
+            path: path.into(),
+            title: title.map(Into::into),
+            aliases: vec![],
+            mime: (kind == "attachment").then(|| "image/png".to_string()),
+            content_bytes: 4,
+            trashed: false,
+        }
+    }
+
+    /// The Half-2 payoff: with the graph held, the five predicates render as REAL answers — and
+    /// an empty one renders as `[]`, which is now a statement rather than a silence.
+    #[test]
+    fn a_held_graph_fills_the_envelope_and_empty_means_empty() {
+        let f = fx(&[("mirror", 1, None)]);
+        put_note(&f, "mirror", 1, 9, "a.md", "x\n");
+        put_note(&f, "mirror", 1, 10, "b.md", "y\n");
+        put_graph(
+            &f,
+            1,
+            docli_sync_wire::WireGraph {
+                nodes: vec![
+                    gnode(9, "file", "a.md", Some("Alpha")),
+                    gnode(10, "file", "b.md", None),
+                    gnode(11, "attachment", "p.png", None),
+                ],
+                edges: vec![
+                    docli_sync_wire::GraphEdge {
+                        src: 0,
+                        dst: Some(1),
+                        att: None,
+                        dst_ref: "b".into(),
+                        kind: "wikilink".into(),
+                        anchor: None,
+                    },
+                    docli_sync_wire::GraphEdge {
+                        src: 0,
+                        dst: None,
+                        att: Some(2),
+                        dst_ref: "p.png".into(),
+                        kind: "embed".into(),
+                        anchor: None,
+                    },
+                    docli_sync_wire::GraphEdge {
+                        src: 0,
+                        dst: None,
+                        att: None,
+                        dst_ref: "nowhere".into(),
+                        kind: "wikilink".into(),
+                        anchor: None,
+                    },
+                ],
+                tags: vec![docli_sync_wire::GraphTag {
+                    node: 0,
+                    tag: "work".into(),
+                }],
+            },
+        );
+
+        let s = served(resolve(&f.project, &args("a.md"), 100));
+        let n = note(&s.envelope);
+        assert_eq!(n.title.as_deref(), Some("Alpha"));
+        assert_eq!(n.links.as_ref().unwrap().len(), 1);
+        assert_eq!(n.embeds.as_ref().unwrap().len(), 1);
+        assert_eq!(n.unresolved.as_deref(), Some(&["nowhere".to_string()][..]));
+        assert_eq!(n.tags.as_deref(), Some(&["work".to_string()][..]));
+        // Nothing links TO a.md — and that is now `[]` with no `absent` entry, which is the
+        // whole difference between Half 1 and Half 2.
+        assert_eq!(n.backlinks.as_ref().unwrap().len(), 0);
+        assert!(!n.absent.contains_key("backlinks"), "{:?}", n.absent);
+        // The counts ride stderr, never stdout: stdout is the note.
+        assert_eq!(s.body, "x\n");
+        assert!(s.note.as_deref().unwrap().contains("backlinks 0"));
+        assert!(s.note.as_deref().unwrap().contains("tags work"));
+
+        // b.md declares no title — knowledge, not a gap, but still a null, so it still says why.
+        let s = served(resolve(&f.project, &args("b.md"), 100));
+        let n = note(&s.envelope);
+        assert!(n.title.is_none());
+        assert!(n.absent["title"].contains("declares no"), "{:?}", n.absent);
+        assert_eq!(n.backlinks.as_ref().unwrap().len(), 1);
+        assert_absent_is_total(&s.envelope);
+    }
+
+    /// The graph is workspace-wide and a mount can be a folder of it, so a held graph over a
+    /// scoped mount names paths this mirror does not hold. Disclosed, not discovered.
+    #[test]
+    fn a_scoped_mount_discloses_that_the_graph_is_wider_than_it_is() {
+        let mut f = fx(&[("mirror", 1, None)]);
+        put_note(&f, "mirror", 1, 9, "docs/a.md", "x\n");
+        put_graph(&f, 1, docli_sync_wire::WireGraph::default());
+        // Unscoped: no such caveat — the graph and the mount cover the same ground.
+        let s = served(resolve(&f.project, &args("docs/a.md"), 100));
+        assert!(!s
+            .envelope
+            .disclosures()
+            .iter()
+            .any(|d| d.code == "graph_wider_than_mount"));
+
+        f.project.config.mounts[0].folder = Some("docs".into());
+        let s = served(resolve(&f.project, &args("docs/a.md"), 100));
+        assert!(
+            s.envelope
+                .disclosures()
+                .iter()
+                .any(|d| d.code == "graph_wider_than_mount"),
+            "{:?}",
+            s.envelope.disclosures()
+        );
+    }
+
+    /// The three absences are three different sentences, and picking the wrong one sends the
+    /// reader to a command that cannot help.
+    #[test]
+    fn the_three_graph_absences_are_told_apart() {
+        // 1. Never asked — a mirror synced by a pre-graph CLI. `docli sync` is the fix.
+        let f = fx(&[("mirror", 1, None)]);
+        put_note(&f, "mirror", 1, 9, "a.md", "x\n");
+        let s = served(resolve(&f.project, &args("a.md"), 100));
+        let n = note(&s.envelope);
+        assert!(n.absent["links"].contains("before the note graph existed"));
+
+        // 2. Asked and got none — the server predates the payload. Sending the reader to `docli
+        // sync` here would loop them forever, so the sentence names the MCP connection instead.
+        let control = ControlRoot::new(&f.project.root);
+        let ws = Uuid::from_u128(1);
+        let mut st = control.load_state(ws).unwrap().unwrap();
+        st.graph_asked = true;
+        control.save_state(ws, &st).unwrap();
+        let s = served(resolve(&f.project, &args("a.md"), 100));
+        let n = note(&s.envelope);
+        assert!(
+            n.absent["links"].contains("serves no note graph"),
+            "{:?}",
+            n.absent
+        );
+
+        // 3. Held but STALE — the cache exists and its stamp does not match. It must never be
+        // served: a graph describing an earlier shape of this mirror is exactly the pairing the
+        // stamp exists to refuse.
+        put_graph(&f, 1, docli_sync_wire::WireGraph::default());
+        let mut st = control.load_state(ws).unwrap().unwrap();
+        st.cursor.rev += 1;
+        control.save_state(ws, &st).unwrap();
+        let s = served(resolve(&f.project, &args("a.md"), 100));
+        let n = note(&s.envelope);
+        assert!(n.links.is_none());
+        assert!(n.absent["links"].contains("earlier sync"), "{:?}", n.absent);
+    }
+
+    /// A pending from-zero rebuild leaves the cursor put while the mirror is rewritten under it,
+    /// so a MATCHING stamp is not enough — the graph must stand down until the rebuild lands.
+    #[test]
+    fn a_pending_rebuild_withholds_the_graph_even_though_the_stamp_matches() {
+        let f = fx(&[("mirror", 1, None)]);
+        put_note(&f, "mirror", 1, 9, "a.md", "x\n");
+        put_graph(&f, 1, docli_sync_wire::WireGraph::default());
+        // Held, to prove the stamp is good before the rebuild flag is what changes the answer.
+        let s = served(resolve(&f.project, &args("a.md"), 100));
+        assert!(note(&s.envelope).backlinks.is_some());
+
+        let control = ControlRoot::new(&f.project.root);
+        let ws = Uuid::from_u128(1);
+        let mut st = control.load_state(ws).unwrap().unwrap();
+        st.from_zero = true;
+        control.save_state(ws, &st).unwrap();
+        assert!(
+            control.load_graph(ws, st.epoch, st.cursor).is_some(),
+            "the cache is still stamped for this position - the flag is doing the work"
+        );
+
+        let s = served(resolve(&f.project, &args("a.md"), 100));
+        let n = note(&s.envelope);
+        assert!(n.backlinks.is_none(), "absent, never an empty list");
+        assert!(
+            n.absent["backlinks"].contains("full rebuild"),
+            "{:?}",
+            n.absent
+        );
+    }
+
+    /// Every sentence `read` puts in front of a reader is checked for the collapsed
+    /// string-continuation defect — a Rust `\`-continued literal whose backslash was eaten before
+    /// it reached the file leaves a run of alignment spaces mid-sentence. One shipped that way in
+    /// this slice, and no test noticed, because the disclosure tests all match on `code`.
+    #[test]
+    fn no_reader_facing_sentence_carries_collapsed_whitespace() {
+        let f = fx(&[("mirror", 1, None)]);
+        put_note(&f, "mirror", 1, 9, "a.md", "x\n");
+        put_graph(&f, 1, docli_sync_wire::WireGraph::default());
+        let s = served(resolve(&f.project, &args("a.md"), 100));
+        let v = assert_absent_is_total(&s.envelope);
+        let mut sentences: Vec<String> = Vec::new();
+        for (_, m) in v["absent"].as_object().unwrap() {
+            sentences.push(m.as_str().unwrap().to_string());
+        }
+        for d in s.envelope.disclosures() {
+            sentences.push(d.message.clone());
+        }
+        // …plus the constants a served envelope cannot show all of at once.
+        for c in [
+            GRAPH_NOT_SYNCED,
+            GRAPH_NOT_SERVED,
+            GRAPH_STALE,
+            GRAPH_REBUILDING,
+            NO_TITLE,
+            FRONTMATTER_ABSENT,
+            RELATED_ABSENT,
+            ATTACHMENT_BYTES_ABSENT,
+            SCOPE_DISCLOSURE,
+        ] {
+            sentences.push(c.to_string());
+        }
+        for m in sentences {
+            assert!(
+                !m.contains("   "),
+                "a collapsed line continuation left a gap in: {m:?}"
+            );
+        }
+    }
+
+    /// The fifth predicate's own surface: a file says which notes embed it.
+    #[test]
+    fn a_file_reports_the_notes_that_embed_it() {
+        let f = fx(&[("mirror", 1, None)]);
+        put_note(&f, "mirror", 1, 9, "a.md", "x\n");
+        put_file(
+            &f,
+            "mirror",
+            1,
+            11,
+            "p.png",
+            "p.png",
+            "id 00000000-0000-0000-0000-00000000000b\nmime image/png\nsize 4\n",
+            TrackedKind::Attachment,
+            Some("p.png.docli"),
+        );
+        put_graph(
+            &f,
+            1,
+            docli_sync_wire::WireGraph {
+                nodes: vec![
+                    gnode(9, "file", "a.md", None),
+                    gnode(11, "attachment", "p.png", None),
+                ],
+                edges: vec![docli_sync_wire::GraphEdge {
+                    src: 0,
+                    dst: None,
+                    att: Some(1),
+                    dst_ref: "p.png".into(),
+                    kind: "embed".into(),
+                    anchor: None,
+                }],
+                tags: vec![],
+            },
+        );
+        let s = served(resolve(&f.project, &args("p.png"), 100));
+        let v = assert_absent_is_total(&s.envelope);
+        assert_eq!(v["embeddedIn"][0]["path"], "a.md");
+        assert!(s.note.as_deref().unwrap().contains("embedded in 1 note"));
     }
 
     #[test]
