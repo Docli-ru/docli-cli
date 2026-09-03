@@ -90,7 +90,6 @@ impl CredsStore {
 
     pub fn open(dir: PathBuf) -> Result<Self> {
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        restrict_dir(&dir)?;
         let store = CredsStore { dir };
         // Re-harden an EXISTING credentials file before anything reads it (Codex rounds
         // 20–21): a file carrying a broad ACE/mode from outside our writes would otherwise
@@ -114,11 +113,37 @@ impl CredsStore {
             ),
             Err(_) => return Ok(store),
         }
-        let lock = OpenOptions::new()
+        // Everything from here on is HARDENING, and hardening has to WRITE. A coding agent's
+        // sandbox routinely leaves $HOME read-only while the workspace stays writable — Codex's
+        // `workspace-write` does exactly that — and treating a write refusal as a failure took
+        // out every verb that merely READS. Measured on the v0.29.1 live-agent gate: `search`,
+        // `list` and `status` all exited «Operation not permitted» inside the sandbox while
+        // `docli read`, which never opens this store, worked fine. An agent that cannot search
+        // cannot establish absence, which is the one thing the contract promises.
+        //
+        // So a write refusal degrades to OBSERVING what we cannot fix. The property being
+        // protected was never «rewrite the file» — it is «never read a credentials file carrying
+        // a broad mode», and that question can be answered with a stat.
+        if let Err(e) = restrict_dir(&store.dir) {
+            return store.finish_unwritable(e);
+        }
+        let lock = match OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
-            .open(store.lock_path())?;
+            .open(store.lock_path())
+        {
+            Ok(l) => l,
+            Err(e) if is_write_refusal(&e) => {
+                return store.finish_unwritable(anyhow::Error::new(e))
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "opening {} to verify the credential file's permissions",
+                    store.lock_path().display()
+                )))
+            }
+        };
         // TRY, don't wait, for the REWRITE half only. Re-hardening is best-effort maintenance,
         // while the holder of this lock may be a concurrent refresh sleeping out a
         // `503 Retry-After` — up to six minutes. Blocking here made merely OPENING the store
@@ -162,6 +187,41 @@ impl CredsStore {
         let _ = lock.unlock();
         rehard?;
         Ok(store)
+    }
+
+    /// The read-only-home path: we cannot re-harden, so CHECK instead of fix.
+    ///
+    /// Fails closed if the mode really is broad. A sandboxed agent cannot repair that, but
+    /// silently reading a world-readable refresh token is the worse of the two answers — and the
+    /// message names the fix, which the human running outside the sandbox can apply.
+    ///
+    /// A non-write error is re-raised untouched: «we could not tell» has never been a reason to
+    /// carry on here.
+    fn finish_unwritable(self, cause: anyhow::Error) -> Result<Self> {
+        if !cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(is_write_refusal)
+        {
+            return Err(cause);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::symlink_metadata(self.file_path())
+                .with_context(|| format!("stat {}", self.file_path().display()))?
+                .permissions()
+                .mode()
+                & 0o777;
+            if mode & 0o077 != 0 {
+                bail!(
+                    "{} is mode {mode:o} and {} is not writable, so it cannot be re-secured - \
+                     tighten it with `chmod 600`, or run this where the home directory is writable",
+                    self.file_path().display(),
+                    self.dir.display()
+                );
+            }
+        }
+        Ok(self)
     }
 
     fn file_path(&self) -> PathBuf {
@@ -531,6 +591,17 @@ fn restrict_dir(p: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Did the filesystem refuse us WRITE access, as opposed to failing for some other reason?
+///
+/// The distinction is the whole of the read-only-home arm: «not allowed to write here» is an
+/// ordinary, expected condition inside an agent sandbox and must not take out the read paths,
+/// while every other error still means we could not tell and must stop.
+fn is_write_refusal(e: &std::io::Error) -> bool {
+    // EPERM and EACCES both arrive as `PermissionDenied`. EROFS does not: older Rust maps it to
+    // `Uncategorized`, so it is matched by its raw code — 30 on both macOS and Linux.
+    e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(30)
+}
+
 /// Owner-only DACL via `icacls` with the OWNER_RIGHTS SID (`*S-1-3-4`) — locale-independent
 /// (no `%USERNAME%` parsing), the same effect as gh's config-file fallback hardened: strip
 /// inheritance, grant only the object owner.
@@ -587,6 +658,74 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let s = CredsStore::open(tmp.path().join("home")).unwrap();
         (tmp, s)
+    }
+
+    /// The v0.29.1 live-agent gate's finding, pinned at the DECISION rather than by faking a
+    /// sandbox: inside Codex's `workspace-write` the home is refused at the syscall level, which
+    /// mode bits cannot reproduce (chmod succeeds on a directory you own, and an existing file
+    /// stays writable in a mode-0500 parent). So the tests drive `finish_unwritable` with the
+    /// error the kernel actually returns.
+    ///
+    /// What it protects: `search`, `list` and `status` all exited «Operation not permitted»
+    /// inside the sandbox, while `docli read` — which never opens this store — worked. An agent
+    /// that cannot search cannot establish absence, which is the one thing the contract promises.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_refused_home_still_opens_when_the_credentials_are_already_tight() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, s) = store();
+        seed(&s, "https://docli.ru", i64::MAX / 2);
+        fs::set_permissions(s.file_path(), fs::Permissions::from_mode(0o600)).unwrap();
+
+        let refusal =
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let reopened = s
+            .finish_unwritable(refusal)
+            .expect("a home we cannot write must still open for reading");
+        assert!(reopened.get("https://docli.ru").unwrap().is_some());
+    }
+
+    /// …and the property the rewrite was protecting survives: a BROAD mode we cannot fix is
+    /// refused rather than read. Checking replaces fixing; it does not replace caring.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_refused_home_refuses_a_world_readable_credentials_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, s) = store();
+        seed(&s, "https://docli.ru", i64::MAX / 2);
+        fs::set_permissions(s.file_path(), fs::Permissions::from_mode(0o644)).unwrap();
+
+        let refusal =
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let msg = match s.finish_unwritable(refusal) {
+            Ok(_) => panic!("a broad mode must still be refused"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(msg.contains("644"), "{msg}");
+        assert!(
+            msg.contains("chmod 600"),
+            "the refusal must name the fix: {msg}"
+        );
+    }
+
+    /// A non-write error is re-raised untouched — «we could not tell» was never a reason to
+    /// carry on, and folding every failure into the tolerant arm is how a security check quietly
+    /// stops being one.
+    #[test]
+    fn a_non_write_error_is_not_treated_as_a_read_only_home() {
+        let (_tmp, s) = store();
+        let other = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::InvalidData));
+        assert!(s.finish_unwritable(other).is_err());
+    }
+
+    #[test]
+    fn write_refusals_are_told_apart_from_other_io_errors() {
+        use std::io::{Error, ErrorKind};
+        assert!(is_write_refusal(&Error::from(ErrorKind::PermissionDenied)));
+        // EROFS, which older Rust leaves `Uncategorized`.
+        assert!(is_write_refusal(&Error::from_raw_os_error(30)));
+        assert!(!is_write_refusal(&Error::from(ErrorKind::NotFound)));
+        assert!(!is_write_refusal(&Error::from(ErrorKind::InvalidData)));
     }
 
     fn seed(s: &CredsStore, server: &str, expires_at: i64) {
