@@ -543,6 +543,7 @@ mod tests {
             folder: None,
             name: Some("заметки".into()),
             derived_dir: false,
+            workspace_label: String::new(),
         };
         // A synced mount carries our MOUNT.docli — the round-17 identity anchor search
         // consults before rendering any local address.

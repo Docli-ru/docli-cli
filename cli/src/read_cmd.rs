@@ -1215,6 +1215,7 @@ mod tests {
                 folder: None,
                 name: name.map(str::to_string),
                 derived_dir: false,
+                workspace_label: String::new(),
             });
         }
         Fx {
@@ -2209,6 +2210,7 @@ mod tests {
             folder: None,
             name: Some(Uuid::from_u128(2).to_string()),
             derived_dir: false,
+            workspace_label: String::new(),
         };
         let other = Mount {
             workspace: Uuid::from_u128(2),
@@ -2216,6 +2218,7 @@ mod tests {
             folder: None,
             name: None,
             derived_dir: false,
+            workspace_label: String::new(),
         };
         let cfg = |mounts: Vec<Mount>| DocliToml {
             server: "https://docli.ru".into(),
@@ -2240,6 +2243,7 @@ mod tests {
             folder: None,
             name: None,
             derived_dir: false,
+            workspace_label: String::new(),
         };
         let e = crate::config::validate_config(&cfg(vec![by_dir, other.clone()]))
             .expect_err("a nameless mount collides through its directory");
@@ -2379,6 +2383,7 @@ mod tests {
             folder: None,
             name: Some(format!("  {}  ", Uuid::from_u128(2))),
             derived_dir: false,
+            workspace_label: String::new(),
         };
         let other = Mount {
             workspace: Uuid::from_u128(2),
@@ -2386,6 +2391,7 @@ mod tests {
             folder: None,
             name: None,
             derived_dir: false,
+            workspace_label: String::new(),
         };
         crate::config::validate_config(&DocliToml {
             server: "https://docli.ru".into(),
@@ -2455,6 +2461,7 @@ mod tests {
                 folder: None,
                 name: Some("   ".into()),
                 derived_dir: false,
+                workspace_label: String::new(),
             }],
             mcp_label: None,
         })

@@ -200,6 +200,7 @@ pub fn missing_ignores(project_root: &Path, dir: &str) -> Result<Vec<IgnoreFix>>
             folder: None,
             name: None,
             derived_dir: false,
+            workspace_label: String::new(),
         },
     );
     // PHYSICAL from the first step, like the geometry rules. With `/outside/link -> /repo/sub`
@@ -628,23 +629,18 @@ pub fn run(cwd: &Path, server_flag: Option<&str>) -> Result<i32> {
     // The DEFAULT is this machine's shared cache for that workspace. Accepting it must store
     // nothing: `docli.toml` is committed, and writing an absolute home path into it would make
     // the file wrong on every other machine.
-    let machine_default = machine_cache_dir(workspace.id);
+    // The default is EMPTY and described in words, not shown as a path. Two reasons: the
+    // absolute cache path is not something the reader acts on (they do not manage that
+    // directory), and printing it here is the most prominent place the CLI could hand an agent
+    // the mirror root — the leak the live-agent gate measured on `docli status`.
+    //
+    // An explicit path still works: type one and it wins, and it is written to `docli.toml`.
     let dir: String = Input::with_theme(&prompt_theme())
-        .with_prompt("Where to put the mirror")
-        .default(
-            current_dir
-                .clone()
-                .or_else(|| machine_default.clone())
-                .unwrap_or_else(|| default_dir(&workspace.handle)),
-        )
+        .with_prompt("Where to put the mirror (Enter for this machine's docli cache)")
+        .allow_empty(true)
+        .default(current_dir.clone().unwrap_or_default())
         .interact_text()?;
     let dir = dir.trim().trim_end_matches('/').to_string();
-    // Unchanged from the machine default ⇒ derived, so it is not written down.
-    let dir = if Some(dir.as_str()) == machine_default.as_deref() {
-        String::new()
-    } else {
-        dir
-    };
     // Prefilled with what this workspace is ALREADY scoped to, so Enter means «leave it» rather
     // than silently widening the mirror; clearing the field is then an explicit act, and the
     // flag path is told to clear (absent `--folder` means «leave alone» there).
@@ -686,17 +682,26 @@ pub fn run(cwd: &Path, server_flag: Option<&str>) -> Result<i32> {
         folder: folder.clone(),
         name: None,
         derived_dir: false,
+        workspace_label: String::new(),
     };
     match mounts.iter_mut().find(|m| m.workspace == workspace.id) {
         // The same upsert `init_cmd` performs — re-point, never add a second mount.
         Some(slot) => *slot = chosen,
         None => mounts.push(chosen),
     }
-    let probe = DocliToml {
+    let mut probe = DocliToml {
         server: server.clone(),
         mcp_label: existing.as_ref().and_then(|c| c.mcp_label.clone()),
         mounts,
     };
+    // An empty `dir` — pressing Enter at the directory step — is not yet a path, and every rule
+    // below asks about one. Resolving here is what `init`'s flag path already does; without it
+    // the wizard validated a mount whose dir was «», whose display name was therefore blank, and
+    // refused its own default answer.
+    if let Err(e) = config::resolve_mount_dirs(&mut probe) {
+        ui::refuse(&format!("{e:#}"));
+        return Ok(1);
+    }
     // The gitignore half is answered by step 6, so a missing entry must not fail the probe:
     // only the geometry rules (overlap, control plane, vault, containment) are checked here.
     if let Err(e) = config::validate_geometry_paths_only(cwd, &probe) {
@@ -1049,6 +1054,57 @@ mod tests {
         assert!(missing_ignores(tmp.path(), "docli-mirror/x")
             .unwrap()
             .is_empty());
+    }
+
+    /// Pressing Enter at the directory step leaves `dir` EMPTY, and the wizard then validated a
+    /// mount that had no path yet — whose `display_name()` was therefore blank, so it refused its
+    /// own default answer with «a mount has a blank display name». Reported from a live run.
+    ///
+    /// The probe must be resolved before it is validated, exactly as the flag path does.
+    #[test]
+    fn the_wizards_probe_resolves_an_empty_dir_before_it_is_validated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _lock = crate::creds::home_env_lock();
+        std::env::set_var("DOCLI_HOME", home.path().join(".docli"));
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                std::env::remove_var("DOCLI_HOME");
+            }
+        }
+        let _restore = Restore;
+
+        let mut probe = config::DocliToml {
+            server: "https://docli.ru".into(),
+            mcp_label: None,
+            mounts: vec![config::Mount {
+                workspace: uuid::Uuid::from_u128(9),
+                dir: String::new(), // ← what Enter produces
+                folder: None,
+                name: None,
+                derived_dir: false,
+                workspace_label: String::new(),
+            }],
+        };
+        // Unresolved, the mount has no name to print and geometry refuses it.
+        assert!(
+            config::validate_config(&probe).is_err(),
+            "an unresolved empty dir must not validate"
+        );
+        config::resolve_mount_dirs(&mut probe).unwrap();
+        config::validate_geometry_paths_only(tmp.path(), &probe)
+            .expect("the wizard's own default answer must validate");
+        // …and it is named by its workspace, never by the cache path.
+        let name = probe.mounts[0].display_name();
+        assert!(
+            name.contains(&uuid::Uuid::from_u128(9).to_string()),
+            "{name}"
+        );
+        assert!(
+            !name.contains(".docli"),
+            "the name must not be a path: {name}"
+        );
     }
 
     #[test]

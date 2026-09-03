@@ -1768,6 +1768,7 @@ mod tests {
             folder: None,
             name: None,
             derived_dir: false,
+            workspace_label: String::new(),
         };
         assert_eq!(
             skill_globs(root, &[m("notes"), m("docli-mirror/agitek")]),

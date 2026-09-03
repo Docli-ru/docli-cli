@@ -136,6 +136,7 @@ fn fx() -> Fx {
                 folder: None,
                 name: Some("тест".into()),
                 derived_dir: false,
+                workspace_label: String::new(),
             }],
             mcp_label: None,
         },
@@ -672,6 +673,7 @@ fn no_access_is_partial_success_not_an_abort() {
         folder: None,
         name: Some("чужое".into()),
         derived_dir: false,
+        workspace_label: String::new(),
     });
     let tree: Arc<Mutex<BTreeMap<u128, Value>>> = Arc::new(Mutex::new(BTreeMap::from([(
         1,
@@ -913,6 +915,7 @@ fn doctor_no_access_is_partial_success_not_an_abort() {
         folder: None,
         name: Some("чужое".into()),
         derived_dir: false,
+        workspace_label: String::new(),
     });
     let tree: Arc<Mutex<BTreeMap<u128, Value>>> = Arc::new(Mutex::new(BTreeMap::from([(
         1,

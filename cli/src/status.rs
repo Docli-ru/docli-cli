@@ -397,25 +397,23 @@ fn render(s: &Status) {
         } else {
             ui::ok(&head);
         }
-        let mw = ui::label_width(["directory", "scope", "updated", "parked"]);
-        ui::field(
-            "directory",
-            &match (m.exists_on_disk, m.emptied) {
-                (false, _) => format!("{} {}", m.dir, ui::dim("(missing on disk)")),
-                (true, true) => format!(
-                    "{} {}",
-                    m.dir,
-                    ui::dim("(empty - docli sync --full rebuilds it)")
-                ),
-                (true, false) if !m.claimed => format!(
-                    "{} {}",
-                    m.dir,
-                    ui::dim("(not this mirror - run docli sync)")
-                ),
-                (true, false) => m.dir.clone(),
-            },
-            mw,
-        );
+        let mw = ui::label_width(["cache", "scope", "updated", "parked"]);
+        // The DIAGNOSIS without the PATH. `status` used to print the mount directory here, which
+        // was harmless while it was a short project-relative name and became the leak the
+        // live-agent gate measured on 2026-09-03: given only a `docli.toml`, Codex ran `docli
+        // status`, took the absolute cache path out of this row, and grepped the mirror —
+        // defeating v0.29.1 D1 through a field nobody thought of as an address.
+        //
+        // Nothing is lost that the reader can act on: the cache is not theirs to manage, every
+        // state below names its own remedy, and `docli doctor` still prints real paths because
+        // reconciling the filesystem is its job.
+        let cache_state = match (m.exists_on_disk, m.emptied) {
+            (false, _) => "not built yet - run docli sync",
+            (true, true) => "empty - docli sync --full rebuilds it",
+            (true, false) if !m.claimed => "not this mirror - run docli sync",
+            (true, false) => "in this machine's docli cache",
+        };
+        ui::field("cache", cache_state, mw);
         if let Some(f) = &m.folder {
             ui::field("scope", f, mw);
         }

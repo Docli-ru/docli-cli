@@ -201,6 +201,7 @@ pub fn run(cwd: &Path, api: Option<&Api>, args: &InitArgs) -> Result<i32> {
                     folder: args.folder.clone(),
                     name: args.name.clone(),
                     derived_dir: false,
+                    workspace_label: String::new(),
                 }),
             }
             // The MOUNT-TABLE rules gate the ADD too, not only the commands that later read the

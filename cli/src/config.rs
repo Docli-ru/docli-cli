@@ -58,6 +58,9 @@ pub struct Mount {
     /// baking this machine's home directory into a committed file.
     #[serde(skip)]
     pub derived_dir: bool,
+    /// Pre-rendered «workspace <id>» for [`display_name`], which returns a borrow.
+    #[serde(skip)]
+    pub workspace_label: String,
     /// Optional folder scope: mirror only this server subtree, mapped to the mount root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder: Option<String>,
@@ -68,8 +71,25 @@ pub struct Mount {
 }
 
 impl Mount {
+    /// What this mount is CALLED in ordinary output — never its path.
+    ///
+    /// The fallback used to be `dir`, which was harmless while a mount was a short project-
+    /// relative directory and became a defect the moment the cache moved to
+    /// `~/.docli/mirror/<id>`: `docli sync` and `docli status` then printed the absolute cache
+    /// path as a mount's NAME. **Measured 2026-09-03 (the live-agent gate):** given only a
+    /// `docli.toml`, Codex found the CLI, read `docli read --help`, ran `docli status`, took the
+    /// path out of it, and grepped the mirror — the exact split v0.29.1 D1 exists to close,
+    /// re-opened by an incidental fallback.
+    ///
+    /// So a derived mount is named by its WORKSPACE, which is what it is. `doctor` and `guard`
+    /// still print real paths, deliberately: one reconciles the filesystem and the other refuses
+    /// a write to a named file, and neither can do its job without saying where.
     pub fn display_name(&self) -> &str {
-        self.name.as_deref().unwrap_or(&self.dir)
+        match self.name.as_deref() {
+            Some(n) => n,
+            None if self.derived_dir => &self.workspace_label,
+            None => &self.dir,
+        }
     }
 }
 
@@ -183,6 +203,7 @@ pub fn resolve_mount_dirs(config: &mut DocliToml) -> Result<()> {
             .to_string_lossy()
             .into_owned();
         m.derived_dir = true;
+        m.workspace_label = format!("workspace {}", m.workspace);
     }
     Ok(())
 }
@@ -681,6 +702,7 @@ mod tests {
             folder: None,
             name: None,
             derived_dir: false,
+            workspace_label: String::new(),
         }]);
         c.mcp_label = Some("stable".into());
         let body = toml::to_string_pretty(&c).unwrap();
@@ -705,6 +727,7 @@ mod tests {
             folder: None,
             name: None,
             derived_dir: false,
+            workspace_label: String::new(),
         }
     }
 
@@ -956,6 +979,7 @@ mod tests {
             folder: None,
             name: None,
             derived_dir: false,
+            workspace_label: String::new(),
         }]);
         let err = validate_geometry(&proj, &c).unwrap_err().to_string();
         assert!(err.contains("not git-ignored"), "{err}");
