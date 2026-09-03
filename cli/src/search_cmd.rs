@@ -1,15 +1,17 @@
 // SPDX-FileCopyrightText: 2026 OOO Agitek
 // SPDX-License-Identifier: MIT
 
-//! `docli search` (v0.28.0 D5, client half) — server BM25 across all mounts by default; results
-//! carry LOCAL paths (or an explicit «not mirrored» tag), so grep can only ever EXTEND a hit,
-//! never establish absence.
+//! `docli search` (v0.28.0 D5, client half) — server BM25 across all mounts by default.
+//!
+//! Results carry the SERVER path and the node id, and **no local mirror address** (v0.29.1 D1).
+//! Until this slice they carried a per-note local path, which is what made the CLI the finder and
+//! something else the reader — the split grep, false absence and every hide-the-mirror question
+//! descended from. `docli read` is the other half of closing it: search finds, read opens, and
+//! both addresses are the one the server speaks.
 //!
 //! The split-brain rule, degraded-aware: only a NON-degraded server search may conclude a note
 //! does not exist; a degraded answer is INCONCLUSIVE about absence, and the CLI says so rather
 //! than printing a bare empty result.
-
-use std::path::Path;
 
 use anyhow::Result;
 use docli_sync_wire::{
@@ -19,7 +21,7 @@ use uuid::Uuid;
 
 use crate::config::{validate_config, Mount, Project};
 use crate::http::Api;
-use crate::state::{ControlRoot, TrackedKind, WsState};
+use crate::state::ControlRoot;
 
 pub fn run(project: &Project, api: &Api, query: &str, json: bool) -> Result<i32> {
     if json {
@@ -31,26 +33,17 @@ pub fn run(project: &Project, api: &Api, query: &str, json: bool) -> Result<i32>
     // Request-level validation only (Codex round 24): search works without a cache, so the
     // mirror-write geometry rules must not block a server query.
     validate_config(&project.config)?;
-    let cwd = std::env::current_dir().unwrap_or_else(|_| project.root.clone());
     let control = ControlRoot::new(&project.root);
     let mounts: Vec<&Mount> = project.config.mounts.iter().collect();
 
     // The local read happens BEFORE the request, because the position rides the request
-    // (v0.29.0 D2d) and the answer must describe the position actually sent. That same snapshot
-    // renders local paths, so the verdict and the addresses beneath it describe ONE instant —
-    // which is the point, and which is also a trade, stated rather than glossed: the id → path
-    // map is now up to a round trip old. A concurrent `docli sync` that RENAMES makes the path
-    // vanish and the hit renders an honest «not mirrored» (every address is stat-checked). A
-    // concurrent SWAP — `A` moved away and some other node moved into `A` inside the window —
-    // is the narrow case that does not vanish: the stale address exists, passes containment, and
-    // names a different note. In-mirror, unlike the identity case, and the cost of the
-    // alternative is a verdict describing one instant over paths describing another.
+    // (v0.29.0 D2d) and the answer must describe the position actually sent.
     //
-    // The mount-IDENTITY anchor deliberately does NOT ride this snapshot: it is re-measured at
-    // render time, because it is the one check `canonically_under` cannot stand in for (Codex
-    // round 17 — a swapped root canonicalizes consistently against itself), and measuring it
-    // before the round trip would widen THAT window, whose failure renders an address outside
-    // the mirror entirely.
+    // Since v0.29.1 D1 that is ALL it is for. It used to double as the id → local-path map the
+    // hits were rendered off, which made the freshness verdict and the addresses beneath it two
+    // snapshots of one instant — and gave the whole window (a concurrent rename, or the narrow
+    // swap case) something to be wrong about. With no address to render, the read decides one
+    // thing: whether this mount's position is worth sending.
     let mut local: std::collections::HashMap<Uuid, MountLocal> =
         std::collections::HashMap::with_capacity(mounts.len());
     for m in &mounts {
@@ -99,7 +92,7 @@ pub fn run(project: &Project, api: &Api, query: &str, json: bool) -> Result<i32>
             continue;
         };
         let l = local.get(&o.workspace_id).expect("every mount was read");
-        rendered.push(render_workspace(project, &cwd, mount, l, o, &mut any_hit));
+        rendered.push(render_workspace(mount, l, o, &mut any_hit));
         any_degraded |= o.degraded;
         any_refused |= o.refused.is_some();
     }
@@ -114,6 +107,8 @@ pub fn run(project: &Project, api: &Api, query: &str, json: bool) -> Result<i32>
             mirror_notice(r);
         }
     } else {
+        // The `[mount]` tag is what `docli read --mount` accepts, so it earns its line whenever
+        // there is a choice to make; with one mount there is none.
         let show_mount = project.config.mounts.len() > 1;
         for r in &rendered {
             print_workspace(r, show_mount);
@@ -130,8 +125,8 @@ pub fn run(project: &Project, api: &Api, query: &str, json: bool) -> Result<i32>
             } else if any_degraded {
                 // Never a bare empty result on a degraded index.
                 crate::ui::warn(
-                    "no hits - but the note index was DEGRADED for at least one workspace, so \
-                     this is INCONCLUSIVE about absence; retry shortly",
+                    "no hits - but the note index was incomplete for at least one workspace, \
+                     so this is INCONCLUSIVE about absence; retry shortly",
                 );
             } else {
                 crate::ui::detail("no hits");
@@ -186,14 +181,11 @@ const NOT_THIS_MIRROR: &str = "this directory is not this workspace's mirror";
 /// «no answer». Forward tolerance at the wire, a frozen set at the surface.
 const KNOWN_DELTA: [&str; 4] = ["none", "pending", "epoch_mismatch", "rebuild_required"];
 
-/// One mount's local half: the ask decision, plus the state that may render local paths.
-///
-/// Deliberately does NOT carry the mount-identity answer — that is re-measured at render time,
-/// after the response, so its window stays as narrow as it was before this slice.
+/// One mount's local half. Since v0.29.1 D1 it is the ask decision and nothing else: the state
+/// snapshot it used to carry existed solely to render per-note local addresses, which `search`
+/// no longer publishes.
 pub struct MountLocal {
     pub decision: AskDecision,
-    /// `Some` only for a COMPLETE projection — local paths render off nothing less.
-    pub state: Option<WsState>,
 }
 
 /// Read one mount's local state and decide whether to ask the server about it.
@@ -211,14 +203,12 @@ fn read_local(project: &Project, control: &ControlRoot, mount: &Mount, now: i64)
         Err(e) => {
             return MountLocal {
                 decision: AskDecision::StateUnreadable(format!("{e:#}")),
-                state: None,
             };
         }
     };
     let Some(st) = loaded else {
         return MountLocal {
             decision: AskDecision::NeverSynced,
-            state: None,
         };
     };
     let decision = if !identity_ok {
@@ -233,13 +223,7 @@ fn read_local(project: &Project, control: &ControlRoot, mount: &Mount, now: i64)
             }),
         }
     };
-    // A corrupt or partial cache is NO cache (Codex round 25): the hits already arrived from the
-    // server, and the disposable `.docli` state must not veto them — degrade to «not mirrored».
-    // A cache built for a DIFFERENT folder scope maps server paths to stale local spellings
-    // (round 26); a MID-REPAIR cache (round 27) or one whose cursor never reached head (round 30)
-    // is the same. Local paths render only off a COMPLETE projection.
-    let state = (st.scope_key == mount.folder && !st.from_zero && st.at_head).then_some(st);
-    MountLocal { decision, state }
+    MountLocal { decision }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -276,97 +260,25 @@ pub struct RenderedWorkspace {
 
 #[derive(Debug, serde::Serialize)]
 pub struct RenderedHit {
+    /// The address, and the only one: what the server calls this node. `docli read` takes it,
+    /// wikilinks resolve to it, and the MCP tools speak it — one address space (v0.29.1 D2).
     pub server_path: String,
-    /// The LOCAL address — present only when the file is genuinely on disk (state AND a stat);
-    /// `None` = «not mirrored» (handing an agent a nonexistent path is exactly the split-brain
-    /// the rule exists to prevent).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub local_path: Option<String>,
+    /// The node id — `docli read --id`'s producer. Stable across renames, unlike the path.
+    pub id: Uuid,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
-    /// True for the attachment arm: the local path is a MARKER sidecar, not the file's bytes.
+    /// True for the attachment arm: what the mirror holds for this node is a metadata MARKER,
+    /// never the file's bytes, so `docli read` prints the marker's fields and `read_attachment`
+    /// over MCP fetches the bytes.
     pub marker: bool,
 }
 
-/// KIND-AWARE, disk-checked projection: a NOTE hit renders its local `.md` path only when
-/// present in state AND a cheap stat confirms it on disk (state can silently diverge from disk
-/// — D3); an ATTACHMENT hit renders its MARKER path (resolved through state — relocation) tagged
-/// as a marker. Anything else — unsynced mount, out-of-scope, guard-parked, stat-miss — renders
-/// «not mirrored» INSTEAD of a path.
-/// Render a filesystem path for the terminal, ANCHORED TO THE INVOCATION CWD (Codex round 1):
-/// `docli search` promises "local paths you can open directly", and a project-root-relative
-/// spelling printed from a subdirectory resolves to the wrong file. Relative-to-cwd when the
-/// path is under it; absolute otherwise.
-fn display_path(cwd: &Path, abs: &Path) -> String {
-    match abs.strip_prefix(cwd) {
-        Ok(rel) if !rel.as_os_str().is_empty() => rel.to_string_lossy().replace('\\', "/"),
-        _ => abs.to_string_lossy().replace('\\', "/"),
-    }
-}
-
 fn render_workspace(
-    project: &Project,
-    cwd: &Path,
     mount: &Mount,
     local: &MountLocal,
     o: &SearchWorkspaceOutcome,
     any_hit: &mut bool,
 ) -> RenderedWorkspace {
-    let state = local.state.as_ref();
-    let mount_root = crate::config::mount_abs(&project.root, mount);
-    // Canonical containment (Codex round 16): `contained_join` is lexical, and search holds no
-    // mount claim, so a post-sync symlink swap could point a rendered address outside the
-    // mirror. A hit renders as mirrored only when its CANONICAL path stays under the canonical
-    // root (canonicalize also refuses a missing file — the «not mirrored» answer).
-    let canonically_under = |root: &Path, abs: &Path| -> bool {
-        match (root.canonicalize(), abs.canonicalize()) {
-            (Ok(r), Ok(a)) => a.starts_with(r),
-            _ => false,
-        }
-    };
-    // …and the ROOTS themselves must be anchored (Codex round 17): a swapped/symlinked mount
-    // root would canonicalize consistently against itself. The mount anchors to its
-    // `MOUNT.docli` identity (lock-free); the control plane anchors to the canonical project
-    // root (`.docli` lives inside the project by construction). Measured HERE, after the
-    // response — `read_local` asks the same question before the request for its own decision,
-    // and reusing that answer would widen this window across the whole round trip.
-    let control_dir = ControlRoot::new(&project.root).dir;
-    let mount_identity_ok =
-        crate::mountfs::verify_mount_identity(&mount_root, &control_dir, mount.workspace);
-    let local_of = |id: Uuid, want_marker: bool| -> Option<String> {
-        let st = state?;
-        if !mount_identity_ok {
-            return None;
-        }
-        let n = st.nodes.get(&id)?;
-        if want_marker {
-            if n.kind != TrackedKind::Attachment {
-                return None;
-            }
-            let mp = n.marker_path.clone()?;
-            // A RELOCATED marker lives under the project's control root, NOT the mount — the
-            // rendered address must say so (a `{mount}/.docli/…` spelling names a path the
-            // geometry rules guarantee cannot exist: the exact split-brain D5 forbids).
-            if mp.starts_with(".docli/") {
-                // Only this workspace's own namespace resolves (Codex round 13).
-                let leaf = crate::apply::relocated_leaf(&mp, mount.workspace)?;
-                let markers = ControlRoot::new(&project.root)
-                    .markers_dir()
-                    .join(mount.workspace.to_string());
-                let abs = markers.join(leaf);
-                (abs.is_file() && canonically_under(&project.root, &abs))
-                    .then(|| display_path(cwd, &abs))
-            } else {
-                // State-derived: containment or «not mirrored» (Codex round 15).
-                let abs = crate::mountfs::contained_join(&mount_root, &mp).ok()?;
-                (abs.is_file() && canonically_under(&mount_root, &abs))
-                    .then(|| display_path(cwd, &abs))
-            }
-        } else {
-            let abs = crate::mountfs::contained_join(&mount_root, &n.local_path).ok()?;
-            (abs.is_file() && canonically_under(&mount_root, &abs)).then(|| display_path(cwd, &abs))
-        }
-    };
     let hits: Vec<RenderedHit> = o
         .hits
         .iter()
@@ -374,7 +286,7 @@ fn render_workspace(
             *any_hit = true;
             RenderedHit {
                 server_path: h.path.clone(),
-                local_path: local_of(h.id, false),
+                id: h.id,
                 snippet: Some(h.snippet.clone()),
                 marker: false,
             }
@@ -387,7 +299,7 @@ fn render_workspace(
             *any_hit = true;
             RenderedHit {
                 server_path: a.path.clone(),
-                local_path: local_of(a.id, true),
+                id: a.id,
                 snippet: None,
                 marker: true,
             }
@@ -440,19 +352,23 @@ fn mirror_sentence(r: &RenderedWorkspace) -> Option<String> {
         // contract, not a defect to report on every call.
         (Some("never_synced"), _) => return None,
         (Some("state_unreadable"), _) => format!(
-            "the local mirror state could not be read ({}), so no local paths are shown",
+            "the local mirror state could not be read ({}), so `docli read` cannot serve from \
+             this mount",
             reason()
         ),
         // The directory is not this mirror: `docli sync` cannot bring it to head, so the generic
         // remedy below would be false. Its own sentence, with the remedy that does apply.
         (Some("unusable"), _) if r.mirror_reason.as_deref() == Some(NOT_THIS_MIRROR) => {
-            format!("{NOT_THIS_MIRROR} - `docli init` re-points it; no local paths are shown")
+            format!("{NOT_THIS_MIRROR} - `docli init` re-points it")
         }
         // Two deliberate word choices here, each a defect an earlier draft actually shipped:
         //
-        // «not a usable projection» rather than «incomplete» — `incomplete` is a DEFINED term in
-        // this codebase (`WsState::incomplete`, `CACHE_INCOMPLETE.docli`) and an over-age head is
-        // not one of its terms, so a mirror can be complete and still too old to trust.
+        // NOT «incomplete» — that is a DEFINED term in this codebase (`WsState::incomplete`,
+        // `CACHE_INCOMPLETE.docli`) and an over-age head is not one of its terms, so a mirror can
+        // be complete and still too old to trust. The first replacement was «not a usable
+        // projection», which avoided the collision by reaching for our own internal vocabulary;
+        // v0.29.1's editorial pass replaced it with a sentence that says the same thing without
+        // asking the reader to know what a projection is. Both constraints still bind.
         //
         // …and the remedy REDIRECTS instead of naming a command, because the seven reasons do not
         // share one (Codex round 3): a transient park needs the occupant removed and then
@@ -467,8 +383,8 @@ fn mirror_sentence(r: &RenderedWorkspace) -> Option<String> {
         // «fresh» (`sync_cmd.rs` check_mount's heal branch). Promising a fix there would send the
         // reader to a command that names none.
         (Some(_), _) => format!(
-            "the local mirror is not a usable projection - {}; `docli sync --check` clears it or \
-             names the fix",
+            "the local mirror cannot be vouched for right now - {}; `docli sync --check` either \
+             clears the condition or names the fix",
             reason()
         ),
         // An UNKNOWN value from a newer server, an api older than v0.29.0, a refusal, or a
@@ -523,8 +439,8 @@ fn clip(s: &str) -> String {
     out
 }
 
-/// `show_mount` gates the `[mount]` prefix: with a single mount, the local path already
-/// starts with the mount directory, so the tag is pure repetition on every line.
+/// `show_mount` gates the `[mount]` prefix: it is what `docli read --mount` accepts, so it is
+/// worth a line whenever there is a choice to make — and pure repetition when there is one mount.
 fn print_workspace(r: &RenderedWorkspace, show_mount: bool) {
     let tag = if show_mount {
         format!("{} ", crate::ui::dim(&format!("[{}]", r.mount)))
@@ -549,22 +465,20 @@ fn print_workspace(r: &RenderedWorkspace, show_mount: bool) {
     if r.degraded {
         crate::ui::warn(&format!(
             "[{}] the note index was incomplete for this query - a missing result here proves \
-             nothing",
+             nothing; retry shortly",
             r.mount
         ));
     }
     for h in &r.hits {
-        // The PATH is the answer — bold and on its own line; the snippet is context, dimmed
-        // and clipped to one terminal line so a screenful of hits stays a list rather than a
-        // wall of prose.
-        match &h.local_path {
-            Some(l) => crate::ui::line(&format!("{tag}{}", console::style(l).bold())),
-            None => crate::ui::line(&format!(
-                "{tag}{} {}",
-                console::style(&h.server_path).bold(),
-                crate::ui::dim("- not mirrored (run docli sync, then docli doctor if it persists)")
-            )),
-        }
+        // The SERVER PATH is the answer — bold and on its own line, because it is what you hand
+        // to `docli read`. The id rides beside it, dimmed, so `--id` has a producer in the human
+        // output too and not only in `--json`. The snippet is context: dimmed and clipped to one
+        // terminal line, so a screenful of hits stays a list rather than a wall of prose.
+        crate::ui::line(&format!(
+            "{tag}{} {}",
+            console::style(&h.server_path).bold(),
+            crate::ui::dim(&h.id.to_string())
+        ));
         if let Some(s) = &h.snippet {
             crate::ui::line(&format!(
                 "    {}",
@@ -573,18 +487,12 @@ fn print_workspace(r: &RenderedWorkspace, show_mount: bool) {
         }
     }
     for a in &r.attachments {
-        match &a.local_path {
-            Some(l) => crate::ui::line(&format!(
-                "{tag}{} {}",
-                console::style(l).bold(),
-                crate::ui::dim("(marker - the bytes live on the server)")
-            )),
-            None => crate::ui::line(&format!(
-                "{tag}{} {}",
-                console::style(&a.server_path).bold(),
-                crate::ui::dim("- a file, not mirrored")
-            )),
-        }
+        crate::ui::line(&format!(
+            "{tag}{} {} {}",
+            console::style(&a.server_path).bold(),
+            crate::ui::dim(&a.id.to_string()),
+            crate::ui::dim("(a file - docli read prints its marker; the bytes stay on the server)")
+        ));
     }
     if r.attachments_truncated {
         crate::ui::detail(&format!(
@@ -594,8 +502,8 @@ fn print_workspace(r: &RenderedWorkspace, show_mount: bool) {
     }
     if r.attachments_query_truncated {
         crate::ui::detail(&format!(
-            "[{}] file matches may be a SUPERSET of the query (it had more terms than the \
-             file arm applies)",
+            "[{}] file matches may include extras - file names were matched on only some of \
+             the query's terms",
             r.mount
         ));
     }
@@ -606,14 +514,13 @@ fn print_workspace(r: &RenderedWorkspace, show_mount: bool) {
 mod tests {
     use super::*;
     use crate::config::DocliToml;
-    use crate::state::{NodeState, WsState};
+    use crate::state::WsState;
     use docli_sync_wire::{SearchAttachmentWire, SearchHitWire};
 
     struct Fx {
         _tmp: tempfile::TempDir,
         project: Project,
         mount: Mount,
-        state: WsState,
     }
 
     fn fx() -> Fx {
@@ -650,22 +557,7 @@ mod tests {
             _tmp: tmp,
             project,
             mount,
-            state: WsState::fresh(None),
         }
-    }
-
-    fn track(state: &mut WsState, id: u128, kind: TrackedKind, local: &str, marker: Option<&str>) {
-        state.nodes.insert(
-            Uuid::from_u128(id),
-            NodeState {
-                server_path: local.to_string(),
-                local_path: local.to_string(),
-                kind,
-                rev: 1,
-                content_sha256: String::new(),
-                marker_path: marker.map(|m| m.to_string()),
-            },
-        );
     }
 
     fn outcome(
@@ -684,24 +576,22 @@ mod tests {
         }
     }
 
-    /// The render input, as a `MountLocal`: a state complete enough to render local paths
-    /// (`None` = an unsynced mount). Mount identity is NOT part of it — `render_workspace`
-    /// measures that itself, which is what keeps the symlink-swap tests below exercising the
-    /// real code path rather than a helper's copy of it.
-    fn as_local(state: Option<&WsState>) -> MountLocal {
+    /// The render input, as a `MountLocal`. Since v0.29.1 D1 it is the ask decision alone —
+    /// there is no local address to render, so there is no state snapshot to render it off.
+    fn as_local(asking: bool) -> MountLocal {
         MountLocal {
-            decision: match state {
-                Some(_) => AskDecision::Ask(MirrorPosition {
+            decision: if asking {
+                AskDecision::Ask(MirrorPosition {
                     cursor: docli_sync_wire::WireCursor {
                         rev: 0,
                         id: Uuid::nil(),
                     },
                     epoch: 0,
                     ledger_count: 0,
-                }),
-                None => AskDecision::NeverSynced,
+                })
+            } else {
+                AskDecision::NeverSynced
             },
-            state: state.cloned(),
         }
     }
 
@@ -724,162 +614,90 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    /// D1's spine, and the one verification item stated narrowly on purpose: **no per-NOTE
+    /// mirror address in `search`'s output**, human or `--json`. Not "no code path prints a
+    /// local path" — `doctor` must publish one on every discrepancy row and `guard`'s refusal
+    /// echoes the path it refused; those are mount-level and deliberate. What is retired is the
+    /// per-note handout an agent read for itself off.
     #[test]
-    fn a_symlink_swapped_mount_root_renders_nothing_local() {
-        // Codex round 17: replacing the WHOLE mount dir with a symlink canonicalizes
-        // consistently against itself — the identity anchor (no-follow stat + MOUNT.docli)
-        // must refuse before any address renders.
+    fn no_hit_carries_a_per_note_mirror_address() {
+        // Run it against BOTH mount shapes, because the one that ships is the second: `docli
+        // init` writes no `name`, so `display_name()` falls back to the DIRECTORY. A pin written
+        // only against a named mount would pass while never exercising the default.
+        for name in [Some("заметки".to_string()), None] {
+            let mut f = fx();
+            f.mount.name = name.clone();
+            // A note and a file that ARE on this disk, at addresses the old build would have
+            // printed. The mirror's state is irrelevant now, which is itself the point.
+            std::fs::write(f.project.root.join("mirror/docs/a.md"), "x").unwrap();
+            std::fs::write(f.project.root.join("mirror/docs/pic.png.docli"), "m").unwrap();
+            let o = outcome(vec![hit(2, "docs/a.md")], vec![att(5, "docs/pic.png")]);
+            let mut any = false;
+            let r = render_workspace(&f.mount, &as_local(true), &o, &mut any);
+            let text = serde_json::to_string(&r).unwrap();
+            assert!(
+                !text.contains("localPath") && !text.contains("local_path"),
+                "{name:?} {text}"
+            );
+            assert!(!text.contains("mirror/docs/a.md"), "{name:?} {text}");
+            assert!(
+                !text.contains("mirror/docs/pic.png.docli"),
+                "{name:?} {text}"
+            );
+            assert!(!text.contains(".docli/markers"), "{name:?} {text}");
+            // The SERVER path is what remains, and it is what `docli read` takes.
+            assert_eq!(r.hits[0].server_path, "docs/a.md");
+            assert_eq!(r.attachments[0].server_path, "docs/pic.png");
+            assert!(r.attachments[0].marker, "a file is still flagged as a file");
+        }
+    }
+
+    /// The limit of the pin above, asserted rather than left to be discovered: with no `name`,
+    /// the mount TAG is the mount DIRECTORY, so a reader who joins the tag to the server path
+    /// reconstructs the file. That is the plan's accepted position — D1 is «affordance removal,
+    /// not impossibility», the mirror's LOCATION stays public because `docli.toml` is committed
+    /// and `doctor`/`guard`/`status`/`init` must print directories — but it is the reason the
+    /// documents say the per-note HANDOUT is retired rather than claiming the address is
+    /// unobtainable. This test exists so that sentence cannot quietly become the stronger one.
+    #[test]
+    fn a_nameless_mount_tags_hits_with_its_directory_and_the_docs_must_not_deny_it() {
         let mut f = fx();
-        track(&mut f.state, 2, TrackedKind::Note, "docs/a.md", None);
-        let outside = f.project.root.join("outside");
-        std::fs::create_dir_all(outside.join("docs")).unwrap();
-        std::fs::write(outside.join("docs/a.md"), "x").unwrap();
-        std::fs::remove_dir_all(f.project.root.join("mirror")).unwrap();
-        std::os::unix::fs::symlink(&outside, f.project.root.join("mirror")).unwrap();
+        f.mount.name = None;
+        assert_eq!(f.mount.display_name(), "mirror");
         let o = outcome(vec![hit(2, "docs/a.md")], vec![]);
         let mut any = false;
-        let r = render_workspace(
-            &f.project,
-            &f.project.root,
-            &f.mount,
-            &as_local(Some(&f.state)),
-            &o,
-            &mut any,
-        );
-        assert_eq!(r.hits[0].local_path, None, "{:?}", r.hits[0]);
+        let r = render_workspace(&f.mount, &as_local(true), &o, &mut any);
+        assert_eq!(r.mount, "mirror");
+        // The two halves are separate values on separate fields; nothing emits the join.
+        assert_eq!(r.hits[0].server_path, "docs/a.md");
     }
 
-    #[cfg(unix)]
+    /// `--id` needs a producer (step 1), and `search` is it — in BOTH surfaces, so an agent
+    /// reading the human output is not left with only the address that can be renamed.
     #[test]
-    fn a_symlinked_materialization_renders_not_mirrored() {
-        // Codex round 16: search holds no mount claim, so a post-sync symlink swap must not
-        // hand the agent an address resolving outside the mirror.
-        let mut f = fx();
-        track(&mut f.state, 2, TrackedKind::Note, "docs/a.md", None);
-        std::fs::write(f.project.root.join("outside.md"), "outside").unwrap();
-        std::os::unix::fs::symlink(
-            f.project.root.join("outside.md"),
-            f.project.root.join("mirror/docs/a.md"),
-        )
-        .unwrap();
-        let o = outcome(vec![hit(2, "docs/a.md")], vec![]);
+    fn every_hit_carries_the_node_id() {
+        let f = fx();
+        let o = outcome(vec![hit(2, "docs/a.md")], vec![att(5, "docs/pic.png")]);
         let mut any = false;
-        let r = render_workspace(
-            &f.project,
-            &f.project.root,
-            &f.mount,
-            &as_local(Some(&f.state)),
-            &o,
-            &mut any,
-        );
-        assert_eq!(r.hits[0].local_path, None, "{:?}", r.hits[0]);
+        let r = render_workspace(&f.mount, &as_local(true), &o, &mut any);
+        assert_eq!(r.hits[0].id, Uuid::from_u128(2));
+        assert_eq!(r.attachments[0].id, Uuid::from_u128(5));
+        let v: serde_json::Value = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["hits"][0]["id"], Uuid::from_u128(2).to_string());
+        assert_eq!(v["attachments"][0]["id"], Uuid::from_u128(5).to_string());
     }
 
+    /// An unsynced mount still reports its HITS. Absence of a local copy was never absence of
+    /// the note, and now there is not even an address to be absent.
     #[test]
-    fn a_note_hit_renders_a_local_path_only_when_state_and_disk_agree() {
-        let mut f = fx();
-        track(&mut f.state, 2, TrackedKind::Note, "docs/a.md", None);
-        track(&mut f.state, 3, TrackedKind::Note, "docs/gone.md", None);
-        std::fs::write(f.project.root.join("mirror/docs/a.md"), "x").unwrap();
-        // `gone.md` is tracked but NOT on disk (state can silently diverge — D3).
-        let o = outcome(
-            vec![
-                hit(2, "docs/a.md"),
-                hit(3, "docs/gone.md"),
-                hit(4, "unsynced.md"),
-            ],
-            vec![],
-        );
-        let mut any = false;
-        let r = render_workspace(
-            &f.project,
-            &f.project.root,
-            &f.mount,
-            &as_local(Some(&f.state)),
-            &o,
-            &mut any,
-        );
-        assert_eq!(r.hits[0].local_path.as_deref(), Some("mirror/docs/a.md"));
-        assert_eq!(
-            r.hits[1].local_path, None,
-            "stat-miss renders `not mirrored`, never a path"
-        );
-        assert_eq!(
-            r.hits[2].local_path, None,
-            "an untracked hit renders `not mirrored`"
-        );
-    }
-
-    #[test]
-    fn an_attachment_hit_renders_its_marker_and_a_relocated_marker_renders_the_control_path() {
-        let mut f = fx();
-        track(
-            &mut f.state,
-            5,
-            TrackedKind::Attachment,
-            "docs/pic.png",
-            Some("docs/pic.png.docli"),
-        );
-        std::fs::write(f.project.root.join("mirror/docs/pic.png.docli"), "m").unwrap();
-        // A RELOCATED marker (control-file collision): lives under .docli/markers/, and the
-        // rendered address must be that path — a `{mount}/.docli/…` spelling names a file the
-        // geometry rules guarantee cannot exist (round-1 §4.2).
-        let reloc = format!(
-            ".docli/markers/{}/{}.docli",
-            f.mount.workspace,
-            Uuid::from_u128(6)
-        );
-        track(
-            &mut f.state,
-            6,
-            TrackedKind::Attachment,
-            "MOUNT",
-            Some(&reloc),
-        );
-        let markers = ControlRoot::new(&f.project.root)
-            .markers_dir()
-            .join(f.mount.workspace.to_string());
-        std::fs::create_dir_all(&markers).unwrap();
-        std::fs::write(markers.join(format!("{}.docli", Uuid::from_u128(6))), "m").unwrap();
-
-        let o = outcome(vec![], vec![att(5, "docs/pic.png"), att(6, "MOUNT")]);
-        let mut any = false;
-        let r = render_workspace(
-            &f.project,
-            &f.project.root,
-            &f.mount,
-            &as_local(Some(&f.state)),
-            &o,
-            &mut any,
-        );
-        assert_eq!(
-            r.attachments[0].local_path.as_deref(),
-            Some("mirror/docs/pic.png.docli")
-        );
-        assert!(r.attachments[0].marker);
-        assert_eq!(r.attachments[1].local_path.as_deref(), Some(reloc.as_str()));
-    }
-
-    #[test]
-    fn an_unsynced_mount_renders_not_mirrored_for_everything() {
+    fn an_unsynced_mount_still_reports_its_hits() {
         let f = fx();
         let o = outcome(vec![hit(2, "a.md")], vec![att(3, "b.png")]);
         let mut any = false;
-        let r = render_workspace(
-            &f.project,
-            &f.project.root,
-            &f.mount,
-            &as_local(None),
-            &o,
-            &mut any,
-        );
-        assert!(r.hits[0].local_path.is_none());
-        assert!(r.attachments[0].local_path.is_none());
-        assert!(
-            any,
-            "hits still count as hits - absence of a PATH is not absence of the note"
-        );
+        let r = render_workspace(&f.mount, &as_local(false), &o, &mut any);
+        assert_eq!(r.hits.len(), 1);
+        assert_eq!(r.attachments.len(), 1);
+        assert!(any);
     }
 
     /// The «токен» ban covers THIS refusal surface too (round-1 M4): the search branch reuses
@@ -942,7 +760,6 @@ mod tests {
                 ledger_count: 2,
             })
         );
-        assert!(l.state.is_some(), "and it renders local paths");
     }
 
     /// A mount that has NEVER synced is SILENT — searching without a cache is an explicit
@@ -957,7 +774,6 @@ mod tests {
             NOW,
         );
         assert_eq!(l.decision, AskDecision::NeverSynced);
-        assert!(l.state.is_none());
         let r = rendered_with(&f, &l, None);
         assert_eq!(r.mirror, Some("never_synced"));
         assert_eq!(r.delta, None);
@@ -973,7 +789,6 @@ mod tests {
         std::fs::write(&p, "{ not json").unwrap();
         let l = read_local(&f.project, &control, &f.mount, NOW);
         assert!(matches!(l.decision, AskDecision::StateUnreadable(_)));
-        assert!(l.state.is_none());
         assert_eq!(rendered_with(&f, &l, None).mirror, Some("state_unreadable"));
     }
 
@@ -1109,7 +924,7 @@ mod tests {
             let mut o = outcome(vec![], vec![]);
             o.delta = unanswered.map(str::to_string);
             let mut any = false;
-            let r = render_workspace(&f.project, &f.project.root, &f.mount, &asked, &o, &mut any);
+            let r = render_workspace(&f.mount, &asked, &o, &mut any);
             let v: serde_json::Value = serde_json::to_value(&r).unwrap();
             // The `--json` field is CLOSED over the four known values: an unknown one from a
             // newer server folds to null here, even though the wire preserved it verbatim.
@@ -1120,7 +935,7 @@ mod tests {
         let mut o = outcome(vec![], vec![]);
         o.refused = Some("FORBIDDEN".into());
         let mut any = false;
-        let r = render_workspace(&f.project, &f.project.root, &f.mount, &asked, &o, &mut any);
+        let r = render_workspace(&f.mount, &asked, &o, &mut any);
         let v: serde_json::Value = serde_json::to_value(&r).unwrap();
         assert_eq!(v["delta"], serde_json::Value::Null);
         assert_eq!(v["refused"], "FORBIDDEN");
@@ -1235,6 +1050,6 @@ mod tests {
         let mut o = outcome(vec![], vec![]);
         o.delta = delta.map(str::to_string);
         let mut any = false;
-        render_workspace(&f.project, &f.project.root, &f.mount, l, &o, &mut any)
+        render_workspace(&f.mount, l, &o, &mut any)
     }
 }

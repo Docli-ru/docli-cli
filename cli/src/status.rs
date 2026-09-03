@@ -253,10 +253,15 @@ fn mount_status(root: &Path, control: &ControlRoot, m: &Mount) -> MountStatus {
             .as_ref()
             .is_some_and(|s| s.incomplete() || s.scope_key != m.folder),
         parks: state.as_ref().map(|s| s.parks.len()).unwrap_or(0),
+        // SATURATING, and clamped at zero: `.docli/state` is untrusted input, so a hand-edited
+        // `i64::MIN` would panic in a debug build and wrap in release — where it renders as
+        // «just now», which is the one thing an age is supposed to rule out. A stamp in the
+        // future clamps to 0 rather than going negative; `WsState::unusable_reason` is what
+        // reports that condition, and this column is not the place to invent a second answer.
         head_age_secs: state
             .as_ref()
             .and_then(|s| s.head_reached_at)
-            .map(|t| now_unix() - t),
+            .map(|t| now_unix().saturating_sub(t).max(0)),
         exists_on_disk: dir.is_dir(),
         state_error,
         // State is keyed by WORKSPACE, so it says nothing about the directory configured NOW.

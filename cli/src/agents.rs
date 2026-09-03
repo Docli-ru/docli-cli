@@ -1181,6 +1181,13 @@ pub fn sweep_cfg_temps(project_root: &Path, selected: &[&AgentDef]) {
 /// triggers on files the agent WORKS WITH, so a write to a brand-new path inside the mirror may
 /// not activate it. That second one is precisely why the guard exists and the activation does
 /// not replace it — **activation informs, the hook enforces.**
+///
+/// **v0.29.1 D10 weakens this trigger, deliberately and without replacing it.** With no per-note
+/// local path handed out (D1), an agent doing its job never touches a mirror file, so `paths` now
+/// fires mostly for the case it was written for in the first place — somebody about to edit one.
+/// The contract's delivery moved down the ranking v0.28.6 D1 already established: the CLI's own
+/// output first (every invocation, no trigger problem), then the hooks, then this. The globs stay
+/// because the data-loss case still needs them.
 pub fn copy_skill(project_root: &Path, dir: &str, skill_md: &str, globs: &[String]) -> Result<()> {
     let d = project_root.join(dir);
     fs::create_dir_all(&d)?;

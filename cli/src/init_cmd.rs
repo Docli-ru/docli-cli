@@ -195,9 +195,15 @@ pub fn run(cwd: &Path, api: Option<&Api>, args: &InitArgs) -> Result<i32> {
                     name: args.name.clone(),
                 }),
             }
-            // The geometry rules gate the ADD, not just the later sync — MINUS the ignore
-            // rule, which `--gitignore` is about to satisfy. Everything else refuses here,
-            // before anything at all is written.
+            // The MOUNT-TABLE rules gate the ADD too, not only the commands that later read the
+            // table. `init` is the command that WRITES mounts, so a table it authors and every
+            // other verb then refuses is the worst arrangement available: the refusal arrives
+            // from a different command than the one that caused it, and names none. Cheapest
+            // example: `--name <another mount's workspace uuid>`, which a scripted setup pasting
+            // ids around produces naturally.
+            crate::config::validate_config(&config)?;
+            // …then the geometry rules, MINUS the ignore rule, which `--gitignore` is about to
+            // satisfy. Everything else refuses here, before anything at all is written.
             crate::config::validate_geometry_paths_only(cwd, &config)?;
         }
         (None, None) => {
@@ -609,6 +615,46 @@ fn config_header() -> &'static str {
 mod tests {
     use super::*;
 
+    /// `init` is the command that WRITES mounts, so it must ask the same door every reader
+    /// asks. A table it authors and every other verb then refuses is the worst arrangement
+    /// available: the refusal arrives from a different command than the one that caused it.
+    #[test]
+    fn init_refuses_a_mount_table_the_readers_would_refuse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        let base = |ws: Uuid, dir: &str, name: Option<&str>| InitArgs {
+            workspace: Some(ws),
+            dir: Some(dir.into()),
+            folder: None,
+            name: name.map(str::to_string),
+            server: Some("https://docli.ru".into()),
+            mcp: None,
+            mcp_label: None,
+            mcp_bare: false,
+            allow_prompt: false,
+            clear_folder: false,
+            write_gitignore: false,
+            skills: Some("none".into()),
+            hooks: None,
+            instructions: false,
+        };
+        run(tmp.path(), None, &base(a, "m1", None)).unwrap();
+        // Naming a mount with ANOTHER mount's workspace id: one string, two mounts, across every
+        // surface that prints a mount tag.
+        let e = run(tmp.path(), None, &base(b, "m2", Some(&a.to_string())))
+            .expect_err("the collision must be refused where it is authored");
+        assert!(format!("{e:#}").contains("workspace id"), "{e:#}");
+        // …and a blank name, which would be printed as the tag and accepted by nothing.
+        let e = run(tmp.path(), None, &base(b, "m2", Some("   ")))
+            .expect_err("a blank name must be refused too");
+        assert!(format!("{e:#}").contains("blank display name"), "{e:#}");
+        // The refused mounts are NOT written: the door runs before anything lands.
+        let p = load_project(tmp.path()).unwrap();
+        assert_eq!(p.config.mounts.len(), 1);
+        assert_eq!(p.config.mounts[0].workspace, a);
+    }
+
     #[test]
     fn re_running_init_repoints_the_mount_instead_of_duplicating_it() {
         let tmp = tempfile::tempdir().unwrap();
@@ -802,7 +848,8 @@ mod tests {
             .exists());
         // The bundled contract carries the load-bearing sentences.
         assert!(SKILL_MD.contains("never synced and never protected"));
-        assert!(SKILL_MD.contains("only a non-degraded server search"));
+        // Moved with the wording in v0.29.1's editorial pass — see the pin list below for why.
+        assert!(SKILL_MD.contains("only a server search that does not report an incomplete"));
         assert!(SKILL_MD.contains("sync --check"));
         // D12.3 — the write-discipline paragraph ships in the contract.
         assert!(SKILL_MD.contains("prefer `edit_note`"));
@@ -905,12 +952,29 @@ mod tests {
         // green (SPEC §7's failing-test rule).
         for pin in [
             "never synced and never protected",
-            "only a non-degraded server search",
+            // v0.29.1's editorial pass moved this pin DELIBERATELY, from «only a non-degraded
+            // server search». «Non-degraded» is our word for the condition; the human output
+            // says the note index was «incomplete» and only `--json` says `degraded`, so the
+            // old phrasing asked the reader to translate an adjective they never see. The RULE
+            // is unchanged and still pinned — only its wording names the observable now.
+            "only a server search that does not report an incomplete",
             "sync --check",
             "prefer `edit_note`",
             "conflictSiblingId",
         ] {
             assert!(SKILL_MD.contains(pin), "the rewrite must preserve: {pin}");
+        }
+        // …and v0.29.1's three, pinned the same way. Each is a rule whose ABSENCE is the defect:
+        // an agent that learns the mirror is grep-able looks for a path we no longer publish; one
+        // that reads exit 3 as absence draws the conclusion only `docli search` may draw; and one
+        // that reads an empty graph field as an empty graph gets D5's false negative inside the
+        // verb built to replace grep.
+        for pin in [
+            "publishes **no local mirror path** for its results",
+            "exits 3 when this mirror does not hold the requested note or file",
+            "never an empty list",
+        ] {
+            assert!(SKILL_MD.contains(pin), "the contract must carry: {pin}");
         }
     }
 

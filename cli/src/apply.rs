@@ -57,7 +57,7 @@ fn fold_opt(p: Option<&str>, rules: &FsRules) -> Option<String> {
     p.map(|v| fold_key(v, rules))
 }
 
-fn sha_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
@@ -99,7 +99,7 @@ pub(crate) fn relocated_leaf(marker_path: &str, ws: Uuid) -> Option<&str> {
     Some(leaf)
 }
 
-fn marker_abs(
+pub(crate) fn marker_abs(
     control: &ControlRoot,
     mount_root: &Path,
     ws: Uuid,

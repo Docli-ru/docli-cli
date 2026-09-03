@@ -241,6 +241,56 @@ pub fn validate_config(config: &DocliToml) -> Result<()> {
             );
         }
     }
+    // A mount NAME must not be another mount's workspace ID. Both are `--mount` selectors and
+    // both are PRINTED as mount tags, so a collision makes one string mean two mounts: `docli
+    // search` tags mount A with the name, the reader passes it to `docli read --mount`, and the
+    // resolver hands back mount B's note. Refused at the DOOR rather than resolved at each
+    // consumer — `docli.toml` is untrusted input and this crate rejects it in one place, and a
+    // per-consumer rule would have to be written identically into `search`'s tag, `read`'s
+    // selector and every future one. Closing it here also keeps the invariant that matters
+    // most intact: a workspace id always selects its own mount.
+    for m in &config.mounts {
+        // `display_name()`, not `name`: a mount with no name is tagged by its DIRECTORY, so a
+        // directory literally called `<some-uuid>` collides in exactly the same way. And the
+        // comparison is on the PARSED uuid rather than the string, because `Uuid::parse_str`
+        // accepts braced and unhyphenated spellings a byte comparison would walk straight past.
+        // TRIMMED, because that is what `--mount` compares: the selector is trimmed on the way
+        // in, so a name of `" <uuid> "` would sail past an untrimmed check here and then be
+        // matched — or, worse, not matched, leaving the id lookup to hand back the OTHER mount
+        // for a token `search` printed for this one. Whatever normalization selection applies,
+        // validation applies too, or the door has a gap shaped exactly like the difference.
+        let label = m.display_name().trim();
+        // A blank label is not a name: it is PRINTED as the mount tag and it is what `--mount`
+        // would have to accept, and an empty selector cannot mean one mount. Refused here so
+        // neither surface has to invent a rule for it.
+        if label.is_empty() {
+            bail!(
+                "a mount has a blank display name - give it a non-blank `name` in docli.toml, \
+                 or omit `name` and give it a non-blank `dir`"
+            );
+        }
+        let Ok(labelled) = Uuid::parse_str(label) else {
+            continue;
+        };
+        if labelled != m.workspace && config.mounts.iter().any(|o| o.workspace == labelled) {
+            let named = m.name.is_some();
+            bail!(
+                "mount `{}` {} another mount's workspace id - that one string would select \
+                 two different mounts; {}",
+                crate::ui::sanitize(label),
+                if named {
+                    "uses"
+                } else {
+                    "sits in a directory named after"
+                },
+                if named {
+                    "give it a name of its own"
+                } else {
+                    "give it a `name` in docli.toml, or rename the directory"
+                }
+            );
+        }
+    }
     // One mount per workspace: `.docli/` state is per-workspace, and two mounts draining one
     // cursor would each hold half the tree.
     let mut seen = std::collections::HashSet::new();

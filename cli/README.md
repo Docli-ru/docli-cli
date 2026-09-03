@@ -4,18 +4,26 @@ A local **read-only mirror** of your [**docli**](https://docli.ru) workspaces �
 users who work primarily through coding agents (Claude Code, Codex, and friends).
 
 The CLI **complements a docli MCP connection, never replaces it**: your agent still writes
-through its MCP connector; the CLI gives it a fast local corpus to read and grep — no network
-round-trip per read.
+through its MCP connector, while the CLI reads from a local copy with no network round-trip per
+read.
 
-- **The mirror is a disposable cache.** `docli sync` brings it in line with the current server
-  state; deleting it and syncing again is safe. Local edits are unsupported: they are never
-  uploaded and are overwritten when the note next changes server-side.
-- **`docli search` runs server-side.** It uses the product's BM25 search with Russian and
-  English stemming and prints local paths. Local grep can supplement server results, but a
-  local miss does not prove that content is absent from the server.
-- **Attachments are represented by markers.** Each attachment is mirrored as a `*.docli`
-  metadata sidecar (ID, MIME type, size, SHA-256 digest, and wikilink); its bytes remain on
-  the server and are fetched over MCP.
+- **The mirror is a disposable cache.** `docli sync` applies new server changes;
+  `docli sync --full` rebuilds it and prunes stale files. Deleting the mirror and syncing again is
+  safe. Local edits are unsupported: they are never uploaded, and they survive only until a full
+  sync rebuilds the mirror or the note next changes server-side — then they are overwritten with
+  no conflict copy.
+- **`docli search` finds and `docli read` opens.** Search runs server-side — the product's BM25
+  search with Russian and English stemming — and prints each hit's server path and node id. For a
+  note, `docli read` prints its mirrored content; for a file, the marker metadata described below.
+  `docli search` no longer publishes a local mirror path for each result: one verb finds things,
+  one verb opens them, and the address is the one the server uses. (`docli doctor` still prints
+  directories and paths — it has to, to report a discrepancy.)
+
+  **Upgrading from 0.1.4 — a breaking output change.** `docli search` no longer prints a local
+  path, and `--json` no longer carries `local_path`. Pass a hit's `server_path` to `docli read`,
+  or its `id` to `docli read --id`.
+- **Attachments are metadata here.** `docli read` on a file prints its ID, MIME type, size,
+  SHA-256 digest and wikilink; the bytes remain on the server and are fetched over MCP.
 - **`docli doctor`** — a three-way reconciliation (server / disk / state) with typed discrepancies.
 
 ## Install
@@ -45,7 +53,8 @@ docli login                              # browser sign-in via loopback OAuth
 docli list                               # every workspace; the ones mounted here are marked *
 docli init --workspace <id> --dir docli-mirror/notes --gitignore
 docli sync                               # one-shot sync of every mount
-docli search "what you need"             # server search, local paths
+docli search "what you need"             # server search across mounts
+docli read "Notes/plan.md"               # print a mirrored note (--lines, --id, --json)
 docli status                             # sign-in, mounts, mirror freshness, wired agents
 docli doctor                             # server / disk / state reconciliation
 docli logout                             # disconnect this device and drop the credential
@@ -70,13 +79,18 @@ names the flag that replaces it (`docli uninstall --yes`).
 | `--no-input` | Never ask anything (scripts, CI) |
 | `-q`, `--quiet` | Drop the narration; results and warnings stay |
 | `--no-color` | No colour; so do `NO_COLOR`, `TERM=dumb`, and a non-TTY stdout |
-| `--json` | Machine-readable output for `list`, `status`, `search`, `doctor` |
+| `--json` | Machine-readable output for `list`, `status`, `search`, `read`, `doctor` |
 
-Streams are split: results go to stdout, progress to stderr — so `docli search … | grep`,
+Streams are split: results go to stdout, progress to stderr — so `docli read … | head`,
 `docli status --json | jq` and `docli sync 2>/dev/null` all behave. Where a command's whole
 screen IS the result (`search`, `status`, `list`, human-readable `doctor`), its warnings go to
 stdout with it: a `docli status > file` that dropped half the screen would be worse than no
-redirect. Under `--json` nothing but the JSON reaches stdout.
+redirect. `docli read` is not one of those: the note is the product, so it has stdout to itself
+and every caveat goes to stderr. Under `--json` nothing but the JSON reaches stdout.
+
+`docli read` exits **3** when no selected mount holds what was asked for — its own code, so a
+script can tell "not in this local mirror" from a failure. It says nothing about the server: only
+a `docli search` that does not report an incomplete index settles whether a note exists.
 
 ## Uninstalling
 

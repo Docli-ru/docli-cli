@@ -775,7 +775,8 @@ fn check_mount(
     };
     if !head_reaching(&resp, 1) {
         // Behind the server means the mirror is NOT a complete projection (Codex round 31):
-        // say so durably, or a lock-free search keeps rendering local paths off it.
+        // say so durably, or a lock-free `search` keeps reporting `none` and `docli read` keeps
+        // serving from it without disclosing anything.
         state.at_head = false;
         persist_incomplete(control, handle, ws, state)?;
         return stale(format!(
@@ -801,9 +802,18 @@ fn check_mount(
     // page commit and the head commit leaves `at_head = false` with a complete mirror and the
     // incomplete marker present — the probe just proved completeness, so make the marker and
     // the manifest say so rather than printing «fresh» over a lying marker; Codex round 1).
-    if !state.at_head {
+    //
+    // The head TIME is healed on the same argument, and it has to be: a stamp in the future —
+    // a clock correction — makes the age unreadable, and `WsState::unusable_reason` then has
+    // `search` and `read` calling the mirror unusable while THIS command, the freshness
+    // authority, keeps answering «fresh» and exiting 0. Two authorities disagreeing about one
+    // mirror is the exact defect the shared readiness predicate exists to prevent, and the probe
+    // has just established the one fact the field records: the cursor is at the server's head,
+    // now. So it can fix this rather than report around it.
+    let now = now_unix();
+    if !state.at_head || state.head_reached_at.is_none_or(|t| t > now) {
         state.at_head = true;
-        state.head_reached_at = Some(now_unix());
+        state.head_reached_at = Some(now);
     }
     // ALWAYS reconcile (Codex round 30): a crash between the state save and the marker
     // removal leaves a lying CACHE_INCOMPLETE over a state that already says head — the probe

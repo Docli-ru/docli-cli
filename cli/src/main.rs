@@ -6,8 +6,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use docli_cli::{
-    config, creds, doctor, guard, hooks, http, init_cmd, list_cmd, login, logout, search_cmd,
-    selfupdate, status, sync_cmd, ui, uninstall, wizard,
+    config, creds, doctor, guard, hooks, http, init_cmd, list_cmd, login, logout, read_cmd,
+    search_cmd, selfupdate, status, sync_cmd, ui, uninstall, wizard,
 };
 
 /// D12.5 - the identity block: name, version, site, copyright.
@@ -138,12 +138,30 @@ enum Command {
         #[arg(long, requires = "check", conflicts_with = "full")]
         agent: Option<String>,
     },
-    /// Server search across all mounts (results carry local paths)
+    /// Server search across all mounts; pass a result to `docli read`
     Search {
         /// The query
         #[arg(value_name = "QUERY")]
         query: Vec<String>,
         /// Machine-readable output (JSON)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a mirrored note, or a file's metadata, by server path or node id
+    Read {
+        /// The server path - the address search, wikilinks and the MCP tools all use
+        #[arg(value_name = "PATH")]
+        path: Option<String>,
+        /// Address by node id instead of path
+        #[arg(long, conflicts_with = "path")]
+        id: Option<uuid::Uuid>,
+        /// Which mount to read from - a mount name or a workspace id
+        #[arg(long)]
+        mount: Option<String>,
+        /// Line range, 1-based and inclusive: `40-80`, `40-` for the rest, `40` for one line
+        #[arg(long, value_name = "A-B")]
+        lines: Option<String>,
+        /// Machine-readable output (JSON) - the read_note envelope
         #[arg(long)]
         json: bool,
     },
@@ -382,6 +400,28 @@ fn run(cli: Cli) -> Result<i32> {
             }
             search_cmd::run(&project, &api, &q, json)
         }
+        Command::Read {
+            path,
+            id,
+            mount,
+            lines,
+            json,
+        } => {
+            // Deliberately NOT `api_for`: `read` answers off the mirror, which is the whole
+            // point of having one (latency and egress — v0.29.1 D1). A signed-out device with a
+            // synced mirror still reads.
+            let project = config::load_project(&cwd)?;
+            read_cmd::run(
+                &project,
+                &read_cmd::ReadArgs {
+                    path,
+                    id,
+                    mount,
+                    lines,
+                    json,
+                },
+            )
+        }
         Command::Doctor { json } => {
             let project = config::load_project(&cwd)?;
             let api = api_for(&project)?;
@@ -490,6 +530,7 @@ mod tests {
             "init",
             "sync",
             "search",
+            "read",
             "status",
             "list",
             "logout",

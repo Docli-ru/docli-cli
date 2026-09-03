@@ -160,12 +160,23 @@ impl WsState {
         }
         match self.head_reached_at {
             None => Some("it has never reached the server's head"),
-            Some(t) if now - t > MAX_HEAD_AGE_SECS => {
+            // SATURATING, because this file is untrusted input: a hand-edited `i64::MIN` would
+            // otherwise wrap in release and read as brand new. A stamp in the FUTURE is not
+            // handled here — see `unusable_reason`; it makes the age unknown, which is a reason
+            // to distrust the mirror but not to rebuild it from zero.
+            Some(t) if now.saturating_sub(t) > MAX_HEAD_AGE_SECS => {
                 Some("its cursor last reached head more than 30 days ago")
             }
             _ => None,
         }
     }
+
+    /// How far ahead of `now` a head stamp may sit before its age stops meaning anything.
+    ///
+    /// Not zero, deliberately: a few seconds of skew between a sync and the next command is
+    /// ordinary, and firing on it would make the notice fire constantly. This is the width of a
+    /// clock CORRECTION, not of jitter.
+    const MAX_CLOCK_SKEW_SECS: i64 = 5 * 60;
 
     /// Why this state is not a usable read-only projection right now, or `None` when it is
     /// (v0.29.0 D4 — the shared readiness predicate `search` asks).
@@ -193,6 +204,21 @@ impl WsState {
         }
         if !self.pending_removals.is_empty() {
             return Some("directory removals are blocked by untracked occupants");
+        }
+        // A head stamp in the FUTURE makes the age term above vacuous: `now - t` is negative, so
+        // the mirror never ages out and an arbitrarily stale one reads as current. The realistic
+        // cause is a clock CORRECTION — the machine synced while its clock ran ahead, then NTP
+        // pulled it back — which `selfupdate`'s own «due» check already has an arm for.
+        //
+        // It belongs HERE and not in `rebuild_reason` on purpose: the age is unknown, which is a
+        // reason to stop vouching for the mirror, not to re-download it. Forcing a from-zero
+        // rebuild of a large mirror over two minutes of skew would be a worse bug than the one
+        // it fixes, and the next ordinary `docli sync` re-stamps the field either way.
+        if self
+            .head_reached_at
+            .is_some_and(|t| t.saturating_sub(now) > Self::MAX_CLOCK_SKEW_SECS)
+        {
+            return Some("its last head time is in the future, so its age cannot be read");
         }
         None
     }

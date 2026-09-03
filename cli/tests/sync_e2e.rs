@@ -145,6 +145,14 @@ fn fx() -> Fx {
     }
 }
 
+/// Wall-clock unix seconds, the same value `sync_cmd` stamps with (that one is crate-private).
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 fn api_for(fx_root: &Path, server: &str) -> Api {
     let creds = CredsStore::open(fx_root.join("home/.docli")).unwrap();
     creds
@@ -295,6 +303,48 @@ fn check_exits_nonzero_when_behind() {
         .unwrap()
         .insert(2, wire_node(2, "file", "b.md", 2, Some("y")));
     assert_eq!(check(&mut f, &server), 1, "agents branch on the exit code");
+}
+
+/// A head stamp in the FUTURE — the realistic cause is an NTP correction after a sync that ran
+/// while the clock was ahead — makes the mirror's age unreadable, so `WsState::unusable_reason`
+/// stops vouching for it and `docli read`/`docli search` say so. **`docli sync --check` must
+/// HEAL that**, not report «fresh» over it: two authorities disagreeing about one mirror is the
+/// exact split the shared readiness predicate exists to prevent. The probe establishes the one
+/// fact the field records — the cursor is at the server's head, now — so it can fix it.
+#[test]
+fn check_heals_a_head_time_left_in_the_future_by_a_clock_correction() {
+    let mut f = fx();
+    let tree: Arc<Mutex<BTreeMap<u128, Value>>> = Arc::new(Mutex::new(BTreeMap::from([(
+        1,
+        wire_node(1, "file", "a.md", 1, Some("x")),
+    )])));
+    let server = spawn_stub(tree_server(tree.clone()));
+    assert_eq!(sync(&mut f, &server), 0);
+
+    // The clock ran ahead when the mirror synced; NTP has since pulled it back.
+    let control = ControlRoot::new(&f.project.root);
+    let mut st = control.load_state(WS).unwrap().unwrap();
+    let ahead = st.head_reached_at.unwrap() + 86_400;
+    st.head_reached_at = Some(ahead);
+    control.save_state(WS, &st).unwrap();
+    let now = unix_now();
+    assert!(
+        st.unusable_reason(None, now).is_some(),
+        "the read verbs stop vouching for it"
+    );
+
+    // …and `--check` both passes AND repairs, so the disagreement cannot persist.
+    assert_eq!(check(&mut f, &server), 0);
+    let healed = control.load_state(WS).unwrap().unwrap();
+    assert!(
+        healed.head_reached_at.unwrap() <= unix_now(),
+        "the stamp must be re-anchored to real time, not left in the future"
+    );
+    assert_eq!(
+        healed.unusable_reason(None, unix_now()),
+        None,
+        "and the read verbs must agree with the gate again"
+    );
 }
 
 #[test]

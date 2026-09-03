@@ -1,6 +1,6 @@
 [package]
 name = "docli-cli"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 # MSRV for the public mirror: latest stable we build and verify with (user ruling 2026-08-30 —
 # no groveling for old toolchains). Kept uniform across the three mirror crates; clippy's

@@ -253,8 +253,8 @@ fn doctor_mount(
         }
     };
     // A durable pending repair IS a discrepancy (Codex round 29): with the flag set (or the
-    // cursor short of head) the mirror is not a complete projection, `--check` fails and
-    // search refuses local paths — doctor must not out-vote them with "clean".
+    // cursor short of head) the mirror is not a complete projection, `--check` fails and both
+    // `search` and `read` disclose it — doctor must not out-vote them with "clean".
     if state.from_zero || !state.at_head {
         out.push(Discrepancy {
             class: "repair-pending",

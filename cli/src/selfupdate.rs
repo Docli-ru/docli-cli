@@ -274,10 +274,18 @@ fn due(checked_at: i64, now: i64) -> bool {
 /// The notice for a known-newer version, or `None`. The comparison is [`parse_semver`]'s, so a
 /// manifest version that is not plain `x.y.z` announces nothing — the same fail-closed posture
 /// the update path itself takes.
+///
+/// It names **two** commands, and the second is v0.29.1 D9. `self-update` swaps the BINARY and
+/// nothing else, while the agent contract — `SKILL.md`, `AGENTS.md`, the hook wiring — reaches
+/// disk only through `docli init`. An un-regenerated install is therefore the blast radius of
+/// every contract change, and a release that removed a documented output field (this one removed
+/// `local_path`) would otherwise leave an agent following instructions describing a CLI that no
+/// longer exists. `docli init` has been idempotent since v0.28.2, so naming it unconditionally
+/// costs a re-run that changes nothing when nothing changed.
 pub fn notice_for(latest: &str, current: &str) -> Option<String> {
     match (parse_semver(latest), parse_semver(current)) {
         (Some(l), Some(c)) if l > c => Some(format!(
-            "docli-cli {current} -> {latest} - update: docli self-update"
+            "docli-cli {current} -> {latest} - update: docli self-update, then docli init"
         )),
         _ => None,
     }
@@ -369,11 +377,18 @@ mod tests {
 
     #[test]
     fn the_notice_announces_strictly_newer_and_names_the_command() {
-        // «docli 0.1.2 -> 0.1.3 - update: docli self-update». An agent that reads a state and a
-        // VERB can act; an agent that reads a complaint cannot.
+        // «docli-cli 0.1.2 -> 0.1.3 - update: docli self-update, then docli init». An agent that
+        // reads a state and a VERB can act; an agent that reads a complaint cannot.
         let n = notice_for("0.1.3", "0.1.2").expect("newer announces");
         assert!(n.contains("0.1.2") && n.contains("0.1.3"), "{n}");
         assert!(n.contains("docli self-update"), "{n}");
+        // v0.29.1 D9: `self-update` swaps the binary and nothing else, so the notice must also
+        // name the command that regenerates the agent contract on disk. Without it an
+        // un-regenerated install keeps instructing agents about output fields a release removed.
+        assert!(
+            n.contains("docli init"),
+            "the contract half must be named: {n}"
+        );
         // ONE naming rule across every message the CLI prints: it names ITSELF `docli-cli`, and
         // a command you type stays the bare `docli`. Both halves are in this single line, which
         // is why it is the one pinned — «docli-cli 0.1.2 -> 0.1.3 - update: docli self-update».

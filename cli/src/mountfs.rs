@@ -75,6 +75,59 @@ pub fn contained_join(root: &Path, rel: &str) -> Result<PathBuf> {
     Ok(root.join(p))
 }
 
+/// CANONICAL containment, for a consumer that is about to OPEN the path (`docli read`) — and it
+/// returns the RESOLVED path rather than a yes/no, deliberately.
+///
+/// [`contained_join`] is lexical, and a read holds no mount claim, so a symlink planted inside a
+/// mirror would otherwise let a mirror-relative address name any file the user can open.
+/// Canonicalizing both ends resolves every link first; it also refuses a path that does not
+/// exist, which is the caller's «gone» answer rather than a separate stat.
+///
+/// **Handing back the resolved path is what makes the check worth having.** A caller that
+/// verified one path and then opened the original would leave a swap window between the two, and
+/// a lock-free reader has nothing else closing it. Opening what was actually verified removes
+/// every intermediate link from that window.
+///
+/// **`root` must ALREADY be canonical, or anchored to something that is** — this function does
+/// not canonicalize it, deliberately. Canonicalizing both ends makes a symlinked ROOT vacuous:
+/// root and file resolve through the same link, `starts_with` holds, and the containment check
+/// passes over a directory that is somewhere else entirely. That is the round-17 defect
+/// («a swapped root canonicalizes consistently against itself») one level down, and the
+/// mount arm only escapes it because `verify_mount_identity` refuses a symlinked mount root
+/// first. A caller with no such anchor must build `root` by joining onto a canonical path it
+/// trusts, so that a link anywhere in the chain lands the file outside the expected prefix.
+///
+/// It returns a THREE-way answer rather than an `Option`, because the caller's three answers are
+/// genuinely different: nothing is there, something is there but not ours, and we could not
+/// find out. Collapsing the third into either of the first two puts «this mirror does not hold
+/// it» on a file nobody was able to look at.
+pub fn canonical_within(root: &Path, abs: &Path) -> Containment {
+    let a = match abs.canonicalize() {
+        Ok(a) => a,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Containment::Missing,
+        Err(e) => return Containment::Unresolvable(e),
+    };
+    if a.starts_with(root) {
+        Containment::Inside(a)
+    } else {
+        Containment::Escaped
+    }
+}
+
+/// What [`canonical_within`] found.
+pub enum Containment {
+    /// Resolved, and inside the root. Carries the RESOLVED path — open this one, not the
+    /// original, or the check and the open are about different files.
+    Inside(PathBuf),
+    /// A component of the path does not exist.
+    Missing,
+    /// It resolves, but outside the root — a link leading out of the mirror.
+    Escaped,
+    /// The resolve itself failed: a permission, an ACL, an I/O fault. NOT an answer about
+    /// whether the file is there.
+    Unresolvable(std::io::Error),
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct MountMarker {
     /// Absolute path of the owning `.docli/` — TWO DISTINCT configs resolving to one canonical
