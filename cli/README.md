@@ -51,7 +51,7 @@ The same steps separately, and for scripts where nothing may ask a question:
 ```sh
 docli login                              # browser sign-in via loopback OAuth
 docli list                               # every workspace; the ones mounted here are marked *
-docli init --workspace <id> --dir docli-mirror/notes --gitignore
+docli init --workspace <id> --dir .docli/mirror/notes --gitignore
 docli sync                               # one-shot sync of every mount
 docli search "what you need"             # server search across mounts
 docli read "Notes/plan.md"               # print a mirrored note (--lines, --id, --json)

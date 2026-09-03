@@ -424,7 +424,7 @@ pub fn resolve(project: &Project, args: &ReadArgs, now: i64) -> Outcome {
         Ok(m) => m,
         Err(r) => return Outcome::Refused(r),
     };
-    let control = ControlRoot::new(&project.root);
+    let control = project.control_root();
 
     let mut hits: Vec<Loaded> = Vec::new();
     let mut misses: Vec<(String, Miss)> = Vec::new();
@@ -1194,6 +1194,7 @@ mod tests {
     fn fx(mounts: &[(&str, u128, Option<&str>)]) -> Fx {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
+        let control_dir = root.join(".docli");
         std::fs::create_dir_all(root.join(".docli")).unwrap();
         let owner = std::fs::canonicalize(root.join(".docli"))
             .unwrap()
@@ -1213,6 +1214,7 @@ mod tests {
                 dir: (*dir).to_string(),
                 folder: None,
                 name: name.map(str::to_string),
+                derived_dir: false,
             });
         }
         Fx {
@@ -1224,6 +1226,7 @@ mod tests {
                     mounts: table,
                     mcp_label: None,
                 },
+                control: control_dir.clone(),
             },
         }
     }
@@ -2205,12 +2208,14 @@ mod tests {
             dir: "m1".into(),
             folder: None,
             name: Some(Uuid::from_u128(2).to_string()),
+            derived_dir: false,
         };
         let other = Mount {
             workspace: Uuid::from_u128(2),
             dir: "m2".into(),
             folder: None,
             name: None,
+            derived_dir: false,
         };
         let cfg = |mounts: Vec<Mount>| DocliToml {
             server: "https://docli.ru".into(),
@@ -2234,6 +2239,7 @@ mod tests {
             dir: Uuid::from_u128(2).to_string(),
             folder: None,
             name: None,
+            derived_dir: false,
         };
         let e = crate::config::validate_config(&cfg(vec![by_dir, other.clone()]))
             .expect_err("a nameless mount collides through its directory");
@@ -2372,12 +2378,14 @@ mod tests {
             dir: "m1".into(),
             folder: None,
             name: Some(format!("  {}  ", Uuid::from_u128(2))),
+            derived_dir: false,
         };
         let other = Mount {
             workspace: Uuid::from_u128(2),
             dir: "m2".into(),
             folder: None,
             name: None,
+            derived_dir: false,
         };
         crate::config::validate_config(&DocliToml {
             server: "https://docli.ru".into(),
@@ -2446,6 +2454,7 @@ mod tests {
                 dir: "m1".into(),
                 folder: None,
                 name: Some("   ".into()),
+                derived_dir: false,
             }],
             mcp_label: None,
         })

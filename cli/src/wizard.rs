@@ -95,7 +95,28 @@ pub fn prompt_theme() -> ColorfulTheme {
 /// dotted: coding agents have to be able to list it.
 /// The one directory the CLI proposes for mirrors. Named, because the `.gitignore` helper
 /// hoists to it and must hoist to nothing else.
-pub const MIRROR_PARENT: &str = "docli-mirror";
+/// The mirror lives INSIDE the control plane (`.docli/mirror/<name>`), not beside it.
+///
+/// One gitignored directory instead of two, one thing `uninstall --purge` removes, and the
+/// cache stops sitting in the project root where `ls`, a file tree or an IDE sidebar puts it in
+/// front of anyone who never asked. v0.29.1 D1 already removed the reason anyone would be
+/// HANDED a path into it; this removes the reason they would trip over one.
+pub const MIRROR_PARENT: &str = ".docli/mirror";
+
+/// The per-MACHINE cache for a workspace: `~/.docli/mirror/<workspace-id>`.
+///
+/// Keyed on the ID, not the handle — a project links several workspaces and several projects
+/// link the same workspace, so the cache belongs to the WORKSPACE, and handles rename while ids
+/// do not. Shown to the user as the default; accepting it stores NOTHING in `docli.toml`, which
+/// is what keeps a committed file free of this machine's home directory.
+pub fn machine_cache_dir(ws: uuid::Uuid) -> Option<String> {
+    crate::creds::cli_home().ok().map(|h| {
+        h.join("mirror")
+            .join(ws.to_string())
+            .to_string_lossy()
+            .into_owned()
+    })
+}
 
 pub fn default_dir(handle: &str) -> String {
     let h = handle.trim_start_matches('@').trim();
@@ -178,6 +199,7 @@ pub fn missing_ignores(project_root: &Path, dir: &str) -> Result<Vec<IgnoreFix>>
             dir: dir.to_string(),
             folder: None,
             name: None,
+            derived_dir: false,
         },
     );
     // PHYSICAL from the first step, like the geometry rules. With `/outside/link -> /repo/sub`
@@ -185,6 +207,14 @@ pub fn missing_ignores(project_root: &Path, dir: &str) -> Result<Vec<IgnoreFix>>
     // so both the «does it need an entry» question and the work-tree lookup answered about the
     // wrong tree — the fix vanished while geometry (which physicalizes) went on refusing.
     let phys = config::physicalize(&abs_dir);
+    // A mount INSIDE `.docli/` is already covered by the `/.docli/` entry proposed above — which
+    // is the default since the mirror moved there. Asking git is the wrong question at this
+    // moment: the entry that will cover it has not been WRITTEN yet, so `check-ignore` says
+    // «missing» and we would offer a second, redundant line for a path the first one subsumes.
+    let control = config::physicalize(&project_root.join(".docli"));
+    if config::is_ancestor_or_self(&control, &phys) {
+        return Ok(out);
+    }
     match config::ignore_state(&phys, &phys) {
         config::IgnoreState::NotInRepo | config::IgnoreState::Covered => {}
         config::IgnoreState::Unknown(why) => anyhow::bail!(why),
@@ -595,11 +625,26 @@ pub fn run(cwd: &Path, server_flag: Option<&str>) -> Result<i32> {
         .as_ref()
         .and_then(|c| c.mounts.iter().find(|m| m.workspace == workspace.id))
         .map(|m| m.dir.clone());
+    // The DEFAULT is this machine's shared cache for that workspace. Accepting it must store
+    // nothing: `docli.toml` is committed, and writing an absolute home path into it would make
+    // the file wrong on every other machine.
+    let machine_default = machine_cache_dir(workspace.id);
     let dir: String = Input::with_theme(&prompt_theme())
         .with_prompt("Where to put the mirror")
-        .default(current_dir.unwrap_or_else(|| default_dir(&workspace.handle)))
+        .default(
+            current_dir
+                .clone()
+                .or_else(|| machine_default.clone())
+                .unwrap_or_else(|| default_dir(&workspace.handle)),
+        )
         .interact_text()?;
     let dir = dir.trim().trim_end_matches('/').to_string();
+    // Unchanged from the machine default ⇒ derived, so it is not written down.
+    let dir = if Some(dir.as_str()) == machine_default.as_deref() {
+        String::new()
+    } else {
+        dir
+    };
     // Prefilled with what this workspace is ALREADY scoped to, so Enter means «leave it» rather
     // than silently widening the mirror; clearing the field is then an explicit act, and the
     // flag path is told to clear (absent `--folder` means «leave alone» there).
@@ -640,6 +685,7 @@ pub fn run(cwd: &Path, server_flag: Option<&str>) -> Result<i32> {
         dir: dir.clone(),
         folder: folder.clone(),
         name: None,
+        derived_dir: false,
     };
     match mounts.iter_mut().find(|m| m.workspace == workspace.id) {
         // The same upsert `init_cmd` performs — re-point, never add a second mount.
@@ -794,14 +840,14 @@ mod tests {
 
     #[test]
     fn the_default_dir_is_derived_from_the_handle_and_shares_one_parent() {
-        assert_eq!(default_dir("agitek"), "docli-mirror/agitek");
-        assert_eq!(default_dir("@agitek"), "docli-mirror/agitek");
+        assert_eq!(default_dir("agitek"), ".docli/mirror/agitek");
+        assert_eq!(default_dir("@agitek"), ".docli/mirror/agitek");
         // A handle that is not a legal path component still yields a usable directory.
-        assert_eq!(default_dir("../etc"), "docli-mirror/etc");
-        assert_eq!(default_dir("///"), "docli-mirror/workspace");
+        assert_eq!(default_dir("../etc"), ".docli/mirror/etc");
+        assert_eq!(default_dir("///"), ".docli/mirror/workspace");
         // Every mount lands under ONE parent, which is what makes a single ignore line enough.
-        assert!(default_dir("a").starts_with("docli-mirror/"));
-        assert!(default_dir("b").starts_with("docli-mirror/"));
+        assert!(default_dir("a").starts_with(".docli/mirror/"));
+        assert!(default_dir("b").starts_with(".docli/mirror/"));
     }
 
     #[test]
@@ -813,18 +859,36 @@ mod tests {
             .current_dir(root)
             .status()
             .unwrap();
-        let missing = missing_ignores(root, "docli-mirror/agitek").unwrap();
+        // The DEFAULT mount lives inside `.docli/`, so a single line covers the control plane
+        // and the mirror both — the old two-line answer (`/.docli/` + `/docli-mirror/`) is one
+        // line now, which is the point of the move.
+        let missing = missing_ignores(root, ".docli/mirror/agitek").unwrap();
+        assert_eq!(entries(&missing), vec!["/.docli/".to_string()]);
+        // A mount the user places OUTSIDE `.docli/` still needs its own entry — and it is the
+        // EXACT path now, not a hoisted parent: `docli-mirror/` stopped being our default, so
+        // ignoring the whole of it would be ignoring a directory the user chose, not ours.
+        let outside = missing_ignores(root, "docli-mirror/agitek").unwrap();
         assert_eq!(
-            entries(&missing),
-            vec!["/.docli/".to_string(), "/docli-mirror/".to_string()]
+            entries(&outside),
+            vec!["/.docli/".to_string(), "/docli-mirror/agitek/".to_string()]
         );
 
+        // The round trip is per-MOUNT: writing what a mount asked for must satisfy the same
+        // check for THAT mount. Writing `/.docli/` covers the default mount and the control
+        // plane; it says nothing about a mount the user put elsewhere.
         append_ignores(&missing).unwrap();
+        assert!(
+            missing_ignores(root, ".docli/mirror/agitek")
+                .unwrap()
+                .is_empty(),
+            "the written entries must satisfy the same check that produced them"
+        );
+        append_ignores(&outside).unwrap();
         assert!(
             missing_ignores(root, "docli-mirror/agitek")
                 .unwrap()
                 .is_empty(),
-            "the written entries must satisfy the same check that produced them"
+            "…and the same holds for a mount outside .docli/"
         );
         // The user's own content survives an append.
         std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
@@ -996,10 +1060,10 @@ mod tests {
             .current_dir(root)
             .status()
             .unwrap();
-        // Our own default hoists to one shared line…
-        assert!(
-            entries(&missing_ignores(root, "docli-mirror/agitek").unwrap())
-                .contains(&"/docli-mirror/".to_string())
+        // The default is inside `.docli/`, which is already required — nothing extra to add…
+        assert_eq!(
+            entries(&missing_ignores(root, ".docli/mirror/agitek").unwrap()),
+            vec!["/.docli/".to_string()]
         );
         // …but a mount the user placed under their source tree is ignored by its OWN path.
         // Offering `src/` would ignore every new file anywhere under `src`.

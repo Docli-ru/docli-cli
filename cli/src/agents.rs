@@ -1767,6 +1767,7 @@ mod tests {
             dir: dir.into(),
             folder: None,
             name: None,
+            derived_dir: false,
         };
         assert_eq!(
             skill_globs(root, &[m("notes"), m("docli-mirror/agitek")]),

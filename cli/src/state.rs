@@ -240,6 +240,19 @@ pub struct ControlRoot {
 }
 
 impl ControlRoot {
+    /// The control plane for a project. Since the mirror became per-MACHINE, this is
+    /// `~/.docli` — the same home the credentials use — not `<project>/.docli`.
+    ///
+    /// State has to live wherever the mirror lives. Two projects linking one workspace share one
+    /// cache; if each kept its own state for it, both would write the same directory believing
+    /// different things about what is in it.
+    pub fn at(dir: &Path) -> Self {
+        ControlRoot {
+            dir: dir.to_path_buf(),
+        }
+    }
+
+    /// TESTS and the legacy project-local shape: `<root>/.docli`.
     pub fn new(project_root: &Path) -> Self {
         ControlRoot {
             dir: project_root.join(".docli"),

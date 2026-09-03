@@ -124,6 +124,7 @@ struct Fx {
 fn fx() -> Fx {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
+    let control_dir = root.join(".docli");
     let mirror = root.join("mirror");
     let project = Project {
         root,
@@ -134,9 +135,11 @@ fn fx() -> Fx {
                 dir: "mirror".into(),
                 folder: None,
                 name: Some("тест".into()),
+                derived_dir: false,
             }],
             mcp_label: None,
         },
+        control: control_dir.clone(),
     };
     Fx {
         _tmp: tmp,
@@ -668,6 +671,7 @@ fn no_access_is_partial_success_not_an_abort() {
         dir: "mirror2".into(),
         folder: None,
         name: Some("чужое".into()),
+        derived_dir: false,
     });
     let tree: Arc<Mutex<BTreeMap<u128, Value>>> = Arc::new(Mutex::new(BTreeMap::from([(
         1,
@@ -908,6 +912,7 @@ fn doctor_no_access_is_partial_success_not_an_abort() {
         dir: "mirror2".into(),
         folder: None,
         name: Some("чужое".into()),
+        derived_dir: false,
     });
     let tree: Arc<Mutex<BTreeMap<u128, Value>>> = Arc::new(Mutex::new(BTreeMap::from([(
         1,

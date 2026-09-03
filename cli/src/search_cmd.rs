@@ -33,7 +33,7 @@ pub fn run(project: &Project, api: &Api, query: &str, json: bool) -> Result<i32>
     // Request-level validation only (Codex round 24): search works without a cache, so the
     // mirror-write geometry rules must not block a server query.
     validate_config(&project.config)?;
-    let control = ControlRoot::new(&project.root);
+    let control = project.control_root();
     let mounts: Vec<&Mount> = project.config.mounts.iter().collect();
 
     // The local read happens BEFORE the request, because the position rides the request
@@ -526,6 +526,7 @@ mod tests {
     fn fx() -> Fx {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
+        let control_dir = root.join(".docli");
         std::fs::create_dir_all(root.join("mirror/docs")).unwrap();
         let project = Project {
             root: root.clone(),
@@ -534,12 +535,14 @@ mod tests {
                 mounts: vec![],
                 mcp_label: None,
             },
+            control: control_dir.clone(),
         };
         let mount = Mount {
             workspace: Uuid::from_u128(1),
             dir: "mirror".into(),
             folder: None,
             name: Some("заметки".into()),
+            derived_dir: false,
         };
         // A synced mount carries our MOUNT.docli — the round-17 identity anchor search
         // consults before rendering any local address.

@@ -1,6 +1,6 @@
 ---
 name: docli-mirror
-description: The docli (докли) notes mirror in this project — docli.toml, docli-mirror/, docli-cache/, *.docli markers. Use when asked to search, read, or change the user's docli/докли notes, vault, or workspace, and ALWAYS before editing any file under a mirror directory: those files are a read-only cache, and a hand edit there is destroyed with no conflict copy.
+description: The docli (докли) notes mirror in this project — docli.toml, .docli/mirror/, *.docli markers. Use when asked to search, read, or change the user's docli/докли notes, vault, or workspace, and ALWAYS before editing any file under a mirror directory: those files are a read-only cache, and a hand edit there is destroyed with no conflict copy.
 allowed-tools: Bash(docli *)
 ---
 

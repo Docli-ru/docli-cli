@@ -59,7 +59,7 @@ docli init                   # пошаговая настройка: вход, 
 ```sh
 docli login                              # вход через браузер по loopback OAuth
 docli list                               # все пространства; смонтированные здесь отмечены *
-docli init --workspace <id> --dir docli-mirror/notes --gitignore
+docli init --workspace <id> --dir .docli/mirror/notes --gitignore
 docli sync                               # разовая синхронизация всех монтирований
 docli search "что ищем"                  # серверный поиск по всем монтированиям
 docli read "Заметки/план.md"             # напечатать заметку из зеркала (--lines, --id, --json)

@@ -162,7 +162,14 @@ pub fn run(cwd: &Path, api: Option<&Api>, args: &InitArgs) -> Result<i32> {
         config.server = requested;
     }
 
-    match (&args.workspace, &args.dir) {
+    // `--workspace` without `--dir` means the machine cache — the normal case now, and the
+    // reason `--dir` stopped being mandatory: there is a correct default and it is not the
+    // project's business. An empty `dir` is what `resolve_mount_dirs` fills in at load.
+    let effective_dir = args
+        .dir
+        .clone()
+        .or_else(|| args.workspace.map(|_| String::new()));
+    match (&args.workspace, &effective_dir) {
         (Some(ws), Some(dir)) => {
             // Idempotent: re-running init for a workspace RE-POINTS its existing mount instead
             // of adding a second one (which validate_geometry would then refuse) — re-running
@@ -193,6 +200,7 @@ pub fn run(cwd: &Path, api: Option<&Api>, args: &InitArgs) -> Result<i32> {
                     dir: dir.clone(),
                     folder: args.folder.clone(),
                     name: args.name.clone(),
+                    derived_dir: false,
                 }),
             }
             // The MOUNT-TABLE rules gate the ADD too, not only the commands that later read the
@@ -201,6 +209,9 @@ pub fn run(cwd: &Path, api: Option<&Api>, args: &InitArgs) -> Result<i32> {
             // from a different command than the one that caused it, and names none. Cheapest
             // example: `--name <another mount's workspace uuid>`, which a scripted setup pasting
             // ids around produces naturally.
+            // Resolve BEFORE validating: an omitted `dir` is not yet a path, and every rule
+            // below — the display name, the geometry, the ignore gate — asks about one.
+            crate::config::resolve_mount_dirs(&mut config)?;
             crate::config::validate_config(&config)?;
             // …then the geometry rules, MINUS the ignore rule, which `--gitignore` is about to
             // satisfy. Everything else refuses here, before anything at all is written.
@@ -238,7 +249,7 @@ pub fn run(cwd: &Path, api: Option<&Api>, args: &InitArgs) -> Result<i32> {
                 );
             }
         }
-        _ => bail!("--workspace and --dir must be used together"),
+        _ => bail!("--dir needs --workspace to say which mount it is for"),
     }
 
     // Validate + resolve the whole --mcp intent BEFORE the first write: a bad flag must
@@ -382,6 +393,15 @@ pub fn run(cwd: &Path, api: Option<&Api>, args: &InitArgs) -> Result<i32> {
         validate_geometry(cwd, &config)?;
     }
 
+    // A DERIVED dir is never written back: `docli.toml` is committed and shared, so baking this
+    // machine's home directory into it would make the file wrong on every other machine — and
+    // the whole reason the default exists is that the path is not the project's business.
+    let mut config = config.clone();
+    for m in &mut config.mounts {
+        if m.derived_dir {
+            m.dir = String::new();
+        }
+    }
     let body = toml::to_string_pretty(&config).context("serializing docli.toml")?;
     fs::write(&config_path, format!("{}{body}", config_header()))?;
     crate::ui::ok(&format!("wrote {}", config_path.display()));
@@ -869,7 +889,7 @@ mod tests {
         // (b) The surfaces that identify this project as a mirror. A description that only
         // names the CONTRACT makes the model leap from \"find my note about X\" to \"docli
         // read-only mirror\" unaided.
-        for marker in ["docli.toml", "docli-mirror/", ".docli"] {
+        for marker in ["docli.toml", ".docli/mirror/", ".docli"] {
             assert!(
                 description.contains(marker),
                 "the description must name {marker}: {description}"

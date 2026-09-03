@@ -104,7 +104,7 @@ pub fn collect(project: &Project, api: &Api) -> Result<Vec<(String, Vec<Discrepa
         validate_geometry(&project.root, &project.config)?;
     }
     let rules = FsRules::native();
-    let control = ControlRoot::new(&project.root);
+    let control = project.control_root();
     let mut all: Vec<(String, Vec<Discrepancy>)> = Vec::new();
     for mount in &project.config.mounts {
         // Partial success (D4, Codex round 11): one revoked/unentitled mount reports as its

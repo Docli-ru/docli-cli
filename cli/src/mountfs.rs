@@ -523,6 +523,35 @@ mod tests {
         assert!(err.contains("already claimed"), "{err}");
     }
 
+    /// Two PROJECTS, one workspace, one cache — the shape the per-machine mirror creates and
+    /// the project-local one made impossible.
+    ///
+    /// Two things have to hold. The ownership marker must ACCEPT them both: `owner` is the
+    /// control root, and now that the control root is `~/.docli` for every project on the
+    /// machine, sharing is legitimate rather than the accident the marker was written to catch.
+    /// And the advisory lock must still serialize them, so only one is ever writing.
+    #[test]
+    fn two_projects_sharing_one_workspace_cache_are_accepted_and_serialized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mount = tmp.path().join("mirror");
+        // ONE control root — this is what makes both projects the same owner.
+        let owner = tmp.path().join("home/.docli");
+        std::fs::create_dir_all(&owner).unwrap();
+        let ws = Uuid::from_u128(1);
+
+        let held = claim_mount(&mount, &owner, ws).expect("project A claims it");
+        // Project B, a different checkout entirely, same workspace and same machine home.
+        let err = claim_mount(&mount, &owner, ws).expect_err("project B must not claim it too");
+        assert!(is_busy(&err), "expected contention, got: {err:#}");
+        // …and the refusal is CONTENTION, not the «claimed by one owner» rejection — that would
+        // mean the two projects were being treated as rivals rather than as sharers.
+        assert!(!format!("{err:#}").contains("one owner"), "{err:#}");
+
+        // When A finishes, B proceeds. Nothing is wedged.
+        drop(held);
+        claim_mount(&mount, &owner, ws).expect("B claims it once A is done");
+    }
+
     #[test]
     fn concurrent_claims_fail_fast_on_the_lock() {
         let tmp = tempfile::tempdir().unwrap();

@@ -40,8 +40,24 @@ fn default_server() -> String {
 pub struct Mount {
     /// Workspace ID — never the handle (handles rename at will; ids don't).
     pub workspace: Uuid,
-    /// Mount dir, relative to `docli.toml`'s directory (or absolute).
+    /// Mount dir. **Omitted in `docli.toml` for the normal case**, and then filled in at load
+    /// with the per-MACHINE cache: `~/.docli/mirror/<workspace-id>`.
+    ///
+    /// A cache keyed on the WORKSPACE, not on the project, is the whole point: a project links
+    /// several workspaces and several projects link the same workspace, so per-project mirrors
+    /// mean N copies of one workspace on a machine, N syncs, and N states that can disagree.
+    /// The id is the key because handles rename and ids do not — the same rule the mount table
+    /// already follows.
+    ///
+    /// An explicit `dir` still works and still wins (relative to `docli.toml`, or absolute):
+    /// scoped mounts and odd layouts keep their escape hatch.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub dir: String,
+    /// True when `dir` was DERIVED from the workspace id rather than written down. Never
+    /// serialized — it exists so a re-written `docli.toml` keeps omitting the path instead of
+    /// baking this machine's home directory into a committed file.
+    #[serde(skip)]
+    pub derived_dir: bool,
     /// Optional folder scope: mirror only this server subtree, mapped to the mount root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder: Option<String>,
@@ -60,6 +76,16 @@ impl Mount {
 pub struct Project {
     pub root: PathBuf,
     pub config: DocliToml,
+    /// Where state and markers live — `~/.docli` in production, a temp dir under test. Carried
+    /// on the project rather than read from the environment at each use, so a test can isolate
+    /// it without racing every other test on one process-global variable.
+    pub control: PathBuf,
+}
+
+impl Project {
+    pub fn control_root(&self) -> crate::state::ControlRoot {
+        crate::state::ControlRoot::at(&self.control)
+    }
 }
 
 /// Find `docli.toml` in `start` or an ancestor (the git discovery shape).
@@ -81,9 +107,17 @@ pub fn load_project(start: &Path) -> Result<Project> {
     let raw = fs::read_to_string(root.join(CONFIG_NAME)).context("reading docli.toml")?;
     // ONE origin normalization and ONE control-character refusal, both at this seam — see
     // `parse_config`, which `init` and the wizard share so neither can skip them.
-    let config = parse_config(&raw)?;
+    let mut config = parse_config(&raw)?;
     refuse_control_characters(&config)?;
-    Ok(Project { root, config })
+    // The ONE place an omitted `dir` becomes a real path. Everything downstream — geometry,
+    // sync, guard, doctor, read — sees a concrete mount and never learns the default exists.
+    resolve_mount_dirs(&mut config)?;
+    let control = crate::creds::cli_home()?;
+    Ok(Project {
+        root,
+        config,
+        control,
+    })
 }
 
 /// Parse `docli.toml` text — the ONE door for this file, so its refusals cannot be bypassed by
@@ -126,6 +160,33 @@ fn refuse_control_characters(config: &DocliToml) -> Result<()> {
 
 /// Absolute mount dir for a mount (lexically normalized — `.`/`..` resolved without touching
 /// the filesystem, so geometry holds for not-yet-created dirs too).
+/// Fill in every omitted `dir` with this machine's per-workspace cache. ONE resolution point,
+/// called at load, so every consumer downstream sees a concrete path and none of them has to
+/// know the default exists.
+pub fn resolve_mount_dirs(config: &mut DocliToml) -> Result<()> {
+    let mut home: Option<PathBuf> = None;
+    for m in &mut config.mounts {
+        if !m.dir.trim().is_empty() {
+            continue;
+        }
+        let h = match &home {
+            Some(h) => h.clone(),
+            None => {
+                let h = crate::creds::cli_home()?;
+                home = Some(h.clone());
+                h
+            }
+        };
+        m.dir = h
+            .join("mirror")
+            .join(m.workspace.to_string())
+            .to_string_lossy()
+            .into_owned();
+        m.derived_dir = true;
+    }
+    Ok(())
+}
+
 pub fn mount_abs(project_root: &Path, m: &Mount) -> PathBuf {
     let p = Path::new(&m.dir);
     let joined = if p.is_absolute() {
@@ -354,7 +415,11 @@ fn validate_geometry_inner(
     // Geometry runs on PHYSICAL paths: symlinked ancestors must not smuggle a mount past the
     // overlap/control/vault/git rules (Codex round 1).
     let project_root_phys = physicalize(project_root);
-    let control = project_root_phys.join(".docli");
+    // The control plane is the MACHINE home now (`~/.docli`), not `<project>/.docli`. Falling
+    // back to the project-local shape keeps the tests — and any project that still keeps one —
+    // meaningful.
+    let control =
+        physicalize(&crate::creds::cli_home().unwrap_or_else(|_| project_root_phys.join(".docli")));
     let abs: Vec<(usize, PathBuf)> = config
         .mounts
         .iter()
@@ -387,11 +452,27 @@ fn validate_geometry_inner(
                 m.display_name()
             );
         }
-        if is_ancestor_or_self(&control, a) {
-            bail!(
-                "mount `{}` is inside .docli/ - choose a directory outside .docli/",
-                m.display_name()
-            );
+        // A mount inside `.docli/` is FINE and is now the default (`.docli/mirror/<name>`) — the
+        // control plane and the mirror share one gitignored, one-line-to-purge home. What is not
+        // fine is a mount that IS the control root or that swallows its own bookkeeping: the
+        // apply pass would then prune `state/` or `markers/` as stale mirror content, which is
+        // the mirror deleting the record of itself.
+        for reserved in [
+            control.clone(),
+            control.join("state"),
+            control.join("markers"),
+        ] {
+            if is_ancestor_or_self(a, &reserved) {
+                bail!(
+                    "mount `{}` contains .docli/{} - a mount may live inside .docli/ (that is \
+                     the default) but must not contain the control plane's own directories",
+                    m.display_name(),
+                    reserved
+                        .strip_prefix(&control)
+                        .map(|r| r.display().to_string())
+                        .unwrap_or_default()
+                );
+            }
         }
         // An Obsidian vault ancestor: the plugin scan-diffs untracked files into CREATE
         // mutations, so a mirror dropped into a synced vault pushes a full duplicate of every
@@ -417,7 +498,11 @@ fn validate_geometry_inner(
         }
     }
     if require_ignored {
-        require_gitignored_control(&project_root_phys, &control)?;
+        // Only when the control plane is actually IN the work tree. With it in `~/.docli` there
+        // is nothing of ours in the repository, so the gate has nothing left to guard.
+        if is_ancestor_or_self(&project_root_phys, &control) {
+            require_gitignored_control(&project_root_phys, &control)?;
+        }
     }
     Ok(())
 }
@@ -528,18 +613,29 @@ fn require_gitignored(project_root: &Path, mount: &Path, m: &Mount) -> Result<()
         return Ok(());
     };
     if !git_check_ignore(&wt, mount)? {
+        // A mount inside `.docli/` — the default — is covered by the `.docli/` line alone, and
+        // `require_gitignored_control` demands that line anyway. Naming the mirror separately
+        // would ask for a second entry the first one subsumes.
+        let inside_control = is_ancestor_or_self(&physicalize(&project_root.join(".docli")), mount);
+        let lines = if inside_control {
+            "  .docli/".to_string()
+        } else {
+            format!(
+                "  {}/\n  .docli/",
+                mount.strip_prefix(&wt).unwrap_or(mount).display()
+            )
+        };
         bail!(
             "mount `{}` ({}) is inside the git work tree at {} but is not git-ignored - \
              `git add -A` would stage mirrored note contents, which could then be committed \
-             and pushed to a remote.\nAdd to .gitignore:\n  {}/\n  .docli/\nOr let docli \
+             and pushed to a remote.\nAdd to .gitignore:\n{}\nOr let docli \
              append them: docli init --gitignore",
             m.display_name(),
             mount.display(),
             wt.display(),
-            mount.strip_prefix(&wt).unwrap_or(mount).display()
+            lines
         );
     }
-    let _ = project_root; // control-root check runs once, in validate_geometry
     Ok(())
 }
 
@@ -573,6 +669,7 @@ mod tests {
             dir: "mirror".into(),
             folder: None,
             name: None,
+            derived_dir: false,
         }]);
         c.mcp_label = Some("stable".into());
         let body = toml::to_string_pretty(&c).unwrap();
@@ -596,6 +693,7 @@ mod tests {
             dir: dir.into(),
             folder: None,
             name: None,
+            derived_dir: false,
         }
     }
 
@@ -622,6 +720,18 @@ mod tests {
     #[test]
     fn a_mount_containing_the_control_plane_is_refused_both_directions() {
         let tmp = tempfile::tempdir().unwrap();
+        // These rules are ABOUT the control plane, so the control plane has to be inside the
+        // fixture — it lives in `~/.docli` now, and a test that let it resolve to the real home
+        // would be asserting about the developer's machine.
+        let _lock = crate::creds::home_env_lock();
+        std::env::set_var("DOCLI_HOME", tmp.path().join(".docli"));
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                std::env::remove_var("DOCLI_HOME");
+            }
+        }
+        let _restore = Restore;
         // A mount of `.` contains docli.toml — a legal server node named `docli.toml` would
         // overwrite the configuration.
         let c = cfg(vec![mount(1, ".")]);
@@ -633,22 +743,43 @@ mod tests {
         let c = cfg(vec![mount(1, "..")]);
         let err = validate_geometry(&sub, &c).unwrap_err().to_string();
         assert!(err.contains("docli.toml or .docli/ directory"), "{err}");
-        // Inverse containment: a mount inside .docli/ itself.
+        // A mount INSIDE `.docli/` is legal, and is the default since the mirror moved there:
+        // one gitignored directory, one thing `--purge` removes, and the cache out of the
+        // project root where a file tree puts it in front of somebody who never asked.
         let c = cfg(vec![mount(1, ".docli/mirror")]);
-        let err = validate_geometry(tmp.path(), &c).unwrap_err().to_string();
-        assert!(err.contains("inside .docli/"), "{err}");
+        validate_geometry(tmp.path(), &c).expect(".docli/mirror is the default mount location");
+        // What stays refused is a mount that IS the control root, or that swallows the control
+        // plane's own directories — the apply pass would prune `state/` and `markers/` as stale
+        // mirror content, which is the mirror deleting the record of itself.
+        for bad in [".docli", ".docli/state", ".docli/markers"] {
+            let c = cfg(vec![mount(1, bad)]);
+            let err = validate_geometry(tmp.path(), &c).unwrap_err().to_string();
+            assert!(err.contains("control plane"), "{bad}: {err}");
+        }
     }
 
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[test]
     fn a_case_varied_spelling_cannot_dodge_geometry_on_a_folding_platform() {
         // `.DOCLI` does not exist yet, so `physicalize` cannot canonicalize it to its on-disk
-        // spelling — but on macOS/Windows it IS `.docli`, and passing it here would let the
-        // mount claim the control plane itself (Codex round 9).
+        // spelling — but on macOS/Windows it IS `.docli`, so a mount there would BE the control
+        // root under another spelling (Codex round 9).
         let tmp = tempfile::tempdir().unwrap();
-        let c = cfg(vec![mount(1, ".DOCLI/mirror")]);
+        // These rules are ABOUT the control plane, so the control plane has to be inside the
+        // fixture — it lives in `~/.docli` now, and a test that let it resolve to the real home
+        // would be asserting about the developer's machine.
+        let _lock = crate::creds::home_env_lock();
+        std::env::set_var("DOCLI_HOME", tmp.path().join(".docli"));
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                std::env::remove_var("DOCLI_HOME");
+            }
+        }
+        let _restore = Restore;
+        let c = cfg(vec![mount(1, ".DOCLI")]);
         let err = validate_geometry(tmp.path(), &c).unwrap_err().to_string();
-        assert!(err.contains("inside .docli/"), "{err}");
+        assert!(err.contains("control plane"), "{err}");
         // Case-varied overlap between mounts is the same alias.
         let c = cfg(vec![mount(1, "Notes"), mount(2, "notes/sub")]);
         let err = validate_geometry(tmp.path(), &c).unwrap_err().to_string();
@@ -813,6 +944,7 @@ mod tests {
             dir: link.join("m").display().to_string(),
             folder: None,
             name: None,
+            derived_dir: false,
         }]);
         let err = validate_geometry(&proj, &c).unwrap_err().to_string();
         assert!(err.contains("not git-ignored"), "{err}");

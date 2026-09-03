@@ -78,7 +78,7 @@ pub fn run(project: &Project, api: &Api, opts: &SyncOptions) -> Result<i32> {
         validate_geometry(&project.root, &project.config)?;
     }
     let rules = FsRules::native();
-    let control = ControlRoot::new(&project.root);
+    let control = project.control_root();
     std::fs::create_dir_all(&control.dir).context("creating .docli/")?;
 
     let mut worst_exit = 0;
@@ -977,7 +977,7 @@ fn freshness_lines(cwd: &Path) -> Vec<String> {
     }
     // Deliberately NOT created here: a hook that has nothing to check must leave the tree
     // exactly as it found it. `one_mount_line` creates it only once it knows there is state.
-    let control = ControlRoot::new(&project.root);
+    let control = project.control_root();
     let mut out = Vec::new();
     for mount in &project.config.mounts {
         // The budget is the WHOLE hook's, and it is spent DOWN across mounts rather than

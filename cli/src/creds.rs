@@ -68,16 +68,24 @@ pub(crate) fn home_env_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// `~/.docli` (override: `DOCLI_HOME` — tests and odd setups) — the CLI's per-MACHINE home.
+///
+/// One definition, because more than one thing lives here now: the credentials, and since the
+/// mirror moved, the cache and its state as well. Two copies of this path would be two answers
+/// to «where does this machine keep its docli data».
+pub fn cli_home() -> Result<PathBuf> {
+    Ok(match std::env::var_os("DOCLI_HOME") {
+        Some(d) => PathBuf::from(d),
+        None => std::env::home_dir()
+            .context("cannot determine the home directory (set DOCLI_HOME)")?
+            .join(".docli"),
+    })
+}
+
 impl CredsStore {
     /// `~/.docli` (override: `DOCLI_HOME` — tests and odd setups).
     pub fn open_default() -> Result<Self> {
-        let dir = match std::env::var_os("DOCLI_HOME") {
-            Some(d) => PathBuf::from(d),
-            None => std::env::home_dir()
-                .context("cannot determine the home directory (set DOCLI_HOME)")?
-                .join(".docli"),
-        };
-        Self::open(dir)
+        Self::open(cli_home()?)
     }
 
     pub fn open(dir: PathBuf) -> Result<Self> {
