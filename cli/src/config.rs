@@ -521,6 +521,17 @@ pub(crate) fn find_git_worktree(from: &Path) -> Option<PathBuf> {
 }
 
 fn git_check_ignore(worktree: &Path, path: &Path) -> Result<bool> {
+    // A path OUTSIDE this work tree is not a question git can answer — it exits 128 with
+    // «is outside repository», which the catch-all arm below then reports as «cannot verify»
+    // and fails closed. Since the mirror and the control plane moved to `~/.docli`, that is the
+    // ORDINARY case: the project is a repository and our data is nowhere near it.
+    //
+    // There is nothing to require, so say so rather than asking. This is the whole ignore gate
+    // standing down on its own the moment nothing of ours can reach a git remote — which is what
+    // moving the cache out of the project bought.
+    if !physicalize(path).starts_with(physicalize(worktree)) {
+        return Ok(true);
+    }
     // A RELATIVE path: git canonicalizes the repo root, and an un-canonicalized absolute arg
     // (macOS /var vs /private/var) reads as "outside repository" — which would report a
     // correctly-ignored mount as unignored.

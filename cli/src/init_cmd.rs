@@ -396,13 +396,21 @@ pub fn run(cwd: &Path, api: Option<&Api>, args: &InitArgs) -> Result<i32> {
     // A DERIVED dir is never written back: `docli.toml` is committed and shared, so baking this
     // machine's home directory into it would make the file wrong on every other machine — and
     // the whole reason the default exists is that the path is not the project's business.
-    let mut config = config.clone();
-    for m in &mut config.mounts {
-        if m.derived_dir {
-            m.dir = String::new();
+    //
+    // SCOPED, deliberately. An earlier draft bound this copy to `config`, shadowing it for the
+    // rest of the function — so every later step (`missing_ignores`, the gitignore report) saw
+    // blanked dirs, resolved a mount to the PROJECT ROOT, and asked git to check-ignore the
+    // repository against itself. The suppression is a serialization detail and must not outlive
+    // the serialization.
+    let body = {
+        let mut for_disk = config.clone();
+        for m in &mut for_disk.mounts {
+            if m.derived_dir {
+                m.dir = String::new();
+            }
         }
-    }
-    let body = toml::to_string_pretty(&config).context("serializing docli.toml")?;
+        toml::to_string_pretty(&for_disk).context("serializing docli.toml")?
+    };
     fs::write(&config_path, format!("{}{body}", config_header()))?;
     crate::ui::ok(&format!("wrote {}", config_path.display()));
 
@@ -638,6 +646,64 @@ mod tests {
     /// `init` is the command that WRITES mounts, so it must ask the same door every reader
     /// asks. A table it authors and every other verb then refuses is the worst arrangement
     /// available: the refusal arrives from a different command than the one that caused it.
+    /// `docli init` in a GIT REPOSITORY with the default (derived) mount, writing the agent
+    /// files — the ordinary first run, and the one no test covered.
+    ///
+    /// 0.1.6 shipped broken here: the copy that blanks a derived `dir` before serializing was
+    /// bound to `config`, shadowing it for the rest of the function, so the later gitignore
+    /// report resolved a mount to the PROJECT ROOT and asked git to check-ignore the repository
+    /// against itself — exit 128, «cannot verify», fail closed. Every existing init test used a
+    /// non-git tempdir, so the whole ignore path was untested.
+    #[test]
+    fn init_in_a_git_repository_with_the_default_mount_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The fake home is its OWN tempdir, outside the repository — a real `~/.docli` never
+        // sits inside the project, and putting it there would test the wrong thing.
+        let home = tempfile::tempdir().unwrap();
+        let _lock = crate::creds::home_env_lock();
+        std::env::set_var("DOCLI_HOME", home.path().join(".docli"));
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                std::env::remove_var("DOCLI_HOME");
+            }
+        }
+        let _restore = Restore;
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(tmp.path())
+            .status()
+            .unwrap();
+        let args = InitArgs {
+            workspace: Some(Uuid::from_u128(7)),
+            // No `--dir`: the machine cache, which is the shipped default.
+            dir: None,
+            folder: None,
+            name: None,
+            server: Some("https://docli.ru".into()),
+            mcp: None,
+            mcp_label: None,
+            mcp_bare: false,
+            allow_prompt: false,
+            clear_folder: false,
+            write_gitignore: false,
+            skills: Some("none".into()),
+            hooks: None,
+            instructions: true,
+        };
+        run(tmp.path(), None, &args).expect("init must succeed in a git repository");
+        // Run twice: the second pass re-points an existing mount, which is the path that
+        // reached the blanked config first.
+        run(tmp.path(), None, &args).expect("a re-run must succeed too");
+        // …and the committed file still carries no machine path.
+        let body = std::fs::read_to_string(tmp.path().join("docli.toml")).unwrap();
+        assert!(
+            !body.contains("dir ="),
+            "a derived dir must not be written: {body}"
+        );
+        assert!(body.contains(&Uuid::from_u128(7).to_string()), "{body}");
+    }
+
     #[test]
     fn init_refuses_a_mount_table_the_readers_would_refuse() {
         let tmp = tempfile::tempdir().unwrap();
