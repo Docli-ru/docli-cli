@@ -197,11 +197,16 @@ pub fn resolve_mount_dirs(config: &mut DocliToml) -> Result<()> {
                 h
             }
         };
-        m.dir = h
-            .join("mirror")
-            .join(m.workspace.to_string())
-            .to_string_lossy()
-            .into_owned();
+        // A SCOPED mount gets its own directory. The cache is keyed on the workspace, and
+        // `scope_key` forces a from-zero rebuild whenever it changes — so a scoped mount and an
+        // unscoped one sharing a directory would each rebuild the other's copy on every sync.
+        // Folding the scope into the key makes two different views of one workspace two
+        // different caches, which is what they are.
+        let leaf = match m.folder.as_deref() {
+            None => m.workspace.to_string(),
+            Some(f) => format!("{}@{}", m.workspace, f.trim_matches('/').replace('/', "-")),
+        };
+        m.dir = h.join("mirror").join(leaf).to_string_lossy().into_owned();
         m.derived_dir = true;
         m.workspace_label = format!("workspace {}", m.workspace);
     }
@@ -729,6 +734,51 @@ mod tests {
             derived_dir: false,
             workspace_label: String::new(),
         }
+    }
+
+    /// A SCOPED mount must not share a directory with an unscoped one. The cache is keyed on
+    /// the workspace and `scope_key` forces a from-zero rebuild whenever it changes, so two
+    /// projects holding different views of one workspace would each rebuild the other's copy on
+    /// every sync — permanent thrash, invisible until someone noticed their mirror was always
+    /// resyncing.
+    #[test]
+    fn a_scoped_mount_gets_its_own_cache_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let _lock = crate::creds::home_env_lock();
+        std::env::set_var("DOCLI_HOME", home.path().join(".docli"));
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                std::env::remove_var("DOCLI_HOME");
+            }
+        }
+        let _restore = Restore;
+
+        let mk = |folder: Option<&str>| {
+            let mut c = cfg(vec![Mount {
+                workspace: Uuid::from_u128(1),
+                dir: String::new(),
+                folder: folder.map(str::to_string),
+                name: None,
+                derived_dir: false,
+                workspace_label: String::new(),
+            }]);
+            resolve_mount_dirs(&mut c).unwrap();
+            c.mounts[0].dir.clone()
+        };
+        let whole = mk(None);
+        let scoped = mk(Some("docs/api"));
+        assert_ne!(
+            whole, scoped,
+            "a scope must not land in the whole-workspace cache"
+        );
+        assert!(whole.ends_with(&Uuid::from_u128(1).to_string()), "{whole}");
+        assert!(
+            scoped.contains("@docs-api"),
+            "the scope belongs in the key: {scoped}"
+        );
+        // The same scope resolves to the same place, so two projects that agree still SHARE.
+        assert_eq!(scoped, mk(Some("/docs/api/")));
     }
 
     #[test]

@@ -195,7 +195,12 @@ pub fn gather(cwd: &Path, server: &str) -> Result<Status> {
         status.project_other_server = Some(project.config.server.clone());
         return Ok(status);
     }
-    let control = ControlRoot::new(&root);
+    // The PROJECT's control root — `~/.docli` since the cache became per-machine, not
+    // `<project>/.docli`. Built from the project rather than the project ROOT: comparing a
+    // mirror's ownership marker against the wrong directory made `docli status` report a
+    // perfectly synced mount as «never synced / not this mirror», with its own node count
+    // printed on the line above.
+    let control = project.control_root();
     for m in &project.config.mounts {
         status.mounts.push(mount_status(&root, &control, m));
         // A git question nobody can answer is REPORTED, not silently rendered as «fine»: this

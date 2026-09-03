@@ -27,27 +27,27 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use console::style;
 use dialoguer::theme::ColorfulTheme;
-use dialoguer::{Confirm, Input, MultiSelect, Select};
+use dialoguer::{Confirm, Input, MultiSelect};
 
 use crate::config::{self, DocliToml, Mount};
 use crate::http::{Api, WorkspaceInfo};
 use crate::{creds, init_cmd, login, ui};
 
-const STEPS: usize = 7;
+const STEPS: usize = 6;
 
 /// What the wizard decided, ready to apply.
 pub struct Plan {
     pub server: String,
-    pub workspace: WorkspaceInfo,
+    /// EVERY workspace the reader picked. A project links several, and asking one at a time made
+    /// setting up three a matter of running the wizard three times (user ruling 2026-09-03).
+    pub workspaces: Vec<WorkspaceInfo>,
+    /// Empty for the machine cache, which is the only thing the guided path produces now. The
+    /// field survives because `init_cmd` still takes an explicit `--dir`.
     pub dir: String,
-    pub folder: Option<String>,
     /// The reader agreed to the `.gitignore` lines. The WRITE happens inside `init_cmd`, after
     /// the whole configuration validates — writing here covered only the selected mount and
     /// left a partial edit behind when another mount then failed the gate.
     pub gitignore: bool,
-    /// The reader emptied a scope that was set: `init_cmd` must be told to CLEAR it, since an
-    /// absent `--folder` there means «leave what is recorded».
-    pub clear_folder: bool,
     pub agents: Vec<&'static str>,
     /// Which of the two hook-capable agents the reader agreed to install hooks for (v0.28.6 D6).
     /// Offered UNTICKED, unlike the detected agent configurations: a config entry names a
@@ -445,12 +445,23 @@ pub fn pick_agents(detected: &[&'static str]) -> Result<Vec<&'static str>> {
             }
         })
         .collect();
-    let checked: Vec<bool> = all.iter().map(|a| detected.contains(&a.key)).collect();
-    let chosen = MultiSelect::with_theme(&prompt_theme())
-        .with_prompt("Where to wire this project's MCP connection")
-        .items(&items)
-        .defaults(&checked)
-        .interact()?;
+    // NOTHING is pre-ticked, and at least one must be picked (user ruling 2026-09-03). This
+    // REVERSES v0.28.2's «detected configurations arrive pre-ticked»: that rule was written to
+    // stop `docli init` writing every config it found, and a pre-ticked box is still a box the
+    // reader has to notice and clear. The choice is theirs to make, not ours to make and theirs
+    // to undo — and a setup that wires nothing is almost never what was wanted, so an empty
+    // pick asks again rather than proceeding.
+    let chosen = loop {
+        let picked = MultiSelect::with_theme(&prompt_theme())
+            .with_prompt("Where to wire this project's MCP connection (pick at least one)")
+            .items(&items)
+            .defaults(&vec![false; items.len()])
+            .interact()?;
+        if !picked.is_empty() {
+            break picked;
+        }
+        ui::warn("Pick at least one - space toggles, Enter confirms.");
+    };
     Ok(chosen.into_iter().map(|i| all[i].key).collect())
 }
 
@@ -490,11 +501,17 @@ fn pick_enforcement(
              enforcement at all.",
         );
         let items: Vec<String> = candidates.iter().map(|a| a.display().to_string()).collect();
-        // UNTICKED. This is the one selection in the whole wizard that starts empty.
+        // TICKED (user ruling 2026-09-03), reversing v0.28.6 D6's «offered UNTICKED». The
+        // argument for unticking was that a hook runs a program while a config entry only names
+        // a server — true, and the reason the offer still spells out exactly what is written and
+        // where. But a lone «no» sitting among yeses reads as a warning the reader cannot
+        // account for, and BOTH agents refuse to run a project-local hook until the person
+        // accepts a trust dialog, so the platform, not this checkbox, is what actually gates
+        // execution. Space clears it.
         let picked = MultiSelect::with_theme(&prompt_theme())
-            .with_prompt("Install docli's hooks (nothing is ticked - space to opt in)")
+            .with_prompt("Install docli's hooks (space to clear)")
             .items(&items)
-            .defaults(&vec![false; items.len()])
+            .defaults(&vec![true; items.len()])
             .interact()?;
         chosen = picked.into_iter().map(|i| candidates[i]).collect();
     }
@@ -520,9 +537,12 @@ fn pick_enforcement(
     for line in crate::instructions::consent_summary(cwd) {
         ui::detail(&format!("  {line}"));
     }
+    // YES by default, with the rest (user ruling 2026-09-03): a stray «no» among yeses reads as
+    // a warning the reader cannot account for. An existing `CLAUDE.md` is still never edited —
+    // that guard is in `instructions.rs`, not in this default.
     let instructions = Confirm::with_theme(&prompt_theme())
         .with_prompt("Write these instruction files?")
-        .default(false)
+        .default(true)
         .interact()?;
     Ok((chosen, instructions))
 }
@@ -598,7 +618,7 @@ pub fn run(cwd: &Path, server_flag: Option<&str>) -> Result<i32> {
     let api = Api::new(&server, creds::CredsStore::open_default()?)?;
 
     // ── 3. Пространство ──────────────────────────────────────────────────────────────────
-    ui::step(3, STEPS, "Workspace");
+    ui::step(3, STEPS, "Workspaces");
     let spaces = api.workspaces().context("listing your workspaces")?;
     if spaces.is_empty() {
         ui::warn("This account has no workspaces you can reach.");
@@ -611,61 +631,34 @@ pub fn run(cwd: &Path, server_flag: Option<&str>) -> Result<i32> {
         .iter()
         .map(|w| format!("@{}  {}", w.handle, ui::dim(&w.name)))
         .collect();
-    let picked = Select::with_theme(&prompt_theme())
-        .with_prompt("Which workspace should be mirrored?")
+    ui::detail("Space toggles, Enter confirms. Pick as many as you like.");
+    let picked = MultiSelect::with_theme(&prompt_theme())
+        .with_prompt("Which workspaces should be mirrored?")
         .items(&labels)
-        .default(0)
+        .defaults(&vec![false; labels.len()])
         .interact()?;
-    let workspace = spaces[picked].clone();
+    if picked.is_empty() {
+        ui::warn("No workspace picked - there would be nothing to mirror.");
+        ui::next(&format!(
+            "Run {} again and choose at least one.",
+            ui::cmd("docli init")
+        ));
+        return Ok(1);
+    }
+    let workspaces: Vec<WorkspaceInfo> = picked.iter().map(|&i| spaces[i].clone()).collect();
 
-    // ── 4. Каталог ───────────────────────────────────────────────────────────────────────
-    ui::step(4, STEPS, "Mirror directory");
-    // Prefilled with the mount this workspace ALREADY has, if any: pressing Enter on a re-run
-    // must not silently abandon an existing mirror for the CLI's own default.
-    let current_dir = existing
-        .as_ref()
-        .and_then(|c| c.mounts.iter().find(|m| m.workspace == workspace.id))
-        .map(|m| m.dir.clone());
-    // The DEFAULT is this machine's shared cache for that workspace. Accepting it must store
-    // nothing: `docli.toml` is committed, and writing an absolute home path into it would make
-    // the file wrong on every other machine.
-    // The default is EMPTY and described in words, not shown as a path. Two reasons: the
-    // absolute cache path is not something the reader acts on (they do not manage that
-    // directory), and printing it here is the most prominent place the CLI could hand an agent
-    // the mirror root — the leak the live-agent gate measured on `docli status`.
+    // ── NO directory step ────────────────────────────────────────────────────────────────
+    // The mirror lives in this machine's docli folder, keyed on the workspace. There is nothing
+    // to decide, so there is nothing to ask: a prompt whose only good answer is «the default»
+    // costs a step and, when it showed the path, was the CLI's most prominent way of handing an
+    // agent the mirror root. `docli init --dir` remains for the rare project that wants its own
+    // location.
     //
-    // An explicit path still works: type one and it wins, and it is written to `docli.toml`.
-    let dir: String = Input::with_theme(&prompt_theme())
-        .with_prompt("Where to put the mirror (Enter for this machine's docli cache)")
-        .allow_empty(true)
-        .default(current_dir.clone().unwrap_or_default())
-        .interact_text()?;
-    let dir = dir.trim().trim_end_matches('/').to_string();
-    // Prefilled with what this workspace is ALREADY scoped to, so Enter means «leave it» rather
-    // than silently widening the mirror; clearing the field is then an explicit act, and the
-    // flag path is told to clear (absent `--folder` means «leave alone» there).
-    let current_folder = existing
-        .as_ref()
-        .and_then(|c| c.mounts.iter().find(|m| m.workspace == workspace.id))
-        .and_then(|m| m.folder.clone());
-    let prompt = match &current_folder {
-        Some(_) => "Mirror only this folder (clear the field for the whole workspace)",
-        None => "Mirror only one folder (Enter for the whole workspace)",
-    };
-    let folder: String = Input::with_theme(&prompt_theme())
-        .with_prompt(prompt)
-        .allow_empty(true)
-        .default(current_folder.clone().unwrap_or_default())
-        .interact_text()?;
-    let folder = {
-        let f = folder.trim().trim_matches('/').to_string();
-        if f.is_empty() {
-            None
-        } else {
-            Some(f)
-        }
-    };
-    let clear_folder = folder.is_none() && current_folder.is_some();
+    // No folder prompt either. A scope is an expert flag (`--folder`), and offering it here
+    // would offer the one setting that can make the shared cache thrash — a scoped mount and an
+    // unscoped one would each force a from-zero rebuild of the other. What is already RECORDED
+    // is carried forward untouched, so a hand-written scope survives a re-run.
+    let dir = String::new();
 
     // Validate the geometry NOW, while the answer is still changeable and nothing is written —
     // against the config `init_cmd` will actually PRODUCE, existing mounts included. A probe
@@ -676,18 +669,26 @@ pub fn run(cwd: &Path, server_flag: Option<&str>) -> Result<i32> {
         .as_ref()
         .map(|c| c.mounts.clone())
         .unwrap_or_default();
-    let chosen = Mount {
-        workspace: workspace.id,
-        dir: dir.clone(),
-        folder: folder.clone(),
-        name: None,
-        derived_dir: false,
-        workspace_label: String::new(),
-    };
-    match mounts.iter_mut().find(|m| m.workspace == workspace.id) {
-        // The same upsert `init_cmd` performs — re-point, never add a second mount.
-        Some(slot) => *slot = chosen,
-        None => mounts.push(chosen),
+    for w in &workspaces {
+        // Carry forward whatever scope this workspace already has — the wizard no longer asks,
+        // and a re-run must not silently widen a hand-written one.
+        let folder = mounts
+            .iter()
+            .find(|m| m.workspace == w.id)
+            .and_then(|m| m.folder.clone());
+        let chosen = Mount {
+            workspace: w.id,
+            dir: dir.clone(),
+            folder,
+            name: None,
+            derived_dir: false,
+            workspace_label: String::new(),
+        };
+        match mounts.iter_mut().find(|m| m.workspace == w.id) {
+            // The same upsert `init_cmd` performs — re-point, never add a second mount.
+            Some(slot) => *slot = chosen,
+            None => mounts.push(chosen),
+        }
     }
     let mut probe = DocliToml {
         server: server.clone(),
@@ -715,7 +716,7 @@ pub fn run(cwd: &Path, server_flag: Option<&str>) -> Result<i32> {
     }
 
     // ── 5. Агенты ────────────────────────────────────────────────────────────────────────
-    ui::step(5, STEPS, "Coding agents");
+    ui::step(4, STEPS, "Coding agents");
     let detected = crate::agents::detect(cwd, std::env::home_dir().as_deref());
     ui::detail(
         "Space toggles, Enter confirms. The configurations found here are ticked; only what \
@@ -724,11 +725,11 @@ pub fn run(cwd: &Path, server_flag: Option<&str>) -> Result<i32> {
     let agents = pick_agents(&detected)?;
 
     // ── 6. Правила и хуки ────────────────────────────────────────────────────────────────
-    ui::step(6, STEPS, "Rules and enforcement");
+    ui::step(5, STEPS, "Rules and enforcement");
     let (hook_agents, instructions) = pick_enforcement(cwd, &detected)?;
 
     // ── 7. Git и первая синхронизация ────────────────────────────────────────────────────
-    ui::step(7, STEPS, "Git and the first sync");
+    ui::step(6, STEPS, "Git and the first sync");
     // Every line the consent will actually cause to be written — `init_cmd` writes for EVERY
     // mount, so showing only the selected one asked for agreement to a smaller change than the
     // one performed (and could touch a nested repository's file the reader never saw named).
@@ -760,10 +761,8 @@ pub fn run(cwd: &Path, server_flag: Option<&str>) -> Result<i32> {
 
     let plan = Plan {
         server,
-        workspace,
+        workspaces,
         dir,
-        folder,
-        clear_folder,
         agents,
         hooks: hook_agents,
         instructions,
@@ -778,44 +777,53 @@ fn apply(cwd: &Path, api: &Api, plan: Plan) -> Result<i32> {
     ui::heading("Done");
     // The flag path does the actual writing — one implementation of «create docli.toml, drop
     // SKILL.md, wire the agents», never a second copy that can drift from it.
-    let code = init_cmd::run(
-        cwd,
-        Some(api),
-        &init_cmd::InitArgs {
-            workspace: Some(plan.workspace.id),
-            dir: Some(plan.dir.clone()),
-            folder: plan.folder.clone(),
-            clear_folder: plan.clear_folder,
-            name: None,
-            server: Some(plan.server.clone()),
-            mcp: Some(if plan.agents.is_empty() {
-                "none".to_string()
-            } else {
-                plan.agents.join(",")
-            }),
-            mcp_label: None,
-            mcp_bare: false,
-            allow_prompt: false,
-            // The skill goes to every DETECTED agent's own directory regardless of what the
-            // reader ticked for MCP (D4): declining a config write must not silently cost them
-            // the contract too, and `init` already drops the same file at the open-standard
-            // path unconditionally.
-            skills: Some("auto".to_string()),
-            hooks: (!plan.hooks.is_empty()).then(|| {
-                plan.hooks
-                    .iter()
-                    .map(|a| a.key())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            }),
-            instructions: plan.instructions,
-            // Consent was collected in step 6; the WRITE belongs to `init_cmd`, which does it
-            // once the whole configuration has passed the gate.
-            write_gitignore: plan.gitignore,
-        },
-    )?;
-    if code != 0 {
-        return Ok(code);
+    // ONE call per picked workspace. `init_cmd::run` is idempotent and upserts a mount, so the
+    // mounts accumulate; the agent wiring, the contract files and the `.gitignore` consent ride
+    // the FIRST call only, because they are project-wide and repeating them would print the same
+    // writes once per workspace.
+    for (i, w) in plan.workspaces.iter().enumerate() {
+        let first = i == 0;
+        let code = init_cmd::run(
+            cwd,
+            Some(api),
+            &init_cmd::InitArgs {
+                workspace: Some(w.id),
+                dir: Some(plan.dir.clone()),
+                // The wizard no longer asks about scope, and «absent» means «leave what is
+                // recorded» — which is exactly the carry-forward wanted here.
+                folder: None,
+                clear_folder: false,
+                name: None,
+                server: Some(plan.server.clone()),
+                mcp: Some(if !first || plan.agents.is_empty() {
+                    "none".to_string()
+                } else {
+                    plan.agents.join(",")
+                }),
+                mcp_label: None,
+                mcp_bare: false,
+                allow_prompt: false,
+                // The skill goes to every DETECTED agent's own directory regardless of what the
+                // reader ticked for MCP (D4): declining a config write must not silently cost them
+                // the contract too, and `init` already drops the same file at the open-standard
+                // path unconditionally.
+                skills: Some(if first { "auto" } else { "none" }.to_string()),
+                hooks: (first && !plan.hooks.is_empty()).then(|| {
+                    plan.hooks
+                        .iter()
+                        .map(|a| a.key())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                }),
+                instructions: first && plan.instructions,
+                // Consent was collected in step 5; the WRITE belongs to `init_cmd`, which does it
+                // once the whole configuration has passed the gate.
+                write_gitignore: first && plan.gitignore,
+            },
+        )?;
+        if code != 0 {
+            return Ok(code);
+        }
     }
     if plan.sync_now {
         ui::heading("Sync");
