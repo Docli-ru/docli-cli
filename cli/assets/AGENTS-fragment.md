@@ -16,8 +16,11 @@ not through the filesystem: it applies the mirror's freshness and digest checks,
 - **The mirror is never writable.** An edit made inside it is never synced, and it is destroyed
   with no conflict copy the next time that note changes on the server. To change a note, write
   through the docli MCP connection with `edit_note`, then run `docli sync`.
-- **Trust the mirror only after `docli sync --check` exits zero.** Branch on the exit code, not
-  on the prose.
+- **`docli sync --check` reports freshness by exit code — branch on the code, not the prose.**
+  `0` the mirror is current · `1` it is behind, follow the printed remedy · `2` the check could not
+  run, which says nothing about the mirror. A read-only home (an agent sandbox) gives `2`, because
+  the check must record what it learns; reading still works there, so take `docli read`'s own
+  disclosures as the signal instead of assuming the mirror is stale.
 - **Absence is a server question.** The mirror can be scoped, behind, or incomplete. Only a
   `docli search "…"` that does not report an incomplete index establishes that a note does not
   exist.

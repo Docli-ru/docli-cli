@@ -417,6 +417,40 @@ fn a_server_that_serves_no_graph_degrades_to_a_named_absence() {
     );
 }
 
+/// The contract documents THREE exit codes for `--check` and an agent branches on them, so the
+/// gap between «behind» and «could not check» has to be real. `1` is a verdict about the mirror;
+/// `2` is the absence of one, and conflating them is what made the v0.29.1 live-agent gate's
+/// sandbox look permanently stale.
+#[test]
+fn a_check_that_cannot_run_is_an_error_not_a_staleness_verdict() {
+    let mut f = fx();
+    let tree: Arc<Mutex<BTreeMap<u128, Value>>> = Arc::new(Mutex::new(BTreeMap::from([(
+        1,
+        wire_node(1, "file", "a.md", 1, Some("x")),
+    )])));
+    let server = spawn_stub(tree_server(tree.clone()));
+    assert_eq!(sync(&mut f, &server), 0);
+    assert_eq!(check(&mut f, &server), 0, "current");
+
+    // A server that refuses outright: the check cannot reach a verdict. `run` returns Err, which
+    // `main` turns into exit 2 — never the `1` that would tell an agent its mirror is behind.
+    let dead = spawn_stub(Arc::new(|_p: &str, _b: &Value| {
+        (500, json!({"error": "boom"}))
+    }));
+    let outcome = run_sync(
+        &mut f,
+        &dead,
+        SyncOptions {
+            check: true,
+            full: false,
+        },
+    );
+    assert!(
+        outcome.is_err(),
+        "a check that cannot run must not return a freshness code: {outcome:?}"
+    );
+}
+
 #[test]
 fn check_exits_nonzero_when_behind() {
     let mut f = fx();

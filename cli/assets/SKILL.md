@@ -84,10 +84,18 @@ server holds.
 
 ## The mirror is trustworthy only when it is fresh
 
-- `docli sync --check` is the gate. **Branch on the exit code, not the prose**: a zero exit
-  confirms freshness. After any non-zero exit the mirror is not authoritative — follow the remedy
-  that `docli sync --check` printed (which is not always a plain `docli sync`), and do not read
-  from the mirror until a later check exits zero.
+- `docli sync --check` is the gate. **Branch on the exit code, not the prose** — and its three
+  codes mean three different things:
+  - **`0`** — the mirror is current.
+  - **`1`** — the mirror is behind or incomplete. It is not authoritative; follow the remedy the
+    check printed, which is not always a plain `docli sync`.
+  - **`2`** — the check could not run at all. This says nothing about the mirror either way, so it
+    is not a reason to treat it as stale. The common cause is an environment where the check cannot
+    write: it must record what it learns, and an agent sandbox that leaves the home directory
+    read-only stops it. Reading still works there, and `docli read` still discloses what it cannot
+    vouch for, so on `2` take those disclosures as the freshness signal instead.
+  A `2` that is not about writability — a network failure, a refused workspace — is reported in the
+  message, and the same rule applies: it is a failure to CHECK, never a verdict on the mirror.
 - `CACHE_INCOMPLETE.docli` at a mirror root means that mirror is currently incomplete. A file
   missing from an incomplete mirror says nothing about the server.
 - `docli search` reports, beside its results, when the local mirror needs attention — its state
@@ -130,7 +138,7 @@ credential.)
 | command | use |
 | --- | --- |
 | `docli sync` | bring every mount to the server's head (one-shot) |
-| `docli sync --check` | cheap freshness gate — exit 0 = fresh; on non-zero, follow the printed remedy |
+| `docli sync --check` | cheap freshness gate — 0 = current, 1 = behind (follow the printed remedy), 2 = could not check |
 | `docli sync --full` | authoritative resync: re-derive the mirror, prune stale files |
 | `docli search "q"` | server search across mounts — server paths and node ids |
 | `docli read "path"` | print a mirrored note; `--lines`, `--id`, `--mount`, `--json` |
