@@ -228,6 +228,42 @@ impl CredsStore {
         self.dir.join("credentials.json")
     }
 
+    /// Take the credentials lock for a path that is going to WRITE.
+    ///
+    /// The one thing this adds over opening the file directly is a sentence. A read-only home
+    /// cannot take the lock, so none of the four writers can run — and every one of them was
+    /// surfacing that as a bare «Operation not permitted (os error 1)», which names neither the
+    /// cause nor a remedy.
+    ///
+    /// The v0.29.1 live-agent gate measured why that matters: inside an agent sandbox the CLI
+    /// works while the access token is still valid and starts failing the moment it expires.
+    /// Intermittent and unexplained is worse than plainly broken, because the agent cannot tell
+    /// it from a transient fault and will retry forever.
+    ///
+    /// **It already fails SAFE and must keep doing so.** The lock is taken before any network
+    /// call, so a refusal here consumes no rotating refresh token and leaves the stored
+    /// credential usable. Deliberately NOT «refresh anyway and skip the write»: the server
+    /// rotates the refresh token (`RefreshOutcome::Rotated`), so a refresh we cannot persist
+    /// burns the stored one and locks the user out of a credential only a browser round-trip
+    /// restores — which is exactly what an agent cannot do.
+    fn lock_for_write(&self) -> Result<std::fs::File> {
+        match OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.lock_path())
+        {
+            Ok(l) => Ok(l),
+            Err(e) if is_write_refusal(&e) => bail!(
+                "{} is not writable, so the sign-in cannot be updated here - run the command \
+                 where the home directory is writable (outside an agent sandbox). Nothing was \
+                 lost: the stored sign-in is untouched.",
+                self.dir.display()
+            ),
+            Err(e) => Err(anyhow::Error::new(e).context("opening the credentials lock")),
+        }
+    }
+
     fn lock_path(&self) -> PathBuf {
         self.dir.join("creds.lock")
     }
@@ -264,11 +300,7 @@ impl CredsStore {
     /// read the old map, and the later write would silently drop the other's entry — and a
     /// login racing a refresh would clobber the freshly rotated tokens.
     fn mutate(&self, op: &dyn Fn(&mut CredsFile)) -> Result<()> {
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(self.lock_path())?;
+        let lock = self.lock_for_write()?;
         lock.lock().context("waiting for the credentials lock")?;
         let result = (|| {
             let mut f = self.read()?;
@@ -348,11 +380,7 @@ impl CredsStore {
         }
         // Mint under the shared lock (Codex round 18): two concurrent first logins must
         // agree on ONE install id, or the loser registers a phantom device row.
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(self.lock_path())?;
+        let lock = self.lock_for_write()?;
         lock.lock().context("waiting for the credentials lock")?;
         let result = (|| {
             if let Ok(existing) = fs::read_to_string(&p) {
@@ -388,11 +416,7 @@ impl CredsStore {
         &self,
         revoke: &dyn Fn(&str, &ServerCreds) -> bool,
     ) -> Result<Vec<String>> {
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(self.lock_path())?;
+        let lock = self.lock_for_write()?;
         lock.lock().context("waiting for the credentials lock")?;
         let result = (|| {
             let mut f = self.read()?;
@@ -464,11 +488,7 @@ impl CredsStore {
         // The advisory lock: the loser of a concurrent refresh would trip reuse detection and
         // revoke the LINEAGE — both processes lose the credential, recovery is a browser
         // round-trip an agent cannot perform.
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(self.lock_path())?;
+        let lock = self.lock_for_write()?;
         lock.lock().context("waiting for the credentials lock")?;
         let result = self.refresh_locked(server, refresh, rejected);
         let _ = lock.unlock();
@@ -716,6 +736,41 @@ mod tests {
         let (_tmp, s) = store();
         let other = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::InvalidData));
         assert!(s.finish_unwritable(other).is_err());
+    }
+
+    /// The second half of the v0.29.1 gate's finding. The first run fixed OPENING the store on a
+    /// read-only home; this is what remained — every path that WRITES still refused with a bare
+    /// errno, so inside a sandbox the CLI worked until the access token expired and then failed
+    /// with a message naming neither cause nor remedy.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_refusal_on_the_lock_explains_itself_and_keeps_the_sign_in() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let s = CredsStore::open(home.clone()).unwrap();
+        seed(&s, "https://docli.ru", i64::MAX / 2);
+        // Make the lock itself unopenable for writing — the one part of this a mode bit CAN do,
+        // since it is the FILE's own permission rather than the directory's.
+        fs::set_permissions(s.lock_path(), fs::Permissions::from_mode(0o400)).unwrap();
+
+        let msg = match s.lock_for_write() {
+            Ok(_) => panic!("a write-refused lock must not be handed out"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(msg.contains("not writable"), "{msg}");
+        assert!(
+            msg.contains("agent sandbox"),
+            "the refusal must name the cause: {msg}"
+        );
+        assert!(
+            !msg.contains("os error"),
+            "a bare errno is what this replaces: {msg}"
+        );
+        // Fail-safe: the stored credential is untouched and still readable.
+        assert!(s.get("https://docli.ru").unwrap().is_some());
+
+        fs::set_permissions(s.lock_path(), fs::Permissions::from_mode(0o600)).unwrap();
     }
 
     #[test]
