@@ -515,19 +515,16 @@ fn validate_geometry_inner(
             }
             anc = d.parent();
         }
-        // Inside a git work tree, the mirror AND `.docli/` must be git-ignored: `.docli/` holds
-        // the full note-path tree of every mounted workspace, which must not sweep into a git
-        // REMOTE any more than bodies may (the §8 inheritance is about the agent's machine, not
+        // Inside a git work tree the mirror must be git-ignored: mirrored note contents must
+        // not sweep into a git REMOTE (the §8 inheritance is about the agent's machine, not
         // arbitrary remotes; only docli.toml is committed).
+        //
+        // The control plane needs no such gate. It lives in `~/.docli`, outside every
+        // repository, so there is nothing of ours in the work tree to ignore — the check that
+        // used to demand a `.docli/` entry was a leftover of the project-local era and has been
+        // removed rather than left dead.
         if require_ignored {
-            require_gitignored(&project_root_phys, a, m)?;
-        }
-    }
-    if require_ignored {
-        // Only when the control plane is actually IN the work tree. With it in `~/.docli` there
-        // is nothing of ours in the repository, so the gate has nothing left to guard.
-        if is_ancestor_or_self(&project_root_phys, &control) {
-            require_gitignored_control(&project_root_phys, &control)?;
+            require_gitignored(a, m)?;
         }
     }
     Ok(())
@@ -645,23 +642,15 @@ pub(crate) fn ignore_state(from: &Path, path: &Path) -> IgnoreState {
     }
 }
 
-fn require_gitignored(project_root: &Path, mount: &Path, m: &Mount) -> Result<()> {
+fn require_gitignored(mount: &Path, m: &Mount) -> Result<()> {
     let Some(wt) = find_git_worktree(mount) else {
         return Ok(());
     };
     if !git_check_ignore(&wt, mount)? {
-        // A mount inside `.docli/` — the default — is covered by the `.docli/` line alone, and
-        // `require_gitignored_control` demands that line anyway. Naming the mirror separately
-        // would ask for a second entry the first one subsumes.
-        let inside_control = is_ancestor_or_self(&physicalize(&project_root.join(".docli")), mount);
-        let lines = if inside_control {
-            "  .docli/".to_string()
-        } else {
-            format!(
-                "  {}/\n  .docli/",
-                mount.strip_prefix(&wt).unwrap_or(mount).display()
-            )
-        };
+        // ONE entry, for the mirror itself. This used to also propose `.docli/`, because the
+        // control plane was project-local and had its own gate; asking for an entry nothing
+        // requires is how a setup step starts feeling arbitrary.
+        let lines = format!("  {}/", mount.strip_prefix(&wt).unwrap_or(mount).display());
         bail!(
             "mount `{}` ({}) is inside the git work tree at {} but is not git-ignored - \
              `git add -A` would stage mirrored note contents, which could then be committed \
@@ -671,22 +660,6 @@ fn require_gitignored(project_root: &Path, mount: &Path, m: &Mount) -> Result<()
             mount.display(),
             wt.display(),
             lines
-        );
-    }
-    Ok(())
-}
-
-fn require_gitignored_control(project_root: &Path, control: &Path) -> Result<()> {
-    let Some(wt) = find_git_worktree(project_root) else {
-        return Ok(());
-    };
-    // `.docli/` may not exist yet on a fresh init — check-ignore works on hypothetical paths.
-    if !git_check_ignore(&wt, control)? {
-        bail!(
-            ".docli/ is inside the git work tree at {} but is NOT git-ignored - it holds the \
-             full note-path tree of every mounted workspace.\nAdd to .gitignore:\n  .docli/\n\
-             Or let docli append it: docli init --gitignore",
-            wt.display()
         );
     }
     Ok(())

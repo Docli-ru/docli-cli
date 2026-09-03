@@ -29,7 +29,16 @@ pub struct Row {
     pub id: String,
     pub handle: String,
     pub name: String,
-    /// The mount directory in THIS project, when this workspace is mounted here.
+    /// Is this workspace mounted in THIS project?
+    pub mounted: bool,
+    /// Where — but only when the USER chose the directory. A DERIVED mount lives in the
+    /// per-machine cache, and printing that hands out an address nobody needs: it is one level
+    /// from the credentials, and `docli status` stopped printing it for exactly that reason
+    /// after the v0.29.1 live-agent gate watched an agent take the path out of a report and grep
+    /// the mirror. An explicit `dir` is different — it is the user's own choice and already
+    /// sits in the committed `docli.toml`.
+    ///
+    /// `docli doctor` still prints real paths: reconciling the filesystem is its job.
     pub mounted_at: Option<String>,
     pub folder: Option<String>,
 }
@@ -59,7 +68,8 @@ pub fn rows(cwd: &Path, api: &Api, server: &str) -> Result<Vec<Row>> {
                 // `config::load_project` for the committed file), so nothing here needs escaping.
                 handle: w.handle,
                 name: w.name,
-                mounted_at: mount.map(|m| m.dir.clone()),
+                mounted: mount.is_some(),
+                mounted_at: mount.filter(|m| !m.derived_dir).map(|m| m.dir.clone()),
                 folder: mount.and_then(|m| m.folder.clone()),
             }
         })
@@ -79,6 +89,42 @@ pub fn run(cwd: &Path, api: &Api, server: &str, json: bool) -> Result<i32> {
 /// The listing WITHOUT touching global output mode — what `docli init` embeds. `run` sets report
 /// mode process-wide, and `init` calling it left every later line (the MCP wiring progress) on
 /// stdout and printing through `--quiet`.
+/// One rendered row. Pure, so the D1 rule below can be asserted on the STRING a reader sees
+/// rather than on the fields that feed it.
+fn row_line(r: &Row, hw: usize, nw: usize) -> String {
+    // The marker column is TWO characters wide for every row, mounted or not, so the handles
+    // stay in one column and the eye can run down them.
+    let handle = format!("@{}", r.handle);
+    let (mark, handle) = if r.mounted {
+        ("*", style(format!("{handle:<hw$}")).bold().to_string())
+    } else {
+        (" ", format!("{handle:<hw$}"))
+    };
+    let mut line = format!(
+        "{mark} {handle}  {:<nw$}  {}",
+        r.name,
+        ui::dim(&r.id),
+        nw = nw
+    );
+    if r.mounted {
+        let scope = match &r.folder {
+            Some(f) => format!(" ({f})"),
+            None => String::new(),
+        };
+        // The folder SCOPE is a property of the mount and worth seeing; the directory is an
+        // address and is shown only when the user picked it.
+        let tail = match &r.mounted_at {
+            Some(dir) => format!("{} {dir}{scope}", ui::arrow()),
+            None if scope.is_empty() => String::new(),
+            None => format!("{}{scope}", ui::arrow()),
+        };
+        if !tail.is_empty() {
+            line.push_str(&format!("  {}", ui::dim(&tail)));
+        }
+    }
+    line
+}
+
 pub fn render_rows(cwd: &Path, api: &Api, server: &str) -> Result<i32> {
     let rows = rows(cwd, api, server)?;
     render(rows, false)
@@ -109,32 +155,9 @@ fn render(rows: Vec<Row>, json: bool) -> Result<i32> {
         .max()
         .unwrap_or(0);
     for r in &rows {
-        // The marker column is TWO characters wide for every row, mounted or not, so the
-        // handles stay in one column and the eye can run down them.
-        let handle = format!("@{}", r.handle);
-        let (mark, handle) = match &r.mounted_at {
-            Some(_) => ("*", style(format!("{handle:<hw$}")).bold().to_string()),
-            None => (" ", format!("{handle:<hw$}")),
-        };
-        let mut line = format!(
-            "{mark} {handle}  {:<nw$}  {}",
-            r.name,
-            ui::dim(&r.id),
-            nw = nw
-        );
-        if let Some(dir) = &r.mounted_at {
-            let scope = match &r.folder {
-                Some(f) => format!(" ({f})"),
-                None => String::new(),
-            };
-            line.push_str(&format!(
-                "  {}",
-                ui::dim(&format!("{} {dir}{scope}", ui::arrow()))
-            ));
-        }
-        ui::line(&line);
+        ui::line(&row_line(r, hw, nw));
     }
-    let mounted = rows.iter().filter(|r| r.mounted_at.is_some()).count();
+    let mounted = rows.iter().filter(|r| r.mounted).count();
     if mounted == 0 {
         ui::next(&format!(
             "Nothing is mounted here - set it up: {}",
@@ -147,4 +170,52 @@ fn render(rows: Vec<Row>, json: bool) -> Result<i32> {
         ));
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(mounted: bool, at: Option<&str>, folder: Option<&str>) -> Row {
+        Row {
+            id: "cd2f1093-4219-4d68-8d2c-dfe7d5125b72".into(),
+            handle: "docli".into(),
+            name: "docli".into(),
+            mounted,
+            mounted_at: at.map(Into::into),
+            folder: folder.map(Into::into),
+        }
+    }
+
+    /// D1's rule, asserted on `list` because it was MISSED here once. `status` stopped printing
+    /// the cache directory after the v0.29.1 live-agent gate watched an agent take the path out
+    /// of a report and grep the mirror; `list` went on printing the absolute derived path — one
+    /// level from the credentials — which made the contract's silence about that directory a
+    /// half-measure.
+    ///
+    /// A DERIVED mount is ours and its location is not an address to hand out. An explicit one
+    /// is the user's own and already sits in the committed `docli.toml`.
+    #[test]
+    fn a_derived_mount_publishes_no_directory_and_an_explicit_one_does() {
+        let derived = row_line(&row(true, None, None), 8, 8);
+        assert!(
+            !derived.contains(".docli"),
+            "a derived mount must not print its cache path: {derived}"
+        );
+        assert!(
+            derived.contains('*'),
+            "…but it is still marked mounted: {derived}"
+        );
+
+        // The folder SCOPE survives — it describes the mount, it is not a path.
+        let scoped = row_line(&row(true, None, Some("docs")), 8, 8);
+        assert!(scoped.contains("(docs)"), "{scoped}");
+        assert!(!scoped.contains(".docli"), "{scoped}");
+
+        let explicit = row_line(&row(true, Some("mirror"), None), 8, 8);
+        assert!(explicit.contains("mirror"), "{explicit}");
+
+        let unmounted = row_line(&row(false, None, None), 8, 8);
+        assert!(!unmounted.contains('*'), "{unmounted}");
+    }
 }

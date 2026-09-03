@@ -367,12 +367,11 @@ pub fn run(cwd: &Path, api: Option<&Api>, args: &InitArgs) -> Result<i32> {
         // Computed and applied HERE for both shapes — with mounts and without. The no-mount
         // case used to run after `docli.toml` and `SKILL.md` were already on disk, so a
         // repository where git cannot answer left a failed command with files written.
+        // With no mounts there is nothing to ignore: the control plane lives in `~/.docli`,
+        // outside every repository, so a mount directory is the only thing docli can put in a
+        // work tree.
         let mut want: Vec<crate::wizard::IgnoreFix> = Vec::new();
-        if config.mounts.is_empty() {
-            if let Some(fix) = crate::wizard::control_ignore(cwd)? {
-                want.push(fix);
-            }
-        } else {
+        {
             for m in &config.mounts {
                 for fix in crate::wizard::missing_ignores(cwd, &m.dir)? {
                     if !want.contains(&fix) {

@@ -165,33 +165,8 @@ impl IgnoreFix {
     }
 }
 
-/// Which `.gitignore` lines this project still needs for `dir` (plus its control directory).
-/// The entry for `.docli/`, when the control directory still needs one. Applies with or without
-/// a mount — `docli init --gitignore` in a project that has no mount yet would otherwise be a
-/// silent no-op, which is the worst possible answer to an explicit request.
-pub fn control_ignore(project_root: &Path) -> Result<Option<IgnoreFix>> {
-    let control = project_root.join(".docli");
-    match config::ignore_state(project_root, &control) {
-        config::IgnoreState::NotInRepo | config::IgnoreState::Covered => return Ok(None),
-        // PROPAGATED, never swallowed: a caller that cannot tell must say so rather than render
-        // «всё в порядке» over a question git refused to answer.
-        config::IgnoreState::Unknown(why) => anyhow::bail!(why),
-        config::IgnoreState::Missing => {}
-    }
-    let Some(wt) = config::find_git_worktree(project_root) else {
-        return Ok(None);
-    };
-    Ok(relative_entry(&wt, &control, false).map(|entry| IgnoreFix {
-        worktree: wt,
-        entry,
-    }))
-}
-
 pub fn missing_ignores(project_root: &Path, dir: &str) -> Result<Vec<IgnoreFix>> {
     let mut out = Vec::new();
-    if let Some(fix) = control_ignore(project_root)? {
-        out.push(fix);
-    }
     let abs_dir = config::mount_abs(
         project_root,
         &config::Mount {
@@ -208,14 +183,6 @@ pub fn missing_ignores(project_root: &Path, dir: &str) -> Result<Vec<IgnoreFix>>
     // so both the «does it need an entry» question and the work-tree lookup answered about the
     // wrong tree — the fix vanished while geometry (which physicalizes) went on refusing.
     let phys = config::physicalize(&abs_dir);
-    // A mount INSIDE `.docli/` is already covered by the `/.docli/` entry proposed above — which
-    // is the default since the mirror moved there. Asking git is the wrong question at this
-    // moment: the entry that will cover it has not been WRITTEN yet, so `check-ignore` says
-    // «missing» and we would offer a second, redundant line for a path the first one subsumes.
-    let control = config::physicalize(&project_root.join(".docli"));
-    if config::is_ancestor_or_self(&control, &phys) {
-        return Ok(out);
-    }
     match config::ignore_state(&phys, &phys) {
         config::IgnoreState::NotInRepo | config::IgnoreState::Covered => {}
         config::IgnoreState::Unknown(why) => anyhow::bail!(why),
@@ -872,23 +839,22 @@ mod tests {
             .current_dir(root)
             .status()
             .unwrap();
-        // The DEFAULT mount lives inside `.docli/`, so a single line covers the control plane
-        // and the mirror both — the old two-line answer (`/.docli/` + `/docli-mirror/`) is one
-        // line now, which is the point of the move.
+        // ONE rule now: a mount inside the work tree is named by its OWN path, and nothing
+        // else is proposed. The control plane lives in `~/.docli`, outside every repository, so
+        // it has nothing to ignore and stopped being asked for.
         let missing = missing_ignores(root, ".docli/mirror/agitek").unwrap();
-        assert_eq!(entries(&missing), vec!["/.docli/".to_string()]);
+        assert_eq!(
+            entries(&missing),
+            vec!["/.docli/mirror/agitek/".to_string()]
+        );
         // A mount the user places OUTSIDE `.docli/` still needs its own entry — and it is the
         // EXACT path now, not a hoisted parent: `docli-mirror/` stopped being our default, so
         // ignoring the whole of it would be ignoring a directory the user chose, not ours.
         let outside = missing_ignores(root, "docli-mirror/agitek").unwrap();
-        assert_eq!(
-            entries(&outside),
-            vec!["/.docli/".to_string(), "/docli-mirror/agitek/".to_string()]
-        );
+        assert_eq!(entries(&outside), vec!["/docli-mirror/agitek/".to_string()]);
 
         // The round trip is per-MOUNT: writing what a mount asked for must satisfy the same
-        // check for THAT mount. Writing `/.docli/` covers the default mount and the control
-        // plane; it says nothing about a mount the user put elsewhere.
+        // check for THAT mount, and says nothing about a mount the user put elsewhere.
         append_ignores(&missing).unwrap();
         assert!(
             missing_ignores(root, ".docli/mirror/agitek")
@@ -930,11 +896,11 @@ mod tests {
         let m = entries(&missing_ignores(&root, &abs.to_string_lossy()).unwrap());
         assert!(m.contains(&"/cache/".to_string()), "{m:?}");
         assert!(m.iter().all(|e| e.starts_with('/')), "anchored: {m:?}");
-        // A mount outside the project contributes no MOUNT entry to this .gitignore (`.docli/`
-        // still belongs to it — that one is the project's own control directory).
+        // A mount outside the project contributes NOTHING to this .gitignore — and now that is
+        // the whole answer, because the control plane is not in the repository either.
         let outside = tmp.path().parent().unwrap().join("elsewhere");
         let m = entries(&missing_ignores(&root, &outside.to_string_lossy()).unwrap());
-        assert_eq!(m, vec!["/.docli/".to_string()], "{m:?}");
+        assert!(m.is_empty(), "{m:?}");
     }
 
     #[test]
@@ -1029,9 +995,9 @@ mod tests {
             inner,
             "the entry must go to the INNER repository"
         );
-        // …and the control directory still belongs to the outer project.
-        let control = fixes.iter().find(|f| f.entry == "/.docli/").unwrap();
-        assert_eq!(config::physicalize(&control.worktree), root);
+        // …and it is the ONLY fix: the outer project gets nothing, because the control plane
+        // is not in any repository.
+        assert_eq!(fixes.len(), 1, "{fixes:?}");
 
         append_ignores(&fixes).unwrap();
         assert!(std::fs::read_to_string(inner.join(".gitignore"))
@@ -1124,10 +1090,11 @@ mod tests {
             .current_dir(root)
             .status()
             .unwrap();
-        // The default is inside `.docli/`, which is already required — nothing extra to add…
+        // A mount under `.docli/` is named by its own path like any other — there is no
+        // `/.docli/` line to subsume it any more…
         assert_eq!(
             entries(&missing_ignores(root, ".docli/mirror/agitek").unwrap()),
-            vec!["/.docli/".to_string()]
+            vec!["/.docli/mirror/agitek/".to_string()]
         );
         // …but a mount the user placed under their source tree is ignored by its OWN path.
         // Offering `src/` would ignore every new file anywhere under `src`.

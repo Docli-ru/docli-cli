@@ -127,12 +127,6 @@ server holds.
   `wikilink not-expressible` means no correct wikilink exists for that path, so the `path` is the
   one to use. In `--json` both arrive as `null` with the reason named in `absent`.
 
-## `~/.docli/` is a secret store
-
-It holds a **full sync-plane credential acting as the workspace owner**. Nothing in it is read,
-printed, copied, transmitted or committed. ("Read-only" describes this CLI's behaviour, not the
-credential.)
-
 ## Command summary
 
 | command | use |
