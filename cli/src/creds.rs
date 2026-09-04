@@ -29,11 +29,28 @@ const MAX_RETRY_AFTER_SECS: u64 = 120;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerCreds {
     pub access_token: String,
-    pub refresh_token: String,
-    /// Unix seconds.
-    pub expires_at: i64,
+    /// `None` for a KEY the user minted and handed us (`docli login --token`): it has no refresh
+    /// lineage, and that absence is the whole of why it survives a read-only home — nothing to
+    /// rotate means nothing to persist means no lock and no write.
+    ///
+    /// Read as `#[serde(default)]`, so a credentials file written by any earlier CLI still
+    /// parses: the field was mandatory and every entry carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    /// Unix seconds. `None` for a minted key: its lifetime is the server's business, and a
+    /// number we invented would be read as knowledge we do not have.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
     /// The device grant's install key (D27d) — minted once per `~/.docli`, stable thereafter.
     pub install_id: String,
+}
+
+impl ServerCreds {
+    /// Is this credential due for renewal? A key with no expiry never is — the server answers
+    /// that question by accepting or refusing the request.
+    pub fn needs_refresh(&self, skew: i64) -> bool {
+        self.expires_at.is_some_and(|at| at <= now_unix() + skew)
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -44,6 +61,9 @@ struct CredsFile {
 
 pub struct CredsStore {
     dir: PathBuf,
+    /// `DOCLI_TOKEN`, when the environment supplied one. `None` is the ordinary stored-file
+    /// mode; `Some` means nothing under `dir` is read or written for credentials.
+    env: Option<EnvToken>,
 }
 
 fn now_unix() -> i64 {
@@ -82,15 +102,149 @@ pub fn cli_home() -> Result<PathBuf> {
     })
 }
 
+/// The environment-supplied bearer.
+///
+/// The problem it solves was MEASURED, not imagined (the v0.29.1 live-agent gate): a coding
+/// agent's sandbox leaves `$HOME` read-only while the workspace stays writable, and the stored
+/// credential cannot be refreshed there by any arrangement of ours — taking the single-flight
+/// lock needs a writable home, and persisting the ROTATED refresh token needs one too, while
+/// refreshing WITHOUT persisting burns the stored token and locks the user out of a credential
+/// only a browser round-trip restores. So the CLI worked until the access token lapsed and then
+/// stopped, intermittently and without explanation. A token handed in by the environment
+/// sidesteps the whole knot: nothing is locked, nothing is rotated, nothing is written.
+///
+/// The convention is `gh`'s (`GH_TOKEN` / `GH_ENTERPRISE_TOKEN`), including the part that
+/// matters most here: **the token is bound to ONE origin**. `docli.toml` is committed and
+/// teammate-editable, and its `server` line is what decides where the CLI sends its bearer — so
+/// an unbound environment token would let a repository choose where a credential travels. The
+/// binding turns that into a refusal instead of an exfiltration.
+pub const TOKEN_VAR: &str = "DOCLI_TOKEN";
+/// The origin [`TOKEN_VAR`] belongs to. Defaults to production; a dev stack or a self-hosted
+/// server names itself here.
+pub const TOKEN_SERVER_VAR: &str = "DOCLI_TOKEN_SERVER";
+const DEFAULT_TOKEN_SERVER: &str = "https://docli.ru";
+/// Refuse rather than truncate, the `client_id`/`state` rule (v0.25.6 D8). Real tokens are
+/// nowhere near this; anything longer is a paste accident or a file read into the variable.
+const MAX_TOKEN_LEN: usize = 4096;
+
+#[derive(Debug, Clone)]
+pub struct EnvToken {
+    token: String,
+    /// Normalized (no trailing slash), so it compares byte-for-byte with a config origin.
+    server: String,
+}
+
+impl EnvToken {
+    pub fn server(&self) -> &str {
+        &self.server
+    }
+}
+
+/// Resolve [`TOKEN_VAR`], or `None` when it is unset or empty.
+///
+/// Empty is UNSET (gh's rule): `DOCLI_TOKEN=` in a shell profile or a CI matrix that did not
+/// populate it must not shadow the stored sign-in with a credential that cannot work.
+pub fn env_token() -> Result<Option<EnvToken>> {
+    let Some(raw) = std::env::var_os(TOKEN_VAR) else {
+        return Ok(None);
+    };
+    let raw = raw.to_str().with_context(|| {
+        format!("{TOKEN_VAR} is not valid UTF-8 - it cannot be an access token")
+    })?;
+    // Trimmed, because the overwhelmingly common way this variable is filled is from a file or
+    // a command substitution, and a trailing newline in an HTTP header is an error message
+    // about header syntax rather than about the token.
+    let token = raw.trim();
+    if token.is_empty() {
+        return Ok(None);
+    }
+    if token.len() > MAX_TOKEN_LEN {
+        bail!(
+            "{TOKEN_VAR} is {} bytes long - that is not a token",
+            token.len()
+        );
+    }
+    // A bearer is sent verbatim in a header. Anything outside printable ASCII cannot be, and
+    // saying so here beats a transport-level complaint at the first request.
+    if let Some(bad) = token.chars().find(|c| !matches!(c, '\x21'..='\x7e')) {
+        bail!(
+            "{TOKEN_VAR} contains a character that cannot appear in an access token ({:?}) - \
+             check for stray whitespace or quotes",
+            bad
+        );
+    }
+    let server = match std::env::var_os(TOKEN_SERVER_VAR) {
+        Some(s) => {
+            let s = s
+                .to_str()
+                .with_context(|| format!("{TOKEN_SERVER_VAR} is not valid UTF-8"))?
+                .trim()
+                .trim_end_matches('/')
+                .to_string();
+            if s.is_empty() {
+                bail!("{TOKEN_SERVER_VAR} is empty - name the origin {TOKEN_VAR} belongs to, or unset it");
+            }
+            s
+        }
+        None => DEFAULT_TOKEN_SERVER.to_string(),
+    };
+    Ok(Some(EnvToken {
+        token: token.to_string(),
+        server,
+    }))
+}
+
 impl CredsStore {
-    /// `~/.docli` (override: `DOCLI_HOME` — tests and odd setups).
+    /// `~/.docli` (override: `DOCLI_HOME` — tests and odd setups), or [`TOKEN_VAR`] when the
+    /// environment supplies a bearer.
+    ///
+    /// In environment mode the credentials FILE is never opened, hardened, read or written —
+    /// which is the point: a read-only home stops being a problem to solve rather than a
+    /// problem to survive.
     pub fn open_default() -> Result<Self> {
+        Self::open_default_in(cli_home()?)
+    }
+
+    fn open_default_in(dir: PathBuf) -> Result<Self> {
+        match env_token()? {
+            Some(env) => Ok(CredsStore {
+                dir,
+                env: Some(env),
+            }),
+            None => Self::open(dir),
+        }
+    }
+
+    /// The stored credential, IGNORING [`TOKEN_VAR`] — for `logout` and `uninstall`, which
+    /// manage what is on this machine. An environment token is not ours to remove, and refusing
+    /// to clear the file because one happens to be set would leave a device signed in with no
+    /// way to sign it out.
+    pub fn open_stored() -> Result<Self> {
         Self::open(cli_home()?)
+    }
+
+    /// A store that serves ONE bearer from memory and touches no file at all.
+    ///
+    /// It reuses the environment-token machinery because the semantics are identical: a bearer
+    /// bound to one origin, never written, never refreshed. `docli login --token` uses it to
+    /// VERIFY a pasted key against the server before storing it — writing an unusable
+    /// credential and letting the next command discover it would put the failure a long way
+    /// from its cause.
+    pub fn in_memory(server: &str, token: &str) -> Self {
+        CredsStore {
+            // Never read: every path that touches `dir` is a write, and writes refuse while
+            // `env` is set.
+            dir: PathBuf::new(),
+            env: Some(EnvToken {
+                token: token.to_string(),
+                server: server.trim_end_matches('/').to_string(),
+            }),
+        }
     }
 
     pub fn open(dir: PathBuf) -> Result<Self> {
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        let store = CredsStore { dir };
+        let store = CredsStore { dir, env: None };
         // Re-harden an EXISTING credentials file before anything reads it (Codex rounds
         // 20–21): a file carrying a broad ACE/mode from outside our writes would otherwise
         // stay exposed for as long as the access token stays fresh. The entry must be a
@@ -228,6 +382,63 @@ impl CredsStore {
         self.dir.join("credentials.json")
     }
 
+    /// The environment token, when there is one — whatever origin it is bound to. For callers
+    /// that must SAY where the sign-in came from (`status`) or refuse an operation that would
+    /// be shadowed by it (`login`).
+    pub fn env_source(&self) -> Option<&EnvToken> {
+        self.env.as_ref()
+    }
+
+    /// The environment token IF it is the credential for `server`.
+    ///
+    /// A mismatch is an ERROR, deliberately, and not a quiet fall-through to the stored file.
+    /// Falling through would mean the same variable shadows the store on one origin and does
+    /// nothing on another — the intermittent-and-unexplained class this CLI keeps paying for.
+    /// It also silently drops the binding that makes the variable safe to set at all.
+    fn env_for(&self, server: &str) -> Result<Option<&str>> {
+        let Some(env) = &self.env else {
+            return Ok(None);
+        };
+        if server.trim_end_matches('/') == env.server {
+            return Ok(Some(&env.token));
+        }
+        bail!(
+            "{TOKEN_VAR} is set for {}, but this command is talking to {server} - unset \
+             {TOKEN_VAR}, or set {TOKEN_SERVER_VAR} to the origin the token belongs to",
+            env.server
+        )
+    }
+
+    /// Is there a credential for `server` at all — from the environment or from the file?
+    ///
+    /// The «not signed in» gates ask this, never `get()`: in environment mode the file holds
+    /// nothing, and reading that as signed-out would send an agent to `docli login`, which is
+    /// the one thing it cannot do.
+    pub fn signed_in(&self, server: &str) -> Result<bool> {
+        if self.env_for(server)?.is_some() {
+            return Ok(true);
+        }
+        Ok(self.get(server)?.is_some())
+    }
+
+    /// Refuse a write while an environment token is in force.
+    ///
+    /// Not merely tidy: a `docli login` here would open a browser, mint a device grant, write
+    /// it — and then be shadowed by the variable on the very next command, so the user would
+    /// have granted authority they cannot see in use. gh refuses the same way and for the same
+    /// reason. (`logout`/`uninstall` reach the file through [`Self::open_stored`], which has no
+    /// environment token to be in force.)
+    fn refuse_if_env(&self) -> Result<()> {
+        if let Some(env) = &self.env {
+            bail!(
+                "{TOKEN_VAR} is set (for {}), so this machine's stored sign-in is not the one \
+                 in use - unset {TOKEN_VAR} first to store credentials here",
+                env.server
+            );
+        }
+        Ok(())
+    }
+
     /// Take the credentials lock for a path that is going to WRITE.
     ///
     /// The one thing this adds over opening the file directly is a sentence. A read-only home
@@ -269,6 +480,13 @@ impl CredsStore {
     }
 
     fn read(&self) -> Result<CredsFile> {
+        // The file is NOT in use in environment mode, so it must not be visible through the
+        // store either. Two things depend on this: `status` would otherwise report a stored
+        // grant's expiry beside a sign-in that is not it, and `in_memory` (whose `dir` is
+        // deliberately empty) would resolve `credentials.json` against the working directory.
+        if self.env.is_some() {
+            return Ok(CredsFile::default());
+        }
         let p = self.file_path();
         if !p.exists() {
             return Ok(CredsFile::default());
@@ -300,6 +518,7 @@ impl CredsStore {
     /// read the old map, and the later write would silently drop the other's entry — and a
     /// login racing a refresh would clobber the freshly rotated tokens.
     fn mutate(&self, op: &dyn Fn(&mut CredsFile)) -> Result<()> {
+        self.refuse_if_env()?;
         let lock = self.lock_for_write()?;
         lock.lock().context("waiting for the credentials lock")?;
         let result = (|| {
@@ -335,13 +554,16 @@ impl CredsStore {
     /// over the network, and then deletes; a `docli login` finishing inside that window would
     /// otherwise have its fresh lineage deleted locally while staying live on the server, with
     /// no local copy left to revoke it with. Returns false when the entry had moved on.
-    pub fn remove_if_current(&self, server: &str, refresh_token: &str) -> Result<bool> {
+    ///
+    /// A minted KEY has no refresh token, so identity is the ACCESS token for it — the same
+    /// question («is this still the credential I just read?»), asked of the only field it has.
+    pub fn remove_if_current(&self, server: &str, token: &str) -> Result<bool> {
         let removed = std::cell::Cell::new(false);
         self.mutate(&|f| {
             let current_matches = f
                 .servers
                 .get(server)
-                .is_some_and(|c| c.refresh_token == refresh_token);
+                .is_some_and(|c| c.refresh_token.as_deref().unwrap_or(&c.access_token) == token);
             if current_matches {
                 f.servers.remove(server);
                 removed.set(true);
@@ -367,6 +589,7 @@ impl CredsStore {
     /// The install_id for a server — reused if any (revoking + re-logging-in keeps ONE device
     /// row rather than minting grants toward the cap), minted otherwise.
     pub fn install_id(&self, server: &str) -> Result<String> {
+        self.refuse_if_env()?;
         if let Some(c) = self.get(server)? {
             return Ok(c.install_id);
         }
@@ -416,6 +639,7 @@ impl CredsStore {
         &self,
         revoke: &dyn Fn(&str, &ServerCreds) -> bool,
     ) -> Result<Vec<String>> {
+        self.refuse_if_env()?;
         let lock = self.lock_for_write()?;
         lock.lock().context("waiting for the credentials lock")?;
         let result = (|| {
@@ -454,6 +678,9 @@ impl CredsStore {
     /// must be bounded in time (`docli status`): refreshing can meet a `503 Retry-After` and
     /// sleep for minutes, which is the wrong trade for a screen that mostly reports local state.
     pub fn stored_token(&self, server: &str) -> Result<Option<String>> {
+        if let Some(t) = self.env_for(server)? {
+            return Ok(Some(t.to_string()));
+        }
         Ok(self.get(server)?.map(|c| c.access_token))
     }
 
@@ -464,10 +691,16 @@ impl CredsStore {
         server: &str,
         refresh: &dyn Fn(&str) -> Result<RefreshOutcome>,
     ) -> Result<String> {
+        // An environment token is used AS IT IS: there is no refresh token beside it, no
+        // expiry we can read, and nothing of ours to write. Whether it still works is the
+        // server's answer, and it gives it on the next request.
+        if let Some(t) = self.env_for(server)? {
+            return Ok(t.to_string());
+        }
         let Some(c) = self.get(server)? else {
             bail!("not signed in to {server} - run `docli login`");
         };
-        if c.expires_at > now_unix() + REFRESH_SKEW_SECS {
+        if !c.needs_refresh(REFRESH_SKEW_SECS) {
             return Ok(c.access_token);
         }
         self.refresh_single_flight(server, refresh, None)
@@ -485,6 +718,16 @@ impl CredsStore {
         refresh: &dyn Fn(&str) -> Result<RefreshOutcome>,
         rejected: Option<&str>,
     ) -> Result<String> {
+        // There is nothing to rotate. The only caller that reaches here in environment mode is
+        // the 401 retry, so this IS the report of a refused token — and it must name the
+        // credential that was refused, because the fix is somewhere the CLI cannot see.
+        if self.env_for(server)?.is_some() {
+            bail!(
+                "{server} refused the token in {TOKEN_VAR} - it may have expired, been revoked, \
+                 or be missing the `sync` scope. Mint a new one on {server} and set \
+                 {TOKEN_VAR} again."
+            );
+        }
         // The advisory lock: the loser of a concurrent refresh would trip reuse detection and
         // revoke the LINEAGE — both processes lose the credential, recovery is a browser
         // round-trip an agent cannot perform.
@@ -510,12 +753,31 @@ impl CredsStore {
             let Some(c) = self.get(server)? else {
                 bail!("not signed in to {server} - run `docli login`");
             };
-            let usable = c.expires_at > now_unix() + REFRESH_SKEW_SECS
-                && rejected != Some(c.access_token.as_str());
+            let usable =
+                !c.needs_refresh(REFRESH_SKEW_SECS) && rejected != Some(c.access_token.as_str());
             if usable {
                 return Ok(c.access_token);
             }
-            match refresh(&c.refresh_token)? {
+            // A minted key cannot be renewed by us, and the only caller that reaches here with
+            // one is the 401 retry — so this IS the report that the server refused it. Saying
+            // «run docli login» would be wrong twice: it is not what created this credential,
+            // and it would replace a key the user is still managing on the server.
+            //
+            // The entry is KEPT, unlike the `invalid_grant` arm below. That arm acts on the
+            // token endpoint saying the lineage is dead; this one has only a single 401 from a
+            // sync request, which a momentary server-side fault also produces. Nothing was
+            // consumed by the failure — no rotation happened — so keeping the key costs
+            // nothing, while deleting it would force a re-paste on exactly the population that
+            // cannot do one on demand: a sandbox, a CI job, an unattended container.
+            let Some(refresh_token) = c.refresh_token.clone() else {
+                bail!(
+                    "{server} refused the access token stored for this device - it may have \
+                     expired, been revoked, or be missing the `sync` scope. Mint a new key on \
+                     {server} and run `docli login --token`, or `docli login` for a browser \
+                     sign-in."
+                );
+            };
+            match refresh(&refresh_token)? {
                 RefreshOutcome::Rotated {
                     access_token,
                     refresh_token,
@@ -523,8 +785,8 @@ impl CredsStore {
                 } => {
                     let fresh = ServerCreds {
                         access_token: access_token.clone(),
-                        refresh_token,
-                        expires_at: now_unix() + expires_in,
+                        refresh_token: Some(refresh_token),
+                        expires_at: Some(now_unix() + expires_in),
                         install_id: c.install_id,
                     };
                     self.put_unlocked(server, fresh)?;
@@ -783,13 +1045,247 @@ mod tests {
         assert!(!is_write_refusal(&Error::from(ErrorKind::InvalidData)));
     }
 
+    /// Set `DOCLI_TOKEN` (+ optionally `DOCLI_TOKEN_SERVER`) for the body of one test, under the
+    /// same process-global lock `DOCLI_HOME` uses — these are the same class of variable and a
+    /// test that clears one between another's write-and-read is the flake nobody can chase.
+    fn with_env_token<T>(token: &str, server: Option<&str>, body: impl FnOnce() -> T) -> T {
+        let _guard = home_env_lock();
+        // SAFETY: single-threaded within the guard; every reader of these variables in this
+        // crate takes the same lock.
+        unsafe {
+            std::env::set_var(TOKEN_VAR, token);
+            match server {
+                Some(s) => std::env::set_var(TOKEN_SERVER_VAR, s),
+                None => std::env::remove_var(TOKEN_SERVER_VAR),
+            }
+        }
+        let out = body();
+        unsafe {
+            std::env::remove_var(TOKEN_VAR);
+            std::env::remove_var(TOKEN_SERVER_VAR);
+        }
+        out
+    }
+
+    /// gh's rule, and the one that keeps a half-populated CI matrix from breaking every
+    /// developer machine that inherits its profile: `DOCLI_TOKEN=` is UNSET, not «a credential
+    /// that cannot work».
+    #[test]
+    fn an_empty_token_variable_is_not_a_sign_in() {
+        with_env_token("", None, || assert!(env_token().unwrap().is_none()));
+        with_env_token("   \n", None, || assert!(env_token().unwrap().is_none()));
+    }
+
+    /// The overwhelmingly common way this variable gets filled is `$(cat token)` or a `.env`
+    /// line, and both bring a newline. Trimming it here means the failure is never a complaint
+    /// about HTTP header syntax.
+    #[test]
+    fn a_token_is_trimmed() {
+        with_env_token("  abc123 \n", None, || {
+            let t = env_token().unwrap().unwrap();
+            assert_eq!(t.token, "abc123");
+            assert_eq!(t.server, "https://docli.ru");
+        });
+    }
+
+    #[test]
+    fn a_token_that_cannot_be_a_bearer_is_refused_by_name() {
+        with_env_token("abc\u{7}def", None, || {
+            let e = format!("{:#}", env_token().unwrap_err());
+            assert!(e.contains(TOKEN_VAR), "{e}");
+        });
+        with_env_token(&"x".repeat(MAX_TOKEN_LEN + 1), None, || {
+            assert!(env_token().is_err());
+        });
+    }
+
+    #[test]
+    fn the_token_server_variable_names_the_origin_and_is_normalized() {
+        with_env_token("abc", Some("http://docli.localhost/"), || {
+            assert_eq!(
+                env_token().unwrap().unwrap().server,
+                "http://docli.localhost"
+            );
+        });
+        with_env_token("abc", Some("  "), || assert!(env_token().is_err()));
+    }
+
+    /// The binding is the whole reason this variable is safe to set. `docli.toml` is committed
+    /// and teammate-editable, and its `server` line decides where the bearer is sent — so a
+    /// repository naming another origin must get a REFUSAL, never a silent fall-through to the
+    /// stored file (which would also make the shadowing intermittent).
+    #[test]
+    fn the_environment_token_is_bound_to_one_origin() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_env_token("t0k", None, || {
+            let s = CredsStore::open_default_in(tmp.path().join("home")).unwrap();
+            assert_eq!(
+                s.bearer("https://docli.ru", &|_| unreachable!()).unwrap(),
+                "t0k"
+            );
+            assert!(s.signed_in("https://docli.ru").unwrap());
+
+            let e = format!(
+                "{:#}",
+                s.bearer("https://evil.example", &|_| unreachable!())
+                    .unwrap_err()
+            );
+            assert!(e.contains("https://evil.example"), "{e}");
+            assert!(e.contains(TOKEN_SERVER_VAR), "{e}");
+            assert!(s.signed_in("https://evil.example").is_err());
+        });
+    }
+
+    /// The point of the whole feature: a read-only home is not a problem to survive, it is a
+    /// problem that does not arise. Nothing under `dir` may be created, read or written.
+    #[test]
+    fn the_environment_token_never_touches_the_credentials_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("never-created");
+        with_env_token("t0k", None, || {
+            let s = CredsStore::open_default_in(home.clone()).unwrap();
+            assert_eq!(
+                s.bearer("https://docli.ru", &|_| unreachable!()).unwrap(),
+                "t0k"
+            );
+            assert_eq!(
+                s.stored_token("https://docli.ru").unwrap().as_deref(),
+                Some("t0k")
+            );
+        });
+        assert!(
+            !home.exists(),
+            "environment mode created {}",
+            home.display()
+        );
+    }
+
+    /// A 401 in environment mode is the SERVER refusing the token, and there is nothing to
+    /// rotate. It must say which credential was refused, because the fix is somewhere the CLI
+    /// cannot see — and it must not call the refresh function at all.
+    #[test]
+    fn a_refused_environment_token_is_reported_not_refreshed() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_env_token("t0k", None, || {
+            let s = CredsStore::open_default_in(tmp.path().join("home")).unwrap();
+            let e = format!(
+                "{:#}",
+                s.refresh_single_flight("https://docli.ru", &|_| unreachable!(), Some("t0k"))
+                    .unwrap_err()
+            );
+            assert!(e.contains(TOKEN_VAR), "{e}");
+        });
+    }
+
+    /// A `docli login` that completes and is then shadowed on every later command is worse than
+    /// no login: authority granted, invisibly unused. Refuse at the store, so no caller can
+    /// route around it.
+    #[test]
+    fn storing_a_credential_is_refused_while_the_environment_signs_us_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_env_token("t0k", None, || {
+            let s = CredsStore::open_default_in(tmp.path().join("home")).unwrap();
+            for e in [
+                s.put(
+                    "https://docli.ru",
+                    ServerCreds {
+                        access_token: "a".into(),
+                        refresh_token: Some("r".into()),
+                        expires_at: Some(0),
+                        install_id: "i".into(),
+                    },
+                )
+                .unwrap_err(),
+                s.install_id("https://docli.ru").unwrap_err(),
+            ] {
+                let e = format!("{e:#}");
+                assert!(e.contains(TOKEN_VAR), "{e}");
+            }
+        });
+    }
+
+    fn seed_key(s: &CredsStore, server: &str) {
+        s.put(
+            server,
+            ServerCreds {
+                access_token: "minted".into(),
+                refresh_token: None,
+                expires_at: None,
+                install_id: "i1".into(),
+            },
+        )
+        .unwrap();
+    }
+
+    /// The property that makes a minted key work where a device grant cannot: it is never DUE,
+    /// so no command ever takes the credentials lock to renew it — and taking that lock is what
+    /// fails on a read-only home.
+    #[test]
+    fn a_minted_key_is_never_due_for_refresh() {
+        let (_t, s) = store();
+        seed_key(&s, "srv");
+        assert_eq!(s.bearer("srv", &|_| unreachable!()).unwrap(), "minted");
+        // …including when a device grant with the same clock WOULD be due.
+        assert!(!s.get("srv").unwrap().unwrap().needs_refresh(i64::MAX / 2));
+    }
+
+    /// A 401 on a minted key is the server refusing it, and there is nothing to rotate. The
+    /// message must name what to do — and `docli login` alone would be wrong guidance, since it
+    /// is not what created this credential.
+    #[test]
+    fn a_refused_minted_key_says_what_to_do_and_never_refreshes() {
+        let (_t, s) = store();
+        seed_key(&s, "srv");
+        let e = format!(
+            "{:#}",
+            s.refresh_single_flight("srv", &|_| unreachable!(), Some("minted"))
+                .unwrap_err()
+        );
+        assert!(e.contains("--token"), "{e}");
+        // …and the key is KEPT. A single 401 from a sync request is weaker evidence than the
+        // token endpoint's `invalid_grant`, nothing was consumed by the failure, and the people
+        // this credential serves are the ones who cannot re-paste one on demand.
+        assert_eq!(
+            s.get("srv").unwrap().unwrap().access_token,
+            "minted",
+            "a 401 must not destroy a key that may still be good"
+        );
+    }
+
+    /// Identity for `remove_if_current` is the refresh token when there is one and the access
+    /// token otherwise — one question, asked of the only field the credential has.
+    #[test]
+    fn a_minted_key_is_removed_only_while_it_is_still_the_stored_one() {
+        let (_t, s) = store();
+        seed_key(&s, "srv");
+        assert!(!s.remove_if_current("srv", "some-other-key").unwrap());
+        assert!(s.get("srv").unwrap().is_some());
+        assert!(s.remove_if_current("srv", "minted").unwrap());
+        assert!(s.get("srv").unwrap().is_none());
+    }
+
+    /// A credentials file written by any CLI up to 0.1.14 has both fields as bare values. It
+    /// must keep parsing — an upgrade that silently signs the user out would send them to a
+    /// browser they may not have.
+    #[test]
+    fn a_pre_0_1_15_credentials_file_still_parses() {
+        let f: CredsFile = serde_json::from_str(
+            r#"{"servers":{"https://docli.ru":{"access_token":"a","refresh_token":"r",
+               "expires_at":123,"install_id":"i"}}}"#,
+        )
+        .expect("the old shape must still parse");
+        let c = &f.servers["https://docli.ru"];
+        assert_eq!(c.refresh_token.as_deref(), Some("r"));
+        assert_eq!(c.expires_at, Some(123));
+    }
+
     fn seed(s: &CredsStore, server: &str, expires_at: i64) {
         s.put(
             server,
             ServerCreds {
                 access_token: "old-access".into(),
-                refresh_token: "r1".into(),
-                expires_at,
+                refresh_token: Some("r1".into()),
+                expires_at: Some(expires_at),
                 install_id: "i1".into(),
             },
         )
@@ -867,7 +1363,10 @@ mod tests {
         assert_eq!(s.bearer("srv", &refresh).unwrap(), "new-access");
         assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly ONE refresh");
         // The rotated refresh token is persisted (single-use lineage).
-        assert_eq!(s.get("srv").unwrap().unwrap().refresh_token, "r2");
+        assert_eq!(
+            s.get("srv").unwrap().unwrap().refresh_token.as_deref(),
+            Some("r2")
+        );
     }
 
     #[test]
@@ -959,8 +1458,8 @@ mod tests {
             "srv",
             ServerCreds {
                 access_token: "new-access".into(),
-                refresh_token: "r2".into(),
-                expires_at: now_unix() + 3600,
+                refresh_token: Some("r2".into()),
+                expires_at: Some(now_unix() + 3600),
                 install_id: "i1".into(),
             },
         )

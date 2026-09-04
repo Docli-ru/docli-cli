@@ -220,7 +220,8 @@ impl Api {
     pub fn viewer_label(&self) -> Result<String> {
         let v: serde_json::Value =
             self.graphql_no_refresh("{ viewer { email displayName } }", "reading the account")?;
-        let viewer = &v["data"]["viewer"];
+        let viewer = self.viewer_of(&v)?;
+        let viewer = &viewer;
         let name = viewer["displayName"].as_str().unwrap_or("").trim();
         let email = viewer["email"].as_str().unwrap_or("").trim();
         let (name, email) = (crate::ui::sanitize(name), crate::ui::sanitize(email));
@@ -307,12 +308,30 @@ impl Api {
         Ok(v)
     }
 
+    /// `data.viewer`, or a refusal saying the credential was not accepted.
+    ///
+    /// **The server answers an unauthenticated GraphQL request with 200 and `data.viewer: null`**,
+    /// not a 401 — measured against prod, not inferred. Read naively that is indistinguishable
+    /// from a signed-in account holding nothing, and `workspaces()` said exactly that: «This
+    /// account has no workspaces you can reach» for a token the server had refused. An emptiness
+    /// claim made on a refusal is the worst shape an answer can take, because the reader acts
+    /// on it.
+    fn viewer_of<'a>(&self, v: &'a serde_json::Value) -> Result<&'a serde_json::Value> {
+        let viewer = &v["data"]["viewer"];
+        if viewer.is_null() {
+            return Err(anyhow::Error::new(CredentialRefused {
+                server: self.server.clone(),
+            }));
+        }
+        Ok(viewer)
+    }
+
     pub fn workspaces(&self) -> Result<Vec<WorkspaceInfo>> {
         let v = self.graphql(
             "{ viewer { workspaces { id handle name } } }",
             "listing workspaces",
         )?;
-        let list = v["data"]["viewer"]["workspaces"]
+        let list = self.viewer_of(&v)?["workspaces"]
             .as_array()
             .cloned()
             .unwrap_or_default();
@@ -331,6 +350,29 @@ impl Api {
             .collect())
     }
 }
+
+/// The server ANSWERED and said this credential is not one — as distinct from a request that
+/// never arrived.
+///
+/// `status` needs the difference. It is offline-first, so a probe that fails because there is no
+/// network must degrade one line; a probe that fails because the server refused the credential
+/// is the whole answer, and for a minted key it is the ONLY way to learn it — a key carries no
+/// expiry, so «signed in» would otherwise stand forever while every other command failed.
+#[derive(Debug)]
+pub struct CredentialRefused {
+    pub server: String,
+}
+
+impl std::fmt::Display for CredentialRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} did not accept this sign-in - it may have expired or been revoked",
+            self.server
+        )
+    }
+}
+impl std::error::Error for CredentialRefused {}
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceInfo {

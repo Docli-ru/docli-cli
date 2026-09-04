@@ -219,8 +219,26 @@ pub fn run(cwd: &Path, purge: bool, assume_yes: bool) -> Result<i32> {
     let had_store = home
         .as_ref()
         .is_some_and(|h| h.join("credentials.json").exists());
-    let remaining = match CredsStore::open_default().and_then(|store| {
-        store.revoke_all_and_clear(&|server, creds| logout::revoke(server, &creds.refresh_token))
+    // Collected DURING the revoke pass rather than read before it: the pass runs under the
+    // store's lock and is the only place that sees each entry, and a pre-read could name an
+    // origin whose credential the pass then failed to remove.
+    let minted_keys = std::sync::Mutex::new(Vec::<String>::new());
+    let remaining = match CredsStore::open_stored().and_then(|store| {
+        store.revoke_all_and_clear(&|server, creds| match &creds.refresh_token {
+            Some(rt) => logout::revoke(server, rt),
+            // A minted key is DELETED without a server confirmation, deliberately — the
+            // «never delete a credential that was not revoked» invariant exists because a
+            // device grant with no local copy left can never be revoked by anyone. A key the
+            // user minted is listed under their own name in the access list, so they can
+            // always retire it; we never had exclusive custody. It is NAMED below, because
+            // deleting it quietly would still read as «revoked».
+            None => {
+                if let Ok(mut v) = minted_keys.lock() {
+                    v.push(server.to_string());
+                }
+                true
+            }
+        })
     }) {
         Ok(remaining) => remaining,
         Err(e) => {
@@ -232,6 +250,13 @@ pub fn run(cwd: &Path, purge: bool, assume_yes: bool) -> Result<i32> {
             return Ok(1);
         }
     };
+    for origin in minted_keys.into_inner().unwrap_or_default() {
+        ui::warn(&format!(
+            "{origin}: the stored key was a token you minted, so it was removed from this \
+             machine without being revoked - it is still live. Retire it in the access list on \
+             {origin} if you no longer want it to work."
+        ));
+    }
     if !remaining.is_empty() {
         // The origins come from the STORE, never from the current project: with a single
         // `https://staging.example` credential and no project, pointing at docli.ru's access

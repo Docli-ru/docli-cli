@@ -148,7 +148,110 @@ fn open_browser(url: &str) {
     }
 }
 
+/// `--token <VALUE>`, or `--token -` for «ask me».
+///
+/// The indirect form exists because a credential on a command line is not private: it lands in
+/// the shell's history file and is visible in the process list to everything on the machine for
+/// as long as the command runs. Both forms ship rather than only the safe one — `--token "$VAR"`
+/// in a CI job is legitimate and forcing a pipe there is ceremony — and the help text names the
+/// difference so the choice is informed rather than made for the reader.
+///
+/// At a terminal `-` PROMPTS (unechoed); everywhere else it reads one line from stdin, which is
+/// the `echo … | docli login --token -` shape. A bare blocking read would leave an attended
+/// terminal sitting at an empty line with nothing to say what it wanted.
+pub fn read_token_arg(arg: &str) -> Result<String> {
+    if arg != "-" {
+        return Ok(arg.to_string());
+    }
+    if crate::ui::interactive() {
+        return Ok(
+            dialoguer::Password::with_theme(&crate::wizard::prompt_theme())
+                .with_prompt("Token")
+                .interact()?,
+        );
+    }
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line)
+        .context("reading the token from stdin")?;
+    let line = line.trim().to_string();
+    if line.is_empty() {
+        bail!("no token arrived on stdin");
+    }
+    Ok(line)
+}
+
+/// Store a key the user minted on the server, instead of running a browser round.
+///
+/// This is the sign-in for the places `docli login` cannot reach: a container, a CI job, an
+/// agent sandbox. What makes it work there is what it LACKS — no refresh lineage, so nothing
+/// ever needs rotating, so no later command needs a writable home to keep the credential alive.
+/// A device grant does; that asymmetry is the whole reason this exists.
+///
+/// The token is verified against the server BEFORE it is stored. Writing an unusable credential
+/// and letting the next command discover it would put the failure a long way from its cause —
+/// and this is the one path where the user typed the credential themselves, which is exactly
+/// when a typo is likely.
+pub fn store_token(server: &str, creds: &CredsStore, token: &str) -> Result<()> {
+    refuse_while_env_signs_us_in(creds)?;
+    let token = token.trim();
+    if token.is_empty() {
+        bail!("no token was given");
+    }
+    if let Some(bad) = token.chars().find(|c| !matches!(c, '\x21'..='\x7e')) {
+        bail!(
+            "that does not look like an access token (it contains {bad:?}) - check for stray \
+             whitespace or quotes"
+        );
+    }
+    let install_id = creds.install_id(server)?;
+    let probe = ServerCreds {
+        access_token: token.to_string(),
+        refresh_token: None,
+        expires_at: None,
+        install_id,
+    };
+    crate::ui::detail("Checking the token...");
+    let who = crate::http::Api::with_timeout(
+        server,
+        CredsStore::in_memory(server, token),
+        std::time::Duration::from_secs(15),
+    )
+    .and_then(|api| api.viewer_label())
+    // No origin here: `viewer_of` already names it, and repeating it reads as two failures.
+    .context("the token was refused")?;
+    creds.put(server, probe)?;
+    crate::ui::ok(&format!("Signed in to {server} as {who}."));
+    // The two ways this credential differs from a browser sign-in, said once, here, where the
+    // choice is being made — not left for someone to discover from `status` months later.
+    crate::ui::detail(
+        "The key is stored on this machine and is never refreshed: it works until you revoke it \
+         on the server.",
+    );
+    Ok(())
+}
+
+/// Refuse BEFORE anything is granted or stored, on BOTH sign-in paths.
+///
+/// A sign-in that completes and is then shadowed by `DOCLI_TOKEN` on every subsequent command is
+/// worse than no sign-in: the user has granted a device authority they will never see in use,
+/// and cannot tell the two apart afterwards. On the browser path that also means before the
+/// browser opens.
+fn refuse_while_env_signs_us_in(creds: &CredsStore) -> Result<()> {
+    if let Some(env) = creds.env_source() {
+        bail!(
+            "{} is set (for {}) and is what signs this device in, so storing a second \
+             credential here would have no effect - unset {} first if you want a stored \
+             sign-in instead",
+            crate::creds::TOKEN_VAR,
+            env.server(),
+            crate::creds::TOKEN_VAR
+        );
+    }
+    Ok(())
+}
+
 pub fn run_login(server: &str, creds: &CredsStore) -> Result<()> {
+    refuse_while_env_signs_us_in(creds)?;
     let listener =
         TcpListener::bind("127.0.0.1:0").context("binding the loopback callback port")?;
     let port = listener.local_addr()?.port();
@@ -238,12 +341,14 @@ pub fn run_login(server: &str, creds: &CredsStore) -> Result<()> {
         server,
         ServerCreds {
             access_token: t.access_token,
-            refresh_token: t.refresh_token,
-            expires_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0)
-                + t.expires_in,
+            refresh_token: Some(t.refresh_token),
+            expires_at: Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0)
+                    + t.expires_in,
+            ),
             install_id,
         },
     )?;

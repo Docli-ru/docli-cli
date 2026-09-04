@@ -70,11 +70,22 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Sign this device in (browser OAuth)
+    /// Sign this device in - a browser round, or a token you minted on the server
+    ///
+    /// Where a browser is not available - an agent sandbox, CI, a container - there are two
+    /// ways in, and both work without one. --token stores a key you minted: it is checked
+    /// against the server before it is stored, and because it never needs refreshing it keeps
+    /// working where a home directory is read-only. DOCLI_TOKEN does the same for one process
+    /// without storing anything, outranks whatever is stored, and is bound to
+    /// DOCLI_TOKEN_SERVER (https://docli.ru by default) - the token is only ever sent there.
     Login {
         /// docli server URL (default: docli.toml's `server`, else https://docli.ru)
         #[arg(long)]
         server: Option<String>,
+        /// Store a token you minted on the server instead of opening a browser ("-" reads it
+        /// from stdin, which keeps it out of your shell history and out of the process list)
+        #[arg(long, value_name = "TOKEN")]
+        token: Option<String>,
     },
     /// Set the project up - guided, or by flags (docli.toml + the agent SKILL.md)
     Init {
@@ -124,6 +135,10 @@ enum Command {
         /// exists (an existing CLAUDE.md is never edited)
         #[arg(long)]
         instructions: bool,
+        /// Sign in with a token you minted on the server, instead of a browser ("-" reads it
+        /// from stdin). Used only when this device is not signed in yet
+        #[arg(long, value_name = "TOKEN")]
+        token: Option<String>,
     },
     /// Bring every mount to the server's head (one-shot; never pushes)
     Sync {
@@ -322,10 +337,13 @@ fn run(cli: Cli) -> Result<i32> {
     ui::configure(cli.quiet, cli.no_color, cli.no_input);
     let cwd = std::env::current_dir().context("reading the working directory")?;
     match cli.command {
-        Command::Login { server } => {
+        Command::Login { server, token } => {
             let server = resolve_server(server.as_deref(), &cwd)?;
             let creds = creds::CredsStore::open_default()?;
-            login::run_login(&server, &creds)?;
+            match token {
+                Some(t) => login::store_token(&server, &creds, &login::read_token_arg(&t)?)?,
+                None => login::run_login(&server, &creds)?,
+            }
             Ok(0)
         }
         Command::Init {
@@ -342,8 +360,23 @@ fn run(cli: Cli) -> Result<i32> {
             skills,
             hooks,
             instructions,
+            token,
         } => {
             let origin = resolve_server(server.as_deref(), &cwd)?;
+            // BEFORE anything else init does. `init` needs the API to list workspaces and to
+            // resolve a mount, so a device that is not signed in yet has to become signed in
+            // first — that is the whole reason the flag lives on this command as well as on
+            // `login`: one command sets the project up from nothing.
+            if let Some(t) = &token {
+                let creds = creds::CredsStore::open_default()?;
+                if !creds.signed_in(&origin)? {
+                    login::store_token(&origin, &creds, &login::read_token_arg(t)?)?;
+                } else {
+                    ui::detail(&format!(
+                        "This device is already signed in to {origin} - the token was not used."
+                    ));
+                }
+            }
             let args = init_cmd::InitArgs {
                 workspace,
                 dir,
@@ -361,12 +394,15 @@ fn run(cli: Cli) -> Result<i32> {
                 instructions,
             };
             // A bare `docli init` at a terminal is the guided journey; any flag, or a pipe,
-            // keeps the scriptable path an agent can drive.
+            // keeps the scriptable path an agent can drive. `--token` is deliberately NOT
+            // intent (`wizard::has_intent` does not know it): it answers the sign-in step and
+            // nothing else, so a bare `docli init --token …` at a terminal still gets the
+            // guided setup — which by then has one fewer question to ask.
             if wizard::should_run(&args) {
                 return wizard::run(&cwd, args.server.as_deref());
             }
             let api = creds::CredsStore::open_default().ok().and_then(|c| {
-                c.get(&origin).ok().flatten()?;
+                c.signed_in(&origin).ok()?.then_some(())?;
                 http::Api::new(&origin, c).ok()
             });
             init_cmd::run(&cwd, api.as_ref(), &args)
@@ -443,7 +479,7 @@ fn run(cli: Cli) -> Result<i32> {
             // a self-hosted origin is named when there is no docli.toml to read it from.
             let server = resolve_server(server.as_deref(), &cwd)?;
             let store = creds::CredsStore::open_default()?;
-            if store.get(&server)?.is_none() {
+            if !store.signed_in(&server)? {
                 anyhow::bail!("not signed in to {server} - run `docli login`");
             }
             let api = http::Api::new(&server, store)?;
@@ -463,7 +499,7 @@ fn run(cli: Cli) -> Result<i32> {
 
 fn api_for(project: &config::Project) -> Result<http::Api> {
     let creds = creds::CredsStore::open_default()?;
-    if creds.get(&project.config.server)?.is_none() {
+    if !creds.signed_in(&project.config.server)? {
         anyhow::bail!(
             "not signed in to {} - run `docli login`",
             project.config.server

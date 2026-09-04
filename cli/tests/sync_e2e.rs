@@ -164,8 +164,8 @@ fn api_for(fx_root: &Path, server: &str) -> Api {
             server,
             ServerCreds {
                 access_token: "docli_pat_test".into(),
-                refresh_token: "r".into(),
-                expires_at: i64::MAX / 2,
+                refresh_token: Some("r".into()),
+                expires_at: Some(i64::MAX / 2),
                 install_id: "i".into(),
             },
         )

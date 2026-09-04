@@ -68,6 +68,48 @@ git work tree: there the mirror directories and `.docli/` must be listed in `.gi
 `docli sync` refuses to run — one `git add -A` would otherwise push somebody else's notes to a
 remote. `docli init --gitignore` appends the lines for you (the guided setup asks).
 
+## Signing in without a browser
+
+`docli login` needs a browser and a writable home directory. An agent sandbox, a CI job or a
+container usually has neither: a coding agent's sandbox typically leaves `$HOME` read-only, and a
+stored sign-in cannot be refreshed there — so the CLI works until the access token lapses and
+then stops.
+
+Mint a key with the `sync` scope in the access list on docli.ru, then use either of these.
+
+**Store it on the machine** — the guided `docli init` offers this as one of its sign-in
+choices, and these are the same thing without the questions:
+
+```sh
+docli login --token -            # reads the token from stdin, so it stays out of your history
+docli init  --token -            # the same, then sets the project up
+```
+
+The key is checked against the server before it is stored, and it is stored *without an
+expiry*, because it has none we can read. That absence is the point: a browser sign-in has to
+be refreshed, refreshing has to be written down, and writing has to happen somewhere — which is
+exactly what a read-only home does not offer. A key is never due, so nothing ever writes.
+
+**Or hand it in per process**, storing nothing at all:
+
+```sh
+export DOCLI_TOKEN=<the key>
+docli search "what you need"
+```
+
+`DOCLI_TOKEN` outranks whatever is stored, is never written to disk and is never refreshed. It
+is **bound to one origin** — `https://docli.ru`, or whatever `DOCLI_TOKEN_SERVER` names.
+`docli.toml` is a committed file that anyone on the project can edit, and its `server` line
+decides where the CLI sends its bearer, so a mismatch is refused rather than followed.
+
+Either way, `docli sync` still needs a writable home — it writes the mirror. `search`, `read`,
+`list` and `status` do not.
+
+Three things to know afterwards: `docli login` refuses while `DOCLI_TOKEN` is set, because a
+stored credential would be shadowed on every later command; `docli logout` clears what is on
+this machine but cannot unset your environment, and says so; and logging out of a stored key
+removes it here without revoking it — it stays live until you retire it in the access list.
+
 ## Interactive and non-interactive
 
 Every command works both ways. Questions are asked only at an attended terminal; in a pipe, in

@@ -57,8 +57,24 @@ pub struct Status {
     /// not repaired by the `docli login` that answer would send the reader to.
     pub credential_error: Option<String>,
     pub account: Option<String>,
-    /// Seconds until the access token's nominal expiry (negative once past it).
+    /// Seconds until the access token's nominal expiry (negative once past it). Always `None`
+    /// in environment mode — a bearer handed in through `DOCLI_TOKEN` carries no expiry we can
+    /// read, and inventing one would be worse than the blank.
     pub token_expires_in: Option<i64>,
+    /// How this device is signed in: `"oauth"` (a browser round, refreshable), `"key"` (a
+    /// token the user minted and `docli login --token` stored) or `"env"` (`DOCLI_TOKEN`).
+    ///
+    /// The three behave differently on expiry, on `logout` and on `login`, and only the first
+    /// has a `token_expires_in` to report — so the screen names which one it is rather than
+    /// leaving a reader to infer it from a missing field.
+    pub credential_kind: Option<&'static str>,
+    /// Set when `DOCLI_TOKEN` is what signs this device in, to the origin it is bound to.
+    ///
+    /// The screen has to SAY this. Otherwise a reader who unsets the variable, or edits the
+    /// wrong one, sees «signed in» flip with nothing on this screen having explained where the
+    /// sign-in came from — and the two credentials behave differently on expiry, on `logout`,
+    /// and on `login`.
+    pub token_from_env: Option<String>,
     pub project_root: Option<String>,
     /// Set when the project here is configured for a DIFFERENT server than the one reported:
     /// its mounts and agents are then deliberately absent rather than misattributed.
@@ -120,17 +136,29 @@ pub fn human_until(secs: i64) -> String {
 pub fn gather(cwd: &Path, server: &str) -> Result<Status> {
     // A store that cannot be OPENED or READ is not «signed out»: rendering it that way sent the
     // reader to `docli login`, which fails on the same broken file. Report the condition.
+    // `signed_in` rather than `get`, because it is also the question that FAILS on a
+    // `DOCLI_TOKEN` bound to a different origin than the one being reported — the one shape
+    // where the environment holds a credential and this screen must not call it a sign-in.
     let (store, store_error) = match CredsStore::open_default() {
-        Ok(s) => match s.get(server) {
+        Ok(s) => match s.signed_in(server) {
             Ok(_) => (Some(s), None),
             Err(e) => (None, Some(format!("{e:#}"))),
         },
         Err(e) => (None, Some(format!("{e:#}"))),
     };
-    let had_credential = store
+    // Environment mode short-circuits every question below that is about the FILE: there is no
+    // entry to read, no expiry to report, and no refresh for the identity probe to trigger. The
+    // probe still runs — it is the only way to say whether the token actually works, which for
+    // a credential with no readable expiry is the whole of what a reader wants to know.
+    let token_from_env = store
         .as_ref()
-        .and_then(|s| s.get(server).ok().flatten())
-        .is_some();
+        .and_then(|s| s.env_source())
+        .map(|e| e.server().to_string());
+    let had_credential = token_from_env.is_some()
+        || store
+            .as_ref()
+            .and_then(|s| s.get(server).ok().flatten())
+            .is_some();
 
     // The identity probe: `viewer` self-introspection is open to a sync-scoped PAT by design,
     // so this needs no extra scope. Any failure downgrades the line, never the command. A
@@ -142,36 +170,60 @@ pub fn gather(cwd: &Path, server: &str) -> Result<Status> {
     // `503 Retry-After` three times at two minutes each, which would hold this offline-first
     // screen for six, and the 5s client bounds ONE request, not that loop. A status command is
     // a reader: it reports what the credential says, it does not renew it.
-    let token_live = store
-        .as_ref()
-        .and_then(|s| s.get(server).ok().flatten())
-        .is_some_and(|c| c.expires_at > now_unix() + 60);
-    let account = if had_credential && token_live {
+    let token_live = token_from_env.is_some()
+        || store
+            .as_ref()
+            .and_then(|s| s.get(server).ok().flatten())
+            .is_some_and(|c| !c.needs_refresh(60));
+    // The probe's FAILURE is kept, not just its success, because the two ways it can fail are
+    // different answers. Offline degrades one line, as it always has. A server that ANSWERED and
+    // refused the credential is the whole verdict — and for a credential with no expiry
+    // (a minted key, `DOCLI_TOKEN`) it is the ONLY way to learn it: «signed in» would otherwise
+    // stand forever on this screen while every other command failed, which is the
+    // intermittent-and-unexplained shape this CLI keeps paying for.
+    let probe = if had_credential && token_live {
         CredsStore::open_default()
             .ok()
             .and_then(|own| {
                 crate::http::Api::with_timeout(server, own, IDENTITY_PROBE_TIMEOUT).ok()
             })
-            .and_then(|api| api.viewer_label().ok())
+            .map(|api| api.viewer_label())
     } else {
         None
     };
+    let refused = probe.as_ref().and_then(|r| r.as_ref().err()).and_then(|e| {
+        e.downcast_ref::<crate::http::CredentialRefused>()
+            .map(|r| r.to_string())
+    });
+    let account = probe.and_then(|r| r.ok());
     // Re-read the credential AFTER the probe — BOTH fields come from this read. The probe
     // refreshes a lapsed token (so a pre-refresh expiry read «токен истёк» on a working
     // sign-in), and an `invalid_grant` makes the refresh DELETE the entry (so a pre-probe
     // `signed_in` would keep claiming «вход выполнен» for a credential the server just
     // rejected, and exit 0 with it).
     let after = store.as_ref().and_then(|s| s.get(server).ok().flatten());
-    let signed_in = after.is_some();
-    let token_expires_in = after.map(|c| c.expires_at - now_unix());
+    // A refusal overrides the local file. Holding a credential is not being signed in when the
+    // server has just said otherwise — and unlike the `invalid_grant` path, which DELETES the
+    // entry and lets the re-read below speak for itself, nothing removes a refused key: it may
+    // still be perfectly good and the server merely unwell (see `refresh_locked`).
+    let signed_in = refused.is_none() && (token_from_env.is_some() || after.is_some());
+    let credential_kind = match (&token_from_env, &after) {
+        (Some(_), _) => Some("env"),
+        (None, Some(c)) if c.refresh_token.is_none() => Some("key"),
+        (None, Some(_)) => Some("oauth"),
+        (None, None) => None,
+    };
+    let token_expires_in = after.and_then(|c| c.expires_at).map(|at| at - now_unix());
 
     let mut status = Status {
         version: env!("CARGO_PKG_VERSION"),
         server: server.to_string(),
         signed_in,
-        credential_error: store_error,
+        credential_error: store_error.or(refused),
         account,
         token_expires_in,
+        credential_kind,
+        token_from_env,
         project_root: None,
         project_other_server: None,
         mounts: Vec::new(),
@@ -318,17 +370,28 @@ fn render(s: &Status) {
     ui::heading(&format!("docli-cli {}", s.version));
     let w = ui::label_width(["server", "signed in", "project"]);
     ui::field("server", &s.server, w);
+    // The SOURCE, on the same line as the identity. A token from the environment expires
+    // without warning us, cannot be refreshed, and is not what `docli logout` removes — three
+    // differences a reader has no other way to learn about.
+    let source = match s.credential_kind {
+        Some("env") => format!("  {}", ui::dim("(from DOCLI_TOKEN)")),
+        Some("key") => format!("  {}", ui::dim("(minted key - no expiry)")),
+        _ => String::new(),
+    };
     match (&s.account, s.signed_in) {
         (Some(who), _) => {
             let exp = s
                 .token_expires_in
                 .map(|t| format!("  {}", ui::dim(&format!("token {}", human_until(t)))))
                 .unwrap_or_default();
-            ui::field("signed in", &format!("{who}{exp}"), w);
+            ui::field("signed in", &format!("{who}{exp}{source}"), w);
         }
         (None, true) => ui::field(
             "signed in",
-            &format!("yes {}", ui::dim("(account name unavailable offline)")),
+            &format!(
+                "yes {}{source}",
+                ui::dim("(account name unavailable offline)")
+            ),
             w,
         ),
         (None, false) => match &s.credential_error {
@@ -495,6 +558,31 @@ fn render(s: &Status) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two failures of the identity probe are DIFFERENT answers, and only one of them is
+    /// allowed to unmake a sign-in.
+    ///
+    /// Measured against prod on a really-revoked key: `status` said «signed in (minted key - no
+    /// expiry)» and exited 0 while every other command failed. A key carries no expiry, so that
+    /// line would have stood forever — the intermittent-and-unexplained shape this CLI keeps
+    /// paying for. An offline probe must still degrade one line, because `status` is
+    /// offline-first by design.
+    #[test]
+    fn only_a_server_refusal_unmakes_a_sign_in_never_an_offline_probe() {
+        let refused: anyhow::Error = anyhow::Error::new(crate::http::CredentialRefused {
+            server: "https://docli.ru".into(),
+        });
+        assert!(refused
+            .downcast_ref::<crate::http::CredentialRefused>()
+            .is_some());
+        assert!(format!("{refused}").contains("did not accept"));
+
+        // Anything else — a timeout, a DNS failure, a captive portal — is NOT a refusal.
+        let offline = anyhow::anyhow!("error sending request for url (…): operation timed out");
+        assert!(offline
+            .downcast_ref::<crate::http::CredentialRefused>()
+            .is_none());
+    }
 
     #[test]
     fn ages_and_deadlines_read_as_prose() {

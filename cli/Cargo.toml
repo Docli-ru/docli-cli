@@ -1,6 +1,6 @@
 [package]
 name = "docli-cli"
-version = "0.1.14"
+version = "0.1.15"
 edition = "2021"
 # MSRV for the public mirror: latest stable we build and verify with (user ruling 2026-08-30 —
 # no groveling for old toolchains). Kept uniform across the three mirror crates; clippy's
@@ -49,9 +49,11 @@ minisign-verify = "0.2"
 # would re-serialize and destroy the user's comments/layout.
 toml_edit = "0.25.13"
 # The interactive `docli init` journey + the one output vocabulary (`ui.rs`, 0.1.1).
-# `dialoguer` is default-features-OFF deliberately: `editor`/`password` would pull tempfile +
-# zeroize for prompts this CLI never shows.
-dialoguer = { version = "0.12", default-features = false }
+# `dialoguer` is default-features-OFF apart from `password`: `editor` would pull tempfile for a
+# prompt this CLI never shows, while `password` is now genuinely needed — the token sign-in asks
+# for a credential, and an echoed one sits in the terminal's scrollback afterwards. The feature
+# brings `zeroize`, which is the right dependency to have around a secret anyway.
+dialoguer = { version = "0.12", default-features = false, features = ["password"] }
 console = "0.16"
 
 [dev-dependencies]

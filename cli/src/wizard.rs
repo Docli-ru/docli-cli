@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use console::style;
 use dialoguer::theme::ColorfulTheme;
-use dialoguer::{Confirm, Input, MultiSelect};
+use dialoguer::{Confirm, Input, MultiSelect, Password, Select};
 
 use crate::config::{self, DocliToml, Mount};
 use crate::http::{Api, WorkspaceInfo};
@@ -556,29 +556,50 @@ pub fn run(cwd: &Path, server_flag: Option<&str>) -> Result<i32> {
     // ── 2. Вход ──────────────────────────────────────────────────────────────────────────
     ui::step(2, STEPS, "Sign-in");
     let store = creds::CredsStore::open_default()?;
-    if store.get(&server)?.is_none() {
+    if !store.signed_in(&server)? {
         ui::detail(&format!("This device is not connected to {server} yet."));
-        if !Confirm::with_theme(&prompt_theme())
-            .with_prompt("Sign in now? (opens a browser)")
-            .default(true)
-            .interact()?
-        {
-            ui::warn("Without signing in there is no workspace list to choose from.");
-            // The origin was just chosen in step 1 and there is no docli.toml yet, so a bare
-            // `docli login` here would sign into production instead.
-            let login = if server == "https://docli.ru" {
-                "docli login".to_string()
-            } else {
-                format!("docli login --server {server}")
-            };
-            ui::next(&format!(
-                "Sign in later with {}, then run {} again",
-                ui::cmd(&login),
-                ui::cmd("docli init")
-            ));
-            return Ok(1);
+        // Three answers, not two. A browser is not always available — a container, a remote
+        // shell, a machine that is not yours — and «no» used to be the only thing left to say
+        // there, which ended the setup on a machine that could have been set up.
+        let choice = Select::with_theme(&prompt_theme())
+            .with_prompt("How do you want to sign in?")
+            .items([
+                "Open a browser (recommended)",
+                "Paste a token I minted on the server",
+                "Not now",
+            ])
+            .default(0)
+            .interact()?;
+        match choice {
+            0 => login::run_login(&server, &store)?,
+            1 => {
+                ui::detail(&format!(
+                    "Mint a key with the `sync` scope in the access list on {server}, then paste \
+                     it here. It is not echoed."
+                ));
+                let token = Password::with_theme(&prompt_theme())
+                    .with_prompt("Token")
+                    .interact()?;
+                login::store_token(&server, &store, &token)?;
+            }
+            _ => {
+                ui::warn("Without signing in there is no workspace list to choose from.");
+                // The origin was just chosen in step 1 and there is no docli.toml yet, so a
+                // bare `docli login` here would sign into production instead.
+                let login = if server == "https://docli.ru" {
+                    "docli login".to_string()
+                } else {
+                    format!("docli login --server {server}")
+                };
+                ui::next(&format!(
+                    "Sign in later with {} (or {} for a minted key), then run {} again",
+                    ui::cmd(&login),
+                    ui::cmd("docli login --token -"),
+                    ui::cmd("docli init")
+                ));
+                return Ok(1);
+            }
         }
-        login::run_login(&server, &store)?;
     } else {
         ui::ok(&format!("This device is already connected to {server}."));
     }

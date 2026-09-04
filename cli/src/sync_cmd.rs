@@ -998,31 +998,44 @@ fn freshness_lines(cwd: &Path) -> Vec<String> {
             )]
         }
     };
-    match store.get(&project.config.server) {
-        // A LIVE token, not merely a present one. An expired one sends `api.pull` through the
-        // refresh path — a credential lock it may wait on, and a `503 Retry-After` loop that
-        // sleeps — none of which a reqwest timeout bounds. A session start is not the place to
-        // discover that, so this reports instead of renewing; the next hand-run `docli` command
-        // refreshes properly.
-        Ok(Some(c)) if c.expires_at <= now_unix() + 60 => {
-            return vec![format!(
-                "docli: this device's sign-in to {} needs renewing, so mirror freshness was \
-                 not checked - run `docli sync` (it will refresh)",
-                project.config.server
-            )]
-        }
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            return vec![format!(
-                "docli: this device is not signed in to {} - the mirror may be out of date; \
-                 run `docli login`, then `docli sync`",
-                project.config.server
-            )]
-        }
+    // An environment token has no expiry to pre-check and no refresh to avoid triggering, so
+    // the whole gate below is about the stored credential only. Whether it still works is a
+    // question only the request answers, and the request is about to happen anyway.
+    let env_signed_in = match store.signed_in(&project.config.server) {
+        Ok(yes) => yes && store.env_source().is_some(),
         Err(e) => {
             return vec![format!(
-                "docli: this device's credentials cannot be read ({e:#}) - run `docli login`"
+                "docli: this device's credentials cannot be used ({e:#})"
             )]
+        }
+    };
+    if !env_signed_in {
+        match store.get(&project.config.server) {
+            // A LIVE token, not merely a present one. An expired one sends `api.pull` through the
+            // refresh path — a credential lock it may wait on, and a `503 Retry-After` loop that
+            // sleeps — none of which a reqwest timeout bounds. A session start is not the place to
+            // discover that, so this reports instead of renewing; the next hand-run `docli` command
+            // refreshes properly.
+            Ok(Some(c)) if c.needs_refresh(60) => {
+                return vec![format!(
+                    "docli: this device's sign-in to {} needs renewing, so mirror freshness was \
+                     not checked - run `docli sync` (it will refresh)",
+                    project.config.server
+                )]
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return vec![format!(
+                    "docli: this device is not signed in to {} - the mirror may be out of date; \
+                     run `docli login`, then `docli sync`",
+                    project.config.server
+                )]
+            }
+            Err(e) => {
+                return vec![format!(
+                    "docli: this device's credentials cannot be read ({e:#}) - run `docli login`"
+                )]
+            }
         }
     }
     // Deliberately NOT created here: a hook that has nothing to check must leave the tree
