@@ -104,6 +104,13 @@ pub struct InitArgs {
     /// Write the `AGENTS.md` section, and a `CLAUDE.md` importing it when none exists (D5).
     /// Never edits an existing `CLAUDE.md`.
     pub instructions: bool,
+    /// Let Codex refresh the stored sign-in from inside its sandbox
+    /// (`sandbox_workspace_write.writable_roots += ~/.docli/auth`).
+    ///
+    /// Opt-in and OFF by default, unlike the other v0.28.6 flags: every one of those ADDS a
+    /// capability docli owns, while this one takes a restriction away from another vendor's
+    /// sandbox. It is also unnecessary for a key sign-in, which never refreshes.
+    pub codex_sandbox: bool,
 }
 
 /// The validated `--mcp` intent, resolved BEFORE anything touches the disk.
@@ -529,6 +536,10 @@ pub fn run(cwd: &Path, api: Option<&Api>, args: &InitArgs) -> Result<i32> {
         crate::ui::heading("Instructions");
         crate::instructions::install(cwd)?;
     }
+    if args.codex_sandbox {
+        crate::ui::heading("Codex sandbox");
+        crate::agents::allow_codex_refresh(cwd)?;
+    }
 
     // The next command, LAST — v0.28.6 Step 1. It used to be printed before the agent wiring,
     // so «→ Sync: docli sync» arrived in the middle of the screen with three more sections of
@@ -690,6 +701,7 @@ mod tests {
             skills: Some("none".into()),
             hooks: None,
             instructions: true,
+            codex_sandbox: false,
         };
         run(tmp.path(), None, &args).expect("init must succeed in a git repository");
         // Run twice: the second pass re-points an existing mount, which is the path that
@@ -724,6 +736,7 @@ mod tests {
             skills: Some("none".into()),
             hooks: None,
             instructions: false,
+            codex_sandbox: false,
         };
         run(tmp.path(), None, &base(a, "m1", None)).unwrap();
         // Naming a mount with ANOTHER mount's workspace id: one string, two mounts, across every
@@ -760,6 +773,7 @@ mod tests {
             skills: Some("none".into()),
             hooks: None,
             instructions: false,
+            codex_sandbox: false,
         };
         run(tmp.path(), None, &base).unwrap();
         // Same command again: idempotent, not a duplicate mount (which geometry would refuse).
@@ -810,6 +824,7 @@ mod tests {
             skills: Some("none".into()),
             hooks: None,
             instructions: false,
+            codex_sandbox: false,
         };
         run(tmp.path(), None, &scoped).unwrap();
 
@@ -856,6 +871,7 @@ mod tests {
             skills: Some("none".into()),
             hooks: None,
             instructions: false,
+            codex_sandbox: false,
         };
         run(tmp.path(), None, &bare).unwrap();
         assert_eq!(
@@ -922,6 +938,7 @@ mod tests {
             skills: Some("none".into()),
             hooks: None,
             instructions: false,
+            codex_sandbox: false,
         };
         run(tmp.path(), None, &args).unwrap();
         let p = load_project(tmp.path()).unwrap();
@@ -1082,6 +1099,7 @@ mod tests {
             skills: Some("none".into()),
             hooks: None,
             instructions: false,
+            codex_sandbox: false,
         };
         run(tmp.path(), None, &args).unwrap();
         let mcp: serde_json::Value =
@@ -1113,6 +1131,7 @@ mod tests {
             skills: Some("none".into()),
             hooks: None,
             instructions: false,
+            codex_sandbox: false,
         };
         let err = run(tmp.path(), None, &args).unwrap_err().to_string();
         assert!(err.contains("unknown agent"), "{err}");
@@ -1156,6 +1175,7 @@ mod tests {
             skills: Some("none".into()),
             hooks: None,
             instructions: false,
+            codex_sandbox: false,
         };
         run(tmp.path(), None, &args).unwrap();
         // The chosen label lands in docli.toml…
@@ -1194,6 +1214,7 @@ mod tests {
             skills: Some("none".into()),
             hooks: None,
             instructions: false,
+            codex_sandbox: false,
         };
         run(tmp.path(), None, &args).unwrap();
         let mcp: serde_json::Value =
@@ -1235,6 +1256,7 @@ mod tests {
             skills: Some("none".into()),
             hooks: None,
             instructions: false,
+            codex_sandbox: false,
         };
         let err = run(tmp.path(), None, &args).unwrap_err().to_string();
         assert!(err.contains("is invalid"), "{err}");
@@ -1262,6 +1284,7 @@ mod tests {
             skills: Some("none".into()),
             hooks: None,
             instructions: false,
+            codex_sandbox: false,
         };
         let err = run(tmp.path(), None, &args).unwrap_err().to_string();
         assert!(err.contains("control characters"), "{err}");
@@ -1287,6 +1310,7 @@ mod tests {
             skills: Some("none".into()),
             hooks: None,
             instructions: false,
+            codex_sandbox: false,
         };
         run(tmp.path(), None, &args).unwrap();
         for f in [".mcp.json", ".codex/config.toml", ".gemini/settings.json"] {
@@ -1311,6 +1335,7 @@ mod tests {
             skills: skills.map(str::to_string),
             hooks: hooks.map(str::to_string),
             instructions,
+            codex_sandbox: false,
         }
     }
 
@@ -1433,6 +1458,7 @@ mod tests {
             skills: Some("none".into()),
             hooks: None,
             instructions: false,
+            codex_sandbox: false,
         };
         let err = run(tmp.path(), None, &args).unwrap_err().to_string();
         assert!(err.contains("docli.toml or .docli/ directory"), "{err}");

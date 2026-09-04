@@ -690,6 +690,62 @@ fn merge_codex_toml(existing: Option<&str>, url: &str) -> MergeOutcome {
     MergeOutcome::Write(doc.to_string())
 }
 
+/// Add `path` to Codex's `sandbox_workspace_write.writable_roots`.
+///
+/// **What this is for, and what it deliberately is NOT.** Codex's `workspace-write` sandbox
+/// leaves `$HOME` read-only, so a stored OAuth sign-in cannot be refreshed there and the CLI
+/// starts refusing the moment its access token lapses (measured — the v0.29.1 live-agent gate,
+/// arm B). One writable path fixes it, and the path is `~/.docli/auth`, NOT `~/.docli`:
+/// `writable_roots` is recursive (measured 2026-09-04), so granting the home would also make
+/// the mirror writable to shell commands — exactly the gap the guard hook cannot cover.
+///
+/// It APPENDS. Every other entry is somebody else's decision about their own sandbox, and this
+/// is the one place in `agents.rs` where wholesale convergence would be wrong: the MCP entry is
+/// ours to own, a sandbox policy is not.
+fn merge_codex_writable_root(existing: Option<&str>, path: &str) -> MergeOutcome {
+    let text = existing.map(str::trim).filter(|t| !t.is_empty());
+    let mut doc = match text {
+        None => toml_edit::DocumentMut::new(),
+        Some(t) => match t.parse::<toml_edit::DocumentMut>() {
+            Ok(d) => d,
+            Err(_) => return MergeOutcome::Occupied("does not parse as TOML".to_string()),
+        },
+    };
+    // Same guard, same reason as the MCP merge: indexing INTO a non-table panics in toml_edit.
+    if doc.get("sandbox_workspace_write").is_some()
+        && doc["sandbox_workspace_write"].as_table_like().is_none()
+    {
+        return MergeOutcome::Occupied("sandbox_workspace_write is not a table".to_string());
+    }
+    if let Some(v) = doc
+        .get("sandbox_workspace_write")
+        .and_then(|t| t.get("writable_roots"))
+    {
+        let Some(arr) = v.as_array() else {
+            return MergeOutcome::Occupied("writable_roots is not an array".to_string());
+        };
+        if arr.iter().any(|e| e.as_str() == Some(path)) {
+            return MergeOutcome::AlreadyConfigured { same: true };
+        }
+    } else if doc.get("sandbox_workspace_write").is_none() {
+        let mut t = toml_edit::Table::new();
+        t.set_implicit(false);
+        doc["sandbox_workspace_write"] = toml_edit::Item::Table(t);
+    }
+    let tbl = doc["sandbox_workspace_write"]
+        .as_table_like_mut()
+        .expect("guarded above");
+    match tbl.get_mut("writable_roots").and_then(|i| i.as_array_mut()) {
+        Some(arr) => arr.push(path),
+        None => {
+            let mut arr = toml_edit::Array::new();
+            arr.push(path);
+            tbl.insert("writable_roots", toml_edit::value(arr));
+        }
+    }
+    MergeOutcome::Write(doc.to_string())
+}
+
 fn merge_for(def: &AgentDef, existing: Option<&str>, url: &str) -> Option<(String, MergeOutcome)> {
     match def.adapter {
         McpAdapter::Json {
@@ -892,6 +948,55 @@ fn wire_one(project_root: &Path, def: &AgentDef, url: &str) -> Result<()> {
 /// adapters keep their configuration globally (Cline's panel, Windsurf's home directory), which
 /// is why they are absent here rather than reported as unwired — this answers «what does this
 /// project carry», not «what is installed on this machine».
+/// Let Codex refresh the stored sign-in from inside its sandbox.
+///
+/// Writes `sandbox_workspace_write.writable_roots += ["~/.docli/auth"]` into the same
+/// `.codex/config.toml` the MCP entry goes to. Returns whether anything was written.
+///
+/// **This is the only place docli relaxes another vendor's sandbox**, so it is opt-in, it is
+/// announced with the exact path, and it grants the narrowest directory that works. Everything
+/// else `init` writes ADDS a capability docli owns — an MCP entry, a hook that refuses writes.
+/// This one takes a restriction away, which is why it says so out loud.
+pub fn allow_codex_refresh(project_root: &Path) -> Result<bool> {
+    let Some(def) = agent("codex") else {
+        return Ok(false);
+    };
+    let auth = crate::creds::auth_dir()?;
+    let auth = auth.to_str().context("the credentials path is not UTF-8")?;
+    let McpAdapter::CodexToml { path: rel } = def.adapter else {
+        return Ok(false);
+    };
+    let existing = read_existing(project_root, def).unwrap_or(None);
+    let abs = project_root.join(rel);
+    match merge_codex_writable_root(existing.as_deref(), auth) {
+        MergeOutcome::Write(content) => {
+            if let Some(parent) = abs.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            write_user_config(&abs, content.as_bytes())?;
+            crate::ui::ok(&format!(
+                "{rel}: Codex may now write {auth}, so it can refresh the sign-in in its sandbox"
+            ));
+            crate::ui::detail(
+                "Nothing else under the docli folder is granted - the mirror stays read-only \
+                 to shell commands there.",
+            );
+            Ok(true)
+        }
+        MergeOutcome::AlreadyConfigured { .. } => {
+            crate::ui::ok(&format!("{rel}: Codex already may write {auth}"));
+            Ok(false)
+        }
+        MergeOutcome::Occupied(reason) => {
+            crate::ui::warn(&format!(
+                "{rel}: {reason}; add it by hand:\n    [sandbox_workspace_write]\n    \
+                 writable_roots = [\"{auth}\"]"
+            ));
+            Ok(false)
+        }
+    }
+}
+
 pub fn wired_here(project_root: &Path, server: &str) -> Vec<String> {
     let needle = server.trim_end_matches('/');
     let mut out = Vec::new();
@@ -1518,6 +1623,103 @@ mod tests {
     }
 
     // ---- Codex TOML ----
+
+    /// No reader-facing sentence in this module carries a collapsed line continuation.
+    ///
+    /// The `read_cmd` twin of this test exists for the same reason and this one was added by the
+    /// same defect recurring: a `\`-continued Rust literal, written through a tool that ate the
+    /// backslash, silently becomes one line with the indentation left in the middle of a
+    /// sentence. It compiles, it passes every other test, and it is only visible to someone
+    /// reading the output — which is exactly what happened here (`…stays read-only
+    /// {18 spaces} to shell commands…`), caught by running the command rather than by any test.
+    #[test]
+    fn no_reader_facing_sentence_carries_collapsed_whitespace() {
+        let src = include_str!("agents.rs");
+        for (i, line) in src.lines().enumerate() {
+            let t = line.trim_start();
+            // Only prose: skip code, comments, and the JSON/TOML fixtures that legitimately
+            // carry runs of spaces as INDENTATION inside a literal.
+            if t.starts_with("//") || t.starts_with("///") || !line.contains('"') {
+                continue;
+            }
+            if line.contains("\\n") || line.contains("\\t") {
+                continue;
+            }
+            // BUILT, not written: a literal run of spaces here would make this test flag
+            // its own source.
+            let run = " ".repeat(4);
+            for seg in line.split('"').skip(1).step_by(2) {
+                assert!(
+                    !seg.contains(&run),
+                    "agents.rs:{}: a string literal carries a run of spaces - a collapsed \
+                     line continuation? {line}",
+                    i + 1
+                );
+            }
+        }
+    }
+
+    /// The sandbox grant APPENDS. Every other root is somebody's own decision about their own
+    /// sandbox, and this is the one merge in this module where wholesale convergence — the rule
+    /// the MCP entry follows — would be wrong.
+    #[test]
+    fn the_codex_sandbox_grant_appends_and_never_replaces() {
+        let existing = "[sandbox_workspace_write]\nwritable_roots = [\"/opt/mine\"]\n\
+                        network_access = true\n";
+        let MergeOutcome::Write(out) =
+            merge_codex_writable_root(Some(existing), "/home/u/.docli/auth")
+        else {
+            panic!("expected a write");
+        };
+        assert!(
+            out.contains("/opt/mine"),
+            "the user's own root survives: {out}"
+        );
+        assert!(out.contains("/home/u/.docli/auth"), "ours was added: {out}");
+        assert!(
+            out.contains("network_access = true"),
+            "neighbouring keys survive: {out}"
+        );
+    }
+
+    /// Idempotent: a second `docli init` must not grow the array.
+    #[test]
+    fn the_codex_sandbox_grant_is_a_no_op_when_already_present() {
+        let existing = "[sandbox_workspace_write]\nwritable_roots = [\"/home/u/.docli/auth\"]\n";
+        assert!(matches!(
+            merge_codex_writable_root(Some(existing), "/home/u/.docli/auth"),
+            MergeOutcome::AlreadyConfigured { .. }
+        ));
+    }
+
+    /// From nothing, and from shapes that must REFUSE rather than panic — the same
+    /// index-into-a-non-table trap the MCP merge guards.
+    #[test]
+    fn the_codex_sandbox_grant_creates_the_table_and_refuses_odd_shapes() {
+        let MergeOutcome::Write(fresh) = merge_codex_writable_root(None, "/x/.docli/auth") else {
+            panic!("expected a write");
+        };
+        assert!(fresh.contains("[sandbox_workspace_write]"), "{fresh}");
+        assert!(fresh.contains("writable_roots"), "{fresh}");
+        // Re-merging our own output is a no-op, which is what makes `init` re-runnable.
+        assert!(matches!(
+            merge_codex_writable_root(Some(&fresh), "/x/.docli/auth"),
+            MergeOutcome::AlreadyConfigured { .. }
+        ));
+        for bad in [
+            "sandbox_workspace_write = \"nope\"\n",
+            "[sandbox_workspace_write]\nwritable_roots = 7\n",
+            "not = [valid",
+        ] {
+            assert!(
+                matches!(
+                    merge_codex_writable_root(Some(bad), "/x/.docli/auth"),
+                    MergeOutcome::Occupied(_)
+                ),
+                "must refuse, not panic: {bad}"
+            );
+        }
+    }
 
     #[test]
     fn codex_toml_fresh_and_merge_preserve_user_content() {

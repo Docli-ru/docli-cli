@@ -139,6 +139,12 @@ enum Command {
         /// from stdin). Used only when this device is not signed in yet
         #[arg(long, value_name = "TOKEN")]
         token: Option<String>,
+        /// Let Codex renew the stored sign-in from inside its sandbox, by adding the docli
+        /// credentials directory to writable_roots in .codex/config.toml. Only the credentials
+        /// directory - the mirror stays read-only to shell commands there. Unnecessary after
+        /// --token: a minted key never needs renewing
+        #[arg(long)]
+        codex_sandbox: bool,
     },
     /// Bring every mount to the server's head (one-shot; never pushes)
     Sync {
@@ -361,6 +367,7 @@ fn run(cli: Cli) -> Result<i32> {
             hooks,
             instructions,
             token,
+            codex_sandbox,
         } => {
             let origin = resolve_server(server.as_deref(), &cwd)?;
             // BEFORE anything else init does. `init` needs the API to list workspaces and to
@@ -392,6 +399,7 @@ fn run(cli: Cli) -> Result<i32> {
                 skills,
                 hooks,
                 instructions,
+                codex_sandbox,
             };
             // A bare `docli init` at a terminal is the guided journey; any flag, or a pipe,
             // keeps the scriptable path an agent can drive. `--token` is deliberately NOT

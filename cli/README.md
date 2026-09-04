@@ -105,6 +105,20 @@ decides where the CLI sends its bearer, so a mismatch is refused rather than fol
 Either way, `docli sync` still needs a writable home — it writes the mirror. `search`, `read`,
 `list` and `status` do not.
 
+### Or keep the browser sign-in, and let Codex renew it
+
+Codex's sandbox leaves your home directory read-only, which is why a stored browser sign-in stops
+working there the moment its token needs renewing. One writable path fixes that, and
+`docli init --codex-sandbox` writes it — appending the docli credentials directory to
+`sandbox_workspace_write.writable_roots` in `.codex/config.toml`. The guided setup offers the same
+thing, and only when it would do something: Codex has to be wired, and the sign-in has to be one
+that can lapse (a minted key never renews, so it doesn't ask).
+
+The grant is **only** `~/.docli/auth`, which holds the credentials and nothing else. That is why
+they live in their own directory: `writable_roots` is recursive, so granting the whole docli
+folder would also make the mirror writable to shell commands in the sandbox — and shell writes
+are the one thing the mirror hook cannot refuse.
+
 Three things to know afterwards: `docli login` refuses while `DOCLI_TOKEN` is set, because a
 stored credential would be shadowed on every later command; `docli logout` clears what is on
 this machine but cannot unset your environment, and says so; and logging out of a stored key

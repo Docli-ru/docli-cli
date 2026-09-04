@@ -967,6 +967,7 @@ mod tests {
                 skills: Some("none".into()),
                 hooks: None,
                 instructions: false,
+                codex_sandbox: false,
             },
         )
         .unwrap_err()

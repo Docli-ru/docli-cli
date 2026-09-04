@@ -124,6 +124,49 @@ fn still_ours(cwd: &Path, dir: &Path) -> bool {
     })
 }
 
+/// Delete the per-machine data docli itself wrote, so the directory can actually go.
+///
+/// `remove_dir` below is non-recursive on purpose — it FAILS if anything reappeared, which is
+/// the honest outcome rather than a second race. That only works while nothing of OURS is left,
+/// and since v0.29.2 moved the mirror into `~/.docli` that stopped being true: `mirror/`,
+/// `state/` and `update-check.json` are written by ordinary use, so `remove_dir` always failed
+/// and uninstall always refused — with a claim about a live sign-in that had not happened.
+///
+/// All three are disposable and ours: the contract already says the mirror can be deleted and
+/// re-synced, `state/` only describes that mirror, and `update-check.json` is a cached notice.
+/// The credential files are NOT here — step 1 removes those under the lock.
+fn remove_our_leftovers(h: &Path) {
+    for name in ["mirror", "state"] {
+        let _ = std::fs::remove_dir_all(h.join(name));
+    }
+    let _ = std::fs::remove_file(h.join("update-check.json"));
+}
+
+/// Is everything still under `h` just a docli lock file?
+///
+/// The lock deliberately survives an uninstall (`revoke_all_and_clear` explains why: unlinking
+/// it would let a waiter hold the now-unlinked inode while the next process creates a fresh
+/// one). Since v0.29.1 it lives in `auth/`, so this accepts it at either place — and accepts
+/// NOTHING else, because the whole point of the check is to notice a credential that came back.
+fn only_locks_remain(h: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(h) else {
+        return false;
+    };
+    entries.flatten().all(|e| {
+        let name = e.file_name();
+        if name == std::ffi::OsStr::new("creds.lock") {
+            return true;
+        }
+        if name == std::ffi::OsStr::new("auth") {
+            return std::fs::read_dir(e.path()).is_ok_and(|d| {
+                d.flatten()
+                    .all(|f| f.file_name() == std::ffi::OsStr::new("creds.lock"))
+            });
+        }
+        false
+    })
+}
+
 pub fn run(cwd: &Path, purge: bool, assume_yes: bool) -> Result<i32> {
     let exe = std::env::current_exe().context("locating the running binary")?;
     let home = home_dir();
@@ -147,7 +190,7 @@ pub fn run(cwd: &Path, purge: bool, assume_yes: bool) -> Result<i32> {
             ui::line(&format!(
                 "  {}  {}",
                 ui::path(&shown(h)),
-                ui::dim("(this device's credentials)")
+                ui::dim("(credentials, mirrors and sync state)")
             ));
         }
     }
@@ -218,7 +261,7 @@ pub fn run(cwd: &Path, purge: bool, assume_yes: bool) -> Result<i32> {
     // deleting on the strength of an answer it does not have.
     let had_store = home
         .as_ref()
-        .is_some_and(|h| h.join("credentials.json").exists());
+        .is_some_and(|h| h.join("auth/credentials.json").exists());
     // Collected DURING the revoke pass rather than read before it: the pass runs under the
     // store's lock and is the only place that sees each entry, and a pre-read could name an
     // origin whose credential the pass then failed to remove.
@@ -283,6 +326,23 @@ pub fn run(cwd: &Path, purge: bool, assume_yes: bool) -> Result<i32> {
     if let Some(h) = &home {
         if h.is_dir() {
             let label = shown(h);
+            // Everything else docli itself put here, removed BEFORE the directory. `remove_dir`
+            // is non-recursive by design (it fails if anything reappeared, which is the honest
+            // outcome), but that only works if what remains is nothing of ours — and since the
+            // mirror moved to `~/.docli` in v0.29.2 that stopped being true. The result was an
+            // uninstall that could never finish on an install anyone had USED, refusing with a
+            // claim about a live sign-in that had not happened.
+            //
+            // These are all disposable and ours: the mirror is a cache the contract already
+            // says can be deleted and re-synced, `state/` describes that cache, and
+            // `update-check.json` is the cached update notice. `creds.lock` deliberately stays
+            // (see `revoke_all_and_clear`).
+            remove_our_leftovers(h);
+            // `auth/` only ever holds the credential files, which step 1 removed under the
+            // lock, plus the lock itself — which STAYS, for the reason `revoke_all_and_clear`
+            // gives. So this succeeds exactly when the lock is already gone, and its failure is
+            // the benign case `only_locks_remain` recognises.
+            let _ = std::fs::remove_dir(h.join("auth"));
             match std::fs::remove_dir(h) {
                 Ok(()) => ui::ok(&format!("removed: {label}")),
                 Err(_) => {
@@ -291,28 +351,36 @@ pub fn run(cwd: &Path, purge: bool, assume_yes: bool) -> Result<i32> {
                     // lock file left = nothing of yours is there, and it stays by design (see
                     // `revoke_all_and_clear`). Anything else = a file we did not put there, or
                     // one a concurrent process recreated.
-                    let only_lock = std::fs::read_dir(h)
-                        .map(|d| {
-                            d.flatten()
-                                .all(|e| e.file_name() == std::ffi::OsStr::new("creds.lock"))
-                        })
-                        .unwrap_or(false);
+                    let only_lock = only_locks_remain(h);
                     if only_lock {
                         ui::detail(&format!(
                             "{label} kept: only a lock file remains, safe to delete once no \
                              docli command is running"
                         ));
-                    } else {
-                        // Something is in there that was not a moment ago — in practice a
-                        // `docli login` that won the lock right after the credential step. Its
-                        // token is live and unrevoked, so removing the binary would take away
-                        // the only thing that can revoke it. Stop.
+                    } else if h.join("credentials.json").exists()
+                        || h.join("auth/credentials.json").exists()
+                    {
+                        // A CREDENTIAL is back — in practice a `docli login` that won the lock
+                        // right after the credential step. Its token is live and unrevoked, so
+                        // removing the binary would take away the only thing that can revoke
+                        // it. This is the one case worth stopping for, and it is now decided by
+                        // looking for the credential rather than by "the directory is not
+                        // empty", which was true of every ordinary install.
                         ui::refuse(&format!(
                             "{label} is not empty - a sign-in most likely landed while \
                              uninstalling, and its token is live"
                         ));
-                        ui::next("Run docli logout --all, then uninstall again");
+                        ui::next("Run `docli logout --all`, then uninstall again");
                         return Ok(1);
+                    } else {
+                        // Something we did not write. Say so NEUTRALLY and carry on: the
+                        // credential is gone, which is what this command is actually for, and
+                        // asserting a live token we have no evidence of would be the same false
+                        // alarm this branch used to raise.
+                        ui::detail(&format!(
+                            "{label} kept: it still holds files docli did not write - look, \
+                             then remove it yourself"
+                        ));
                     }
                 }
             }
@@ -618,6 +686,57 @@ mod tests {
     fn outside_a_project_there_is_nothing_to_purge() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(project_paths(tmp.path()).unwrap().is_empty());
+    }
+
+    /// The v0.29.2 regression, pinned at both halves.
+    ///
+    /// `docli uninstall` could not finish on any install that had been USED. The mirror moved
+    /// into `~/.docli`, `remove_dir` is non-recursive, and the leftover check tolerated exactly
+    /// one filename — so an ordinary home always looked «not empty», and the refusal asserted
+    /// that «a sign-in most likely landed while uninstalling, and its token is live», which had
+    /// not happened. Reported from a real run, three releases after the move.
+    #[test]
+    fn a_used_home_is_emptied_of_everything_docli_wrote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let h = tmp.path();
+        std::fs::create_dir_all(h.join("mirror/ws1")).unwrap();
+        std::fs::create_dir_all(h.join("state")).unwrap();
+        std::fs::create_dir_all(h.join("auth")).unwrap();
+        std::fs::write(h.join("mirror/ws1/note.md"), "x").unwrap();
+        std::fs::write(h.join("state/ws1.json"), "{}").unwrap();
+        std::fs::write(h.join("update-check.json"), "{}").unwrap();
+        std::fs::write(h.join("auth/creds.lock"), "").unwrap();
+
+        remove_our_leftovers(h);
+
+        assert!(!h.join("mirror").exists(), "the mirror is a cache and goes");
+        assert!(!h.join("state").exists(), "state only describes the mirror");
+        assert!(
+            !h.join("update-check.json").exists(),
+            "a cached notice goes"
+        );
+        // …and what is left is recognised as benign, so the command completes instead of
+        // refusing with a claim about a credential that is not there.
+        assert!(
+            only_locks_remain(h),
+            "the lock stays by design and must not read as «something reappeared»"
+        );
+    }
+
+    /// The check must still catch the case it was written for.
+    #[test]
+    fn a_credential_that_came_back_is_not_mistaken_for_a_leftover_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let h = tmp.path();
+        std::fs::create_dir_all(h.join("auth")).unwrap();
+        std::fs::write(h.join("auth/creds.lock"), "").unwrap();
+        assert!(only_locks_remain(h));
+        // A `docli login` that won the lock right after the credential step.
+        std::fs::write(h.join("auth/credentials.json"), "{}").unwrap();
+        assert!(
+            !only_locks_remain(h),
+            "a credential under auth/ must NOT read as «only a lock remains»"
+        );
     }
 
     #[test]

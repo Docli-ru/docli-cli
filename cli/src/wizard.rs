@@ -56,6 +56,11 @@ pub struct Plan {
     /// The reader agreed to the `AGENTS.md` section (and a `CLAUDE.md` importing it, when there
     /// is none to damage — D5).
     pub instructions: bool,
+    /// The reader agreed to let Codex write `~/.docli/auth`, so a stored OAuth sign-in can be
+    /// refreshed inside its sandbox. Only ever offered when Codex is among the picked agents
+    /// AND the sign-in is one that can lapse — a minted key never refreshes, so for a key the
+    /// question has no answer worth asking.
+    pub codex_sandbox: bool,
     pub sync_now: bool,
 }
 
@@ -603,6 +608,11 @@ pub fn run(cwd: &Path, server_flag: Option<&str>) -> Result<i32> {
     } else {
         ui::ok(&format!("This device is already connected to {server}."));
     }
+    // Does this sign-in ever need renewing? Only a stored OAuth grant does. A minted key has no
+    // expiry and `DOCLI_TOKEN` is handed in per process, so for either of those the sandbox
+    // question below has nothing to fix — and asking someone to relax their sandbox for nothing
+    // is worse than not offering.
+    let refreshable_signin = creds::CredsStore::open_default()?.can_lapse(&server)?;
     let api = Api::new(&server, creds::CredsStore::open_default()?)?;
 
     // ── 3. Пространство ──────────────────────────────────────────────────────────────────
@@ -742,6 +752,27 @@ pub fn run(cwd: &Path, server_flag: Option<&str>) -> Result<i32> {
             .default(true)
             .interact()?;
     }
+    // Only when it would DO something. Codex has to be wired, and the sign-in has to be one
+    // that can lapse: a minted key never refreshes, so asking a key user to relax their sandbox
+    // would be asking them to give something up for nothing.
+    let mut codex_sandbox = false;
+    if agents.contains(&"codex") && refreshable_signin {
+        ui::detail(
+            "Codex runs shell commands in a sandbox that leaves your home directory read-only, \
+             so the stored sign-in cannot be renewed there - `docli search` works until the \
+             token lapses and then refuses.",
+        );
+        ui::detail(&format!(
+            "Granting Codex write access to {} fixes it. Nothing else under the docli folder \
+             is granted, so the mirror stays read-only to shell commands there.",
+            creds::auth_dir()?.display()
+        ));
+        codex_sandbox = Confirm::with_theme(&prompt_theme())
+            .with_prompt("Let Codex refresh the sign-in in its sandbox?")
+            .default(true)
+            .interact()?;
+    }
+
     let sync_now = Confirm::with_theme(&prompt_theme())
         .with_prompt("Sync straight after setup?")
         .default(true)
@@ -754,6 +785,7 @@ pub fn run(cwd: &Path, server_flag: Option<&str>) -> Result<i32> {
         agents,
         hooks: hook_agents,
         instructions,
+        codex_sandbox,
         gitignore,
         sync_now,
     };
@@ -796,6 +828,7 @@ fn apply(cwd: &Path, api: &Api, plan: Plan) -> Result<i32> {
                 // the contract too, and `init` already drops the same file at the open-standard
                 // path unconditionally.
                 skills: Some(if first { "auto" } else { "none" }.to_string()),
+                codex_sandbox: first && plan.codex_sandbox,
                 hooks: (first && !plan.hooks.is_empty()).then(|| {
                     plan.hooks
                         .iter()
@@ -1141,6 +1174,7 @@ mod tests {
             skills: None,
             hooks: None,
             instructions: false,
+            codex_sandbox: false,
         };
         // `has_intent`, not `should_run`: a test run has no TTY, so `should_run` is false for
         // every variant and would pass even if the intent check were deleted.
@@ -1173,6 +1207,7 @@ mod tests {
         }));
         assert!(has_intent(&init_cmd::InitArgs {
             instructions: true,
+            codex_sandbox: false,
             ..bare.clone()
         }));
         // `docli init --gitignore` must perform the advertised fix, not open the wizard.
@@ -1181,6 +1216,7 @@ mod tests {
             skills: Some("none".into()),
             hooks: None,
             instructions: false,
+            codex_sandbox: false,
             ..bare.clone()
         }));
     }

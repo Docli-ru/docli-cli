@@ -102,6 +102,16 @@ pub fn cli_home() -> Result<PathBuf> {
     })
 }
 
+/// The directory holding this machine's credentials: `~/.docli/auth`.
+///
+/// Named separately from [`cli_home`] because it is the ONE path an agent sandbox has to be able
+/// to write for a token refresh to work, and `docli init` writes it into Codex's
+/// `writable_roots`. Keeping it a level below the home is what stops that grant from reaching
+/// the mirror — `writable_roots` is recursive.
+pub fn auth_dir() -> Result<PathBuf> {
+    Ok(cli_home()?.join("auth"))
+}
+
 /// The environment-supplied bearer.
 ///
 /// The problem it solves was MEASURED, not imagined (the v0.29.1 live-agent gate): a coding
@@ -205,13 +215,13 @@ impl CredsStore {
         Self::open_default_in(cli_home()?)
     }
 
-    fn open_default_in(dir: PathBuf) -> Result<Self> {
+    fn open_default_in(home: PathBuf) -> Result<Self> {
         match env_token()? {
             Some(env) => Ok(CredsStore {
-                dir,
+                dir: home.join("auth"),
                 env: Some(env),
             }),
-            None => Self::open(dir),
+            None => Self::open(home),
         }
     }
 
@@ -242,7 +252,16 @@ impl CredsStore {
         }
     }
 
-    pub fn open(dir: PathBuf) -> Result<Self> {
+    /// `home` is the CLI's per-machine directory; the credentials live in `home/auth`.
+    ///
+    /// The subdirectory exists so that the ONE thing a coding agent's sandbox has to be granted
+    /// — a writable path, for the token refresh — can be granted without also handing over the
+    /// mirror. Codex's `writable_roots` is RECURSIVE (measured 2026-09-04), so a grant of
+    /// `~/.docli` would make the mirror writable to shell commands, which is precisely the gap
+    /// the guard hook cannot cover ("shell writes are not covered on either agent"). With the
+    /// credentials one level down, the grant is `~/.docli/auth` and the mirror stays refused.
+    pub fn open(home: PathBuf) -> Result<Self> {
+        let dir = home.join("auth");
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let store = CredsStore { dir, env: None };
         // Re-harden an EXISTING credentials file before anything reads it (Codex rounds
@@ -419,6 +438,19 @@ impl CredsStore {
             return Ok(true);
         }
         Ok(self.get(server)?.is_some())
+    }
+
+    /// Can this sign-in LAPSE — i.e. does anything ever need to refresh it?
+    ///
+    /// Only a stored OAuth grant can. A minted key has no expiry and `DOCLI_TOKEN` is handed in
+    /// per process, so for either of those there is nothing to renew and nothing a writable
+    /// credentials directory would buy. `docli init` asks it before offering to relax Codex's
+    /// sandbox: asking someone to give up a restriction for no gain is worse than not asking.
+    pub fn can_lapse(&self, server: &str) -> Result<bool> {
+        if self.env_source().is_some() {
+            return Ok(false);
+        }
+        Ok(self.get(server)?.is_some_and(|c| c.refresh_token.is_some()))
     }
 
     /// Refuse a write while an environment token is in force.
@@ -1204,6 +1236,37 @@ mod tests {
         });
     }
 
+    /// The two questions `docli init` asks after a `--token` sign-in, pinned together because
+    /// the right answers are opposite and both matter.
+    ///
+    /// `signed_in` must be TRUE, or the wizard's step 2 would offer a browser round to someone
+    /// who just handed us a working credential — on a machine that may well have no browser,
+    /// which is why they used a key. And `can_lapse` must be FALSE, or the same run would go on
+    /// to ask them to relax Codex's sandbox for a refresh that will never happen.
+    #[test]
+    fn a_key_signin_needs_neither_a_browser_round_nor_a_writable_sandbox() {
+        let (_t, s) = store();
+        seed_key(&s, "https://docli.ru");
+        assert!(
+            s.signed_in("https://docli.ru").unwrap(),
+            "a stored key IS a sign-in - init must not offer to log in again"
+        );
+        assert!(
+            !s.can_lapse("https://docli.ru").unwrap(),
+            "a key never refreshes - init must not offer to widen the sandbox for it"
+        );
+    }
+
+    /// …and the OAuth grant is the one case where the sandbox offer has something to fix.
+    #[test]
+    fn an_oauth_grant_is_the_only_sign_in_that_can_lapse() {
+        let (_t, s) = store();
+        seed(&s, "https://docli.ru", i64::MAX / 2);
+        assert!(s.can_lapse("https://docli.ru").unwrap());
+        // Nothing stored at all is not «can lapse» either — there is no sign-in to renew.
+        assert!(!s.can_lapse("https://other.example").unwrap());
+    }
+
     fn seed_key(s: &CredsStore, server: &str) {
         s.put(
             server,
@@ -1300,8 +1363,11 @@ mod tests {
         // its bytes intact (Codex rounds 20-21).
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
-        fs::create_dir_all(&home).unwrap();
-        let f = home.join("credentials.json");
+        // The credentials live in `home/auth` — a level below the mirror, so an agent sandbox
+        // can be granted the refresh path without being granted the cache.
+        let auth = home.join("auth");
+        fs::create_dir_all(&auth).unwrap();
+        let f = auth.join("credentials.json");
         fs::write(&f, "{\"servers\":{}}").unwrap();
         fs::set_permissions(&f, fs::Permissions::from_mode(0o666)).unwrap();
         let s = CredsStore::open(home.clone()).unwrap();
@@ -1310,8 +1376,8 @@ mod tests {
         assert!(s.get("x").unwrap().is_none());
         // A symlinked credentials entry refuses outright.
         fs::remove_file(&f).unwrap();
-        fs::write(home.join("outside"), "{}").unwrap();
-        std::os::unix::fs::symlink(home.join("outside"), &f).unwrap();
+        fs::write(auth.join("outside"), "{}").unwrap();
+        std::os::unix::fs::symlink(auth.join("outside"), &f).unwrap();
         let err = match CredsStore::open(home) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("a symlinked credentials entry must refuse"),
