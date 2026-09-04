@@ -250,6 +250,119 @@ fn refuse_while_env_signs_us_in(creds: &CredsStore) -> Result<()> {
     Ok(())
 }
 
+/// Does this browser prefer Russian, per RFC 9110 `Accept-Language`?
+///
+/// **This page is the one exception to «the CLI speaks English».** That ruling is about a
+/// developer tool's terminal output; this is a web page, rendered in the browser, in the middle
+/// of a sign-in the reader just completed on a Russian-first product — and the browser tells us
+/// its language in the very request it makes to us. Ignoring a signal we are handed, to show
+/// somebody English inside their own Russian flow, is not a convention, it is a seam.
+///
+/// Tags are ranked by `q` (absent means 1.0, per the RFC), highest wins, ties keep source order.
+/// Anything that is not Russian falls through to English, which is what an unparseable or absent
+/// header does too.
+fn prefers_russian(header: &str) -> bool {
+    let mut best: Option<(f32, bool)> = None;
+    for part in header.split(',') {
+        let mut bits = part.split(';');
+        let tag = bits.next().unwrap_or("").trim().to_ascii_lowercase();
+        if tag.is_empty() {
+            continue;
+        }
+        let q = bits
+            .find_map(|p| {
+                let p = p.trim();
+                p.strip_prefix("q=")
+                    .and_then(|v| v.trim().parse::<f32>().ok())
+            })
+            .unwrap_or(1.0);
+        // `*` matches anything and must not out-rank a real preference at equal q.
+        if tag == "*" {
+            continue;
+        }
+        let is_ru = tag == "ru" || tag.starts_with("ru-");
+        // Strictly greater keeps the FIRST tag at equal q, which is the source order the RFC
+        // says to preserve.
+        if best.is_none() || q > best.unwrap().0 {
+            best = Some((q, is_ru));
+        }
+    }
+    best.is_some_and(|(q, is_ru)| q > 0.0 && is_ru)
+}
+
+/// The page the browser lands on when the loopback callback arrives.
+///
+/// **Entirely self-contained**: no stylesheet, font or image is fetched. This is a loopback
+/// listener that has just taken part in an authorization round — a page that reaches out to the
+/// network to look presentable would make the last step of a sign-in depend on a second request,
+/// and would send one from a URL carrying the round's query string. The colours are the
+/// product's own (`packages/theme/default.css`), copied rather than imported for the same
+/// reason the CLI depends on no core crate: this binary ships standalone under MIT.
+///
+/// It is the hand-off from a designed product page back to a terminal, so it says which one is
+/// next rather than only that this one is finished.
+fn page(russian: bool, ok: bool) -> String {
+    let lang = if russian { "ru" } else { "en" };
+    let (title, detail) = match (russian, ok) {
+        (true, true) => (
+            "Готово",
+            "Устройство подключено. Вкладку можно закрыть и вернуться в терминал.",
+        ),
+        (true, false) => (
+            "Не получилось",
+            "Войти не удалось. Вернитесь в терминал — там написано, что делать дальше.",
+        ),
+        (false, true) => (
+            "All set",
+            "This device is connected. You can close this tab and return to your terminal.",
+        ),
+        (false, false) => (
+            "Didn't work",
+            "The sign-in failed. Return to your terminal \u{2014} it says what to do next.",
+        ),
+    };
+    // The accent carries the state: the product's amber for success, its muted text for a
+    // failure — a red would overstate a round the user can simply run again.
+    let mark = if ok { "#cf8a2c" } else { "#9c968b" };
+    let mark_dark = if ok { "#e0a24a" } else { "#7d776b" };
+    format!(
+        r#"<!doctype html><html lang="{lang}"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>docli</title><style>
+:root {{
+  --bg:#f4f2ee; --surface:#ffffff; --text:#23211d; --text-2:#5a564e;
+  --border:#e7e3dc; --mark:{mark};
+  color-scheme: light dark;
+}}
+@media (prefers-color-scheme: dark) {{
+  :root {{ --bg:#1a1815; --surface:#211f1b; --text:#ece7de; --text-2:#b0aa9d;
+           --border:#322e28; --mark:{mark_dark}; }}
+}}
+* {{ box-sizing: border-box; }}
+body {{
+  margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+  background:var(--bg); color:var(--text); padding:24px;
+  font-family:"Inter",ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  -webkit-font-smoothing:antialiased;
+}}
+.card {{
+  background:var(--surface); border:1px solid var(--border); border-radius:14px;
+  padding:32px 36px; max-width:26rem; width:100%; text-align:center;
+  box-shadow:0 1px 2px rgba(0,0,0,.04), 0 8px 24px rgba(0,0,0,.05);
+}}
+.mark {{
+  width:44px; height:44px; margin:0 auto 20px; border-radius:12px;
+  background:var(--mark); color:#fff; display:flex; align-items:center;
+  justify-content:center; font-weight:700; font-size:22px; line-height:1;
+}}
+h1 {{ margin:0 0 8px; font-size:1.0625rem; font-weight:600; letter-spacing:-.01em; }}
+p  {{ margin:0; font-size:.9375rem; line-height:1.5; color:var(--text-2); }}
+</style></head>
+<body><main class="card"><div class="mark" aria-hidden="true">d</div>
+<h1>{title}</h1><p>{detail}</p></main></body></html>"#
+    )
+}
+
 pub fn run_login(server: &str, creds: &CredsStore) -> Result<()> {
     refuse_while_env_signs_us_in(creds)?;
     let listener =
@@ -292,13 +405,27 @@ pub fn run_login(server: &str, creds: &CredsStore) -> Result<()> {
             );
             continue;
         }
-        let outcome = parse_callback(&line);
-        let body = match &outcome {
-            Ok(_) => {
-                "<html><body><p>docli is connected - you can close this window.</p></body></html>"
+        // The rest of the request, for `Accept-Language`. BOUNDED: a browser sends a dozen
+        // short headers, and this listener answers whatever connects to a loopback port.
+        let mut accept_language = String::new();
+        for _ in 0..64 {
+            let mut h = String::new();
+            match reader.read_line(&mut h) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => break,
             }
-            Err(_) => "<html><body><p>Sign-in failed - return to the terminal.</p></body></html>",
-        };
+            if h.trim().is_empty() {
+                break;
+            }
+            if let Some(v) = h.split_once(':') {
+                if v.0.eq_ignore_ascii_case("accept-language") {
+                    accept_language = v.1.trim().chars().take(256).collect();
+                }
+            }
+        }
+        let outcome = parse_callback(&line);
+        let body = page(prefers_russian(&accept_language), outcome.is_ok());
         let _ = write!(
             stream,
             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -360,6 +487,48 @@ pub fn run_login(server: &str, creds: &CredsStore) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// The page a browser lands on after the sign-in it just completed on a Russian-first
+    /// product must not be English by default. The browser hands us the answer in the same
+    /// request; the only thing that was wrong was that nobody read it.
+    #[test]
+    fn the_callback_page_follows_the_browsers_language() {
+        use super::{page, prefers_russian};
+        assert!(prefers_russian("ru-RU,ru;q=0.9,en-US;q=0.8"));
+        assert!(prefers_russian("ru"));
+        assert!(!prefers_russian("en-US,en;q=0.9"));
+        // Absent, empty and unparseable all mean «we were told nothing» -> English.
+        assert!(!prefers_russian(""));
+        assert!(!prefers_russian("!!!"));
+        // q ranks, and it can put English first even when Russian is listed.
+        assert!(!prefers_russian("ru;q=0.2,en;q=0.9"));
+        assert!(prefers_russian("en;q=0.4,ru;q=0.8"));
+        // `q=0` means «not this one», even alone.
+        assert!(!prefers_russian("ru;q=0"));
+        // A wildcard must not out-rank a real preference.
+        assert!(!prefers_russian("*,en;q=0.5"));
+        // The pages themselves carry the matching lang attribute and no mojibake risk.
+        let ru = page(true, true);
+        assert!(ru.contains("lang=\"ru\""), "{ru}");
+        assert!(ru.contains("можно закрыть"), "{ru}");
+        assert!(page(false, true).contains("close this tab"));
+        assert!(page(true, false).contains("Вернитесь в терминал"));
+        // Self-contained: the last step of a sign-in must not depend on a second request, and
+        // this URL carries the round's query string.
+        for p in [page(true, true), page(false, false)] {
+            assert!(
+                !p.contains("http://") && !p.contains("https://"),
+                "no remote asset: {p}"
+            );
+            assert!(!p.contains("<script"), "no script: {p}");
+        }
+        // Content-Length is written from `str::len()`, which is BYTES — the Cyrillic page would
+        // be truncated if that were ever changed to a character count.
+        assert!(
+            ru.len() > ru.chars().count(),
+            "the page really is multi-byte"
+        );
+    }
+
     use super::*;
 
     #[test]

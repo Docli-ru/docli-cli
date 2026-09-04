@@ -8,10 +8,16 @@
 //! and asks once. What it deliberately does NOT do is decide anything about the user's own
 //! directories:
 //!
-//! * **Mirrors and `docli.toml` are the project's, not ours.** A mirror is a rebuildable cache,
-//!   but it lives inside a repository the user owns, and a tool that deletes files inside a
-//!   checkout on its way out is a tool nobody installs twice. The command PRINTS where they
-//!   are and leaves them; `--purge` opts into removing the ones it can see from here.
+//! * **`docli.toml` and a mirror the user PLACED are the project's, not ours.** A mirror is a
+//!   rebuildable cache, but an explicit `dir` puts it inside a repository the user owns, and a
+//!   tool that deletes files inside a checkout on its way out is a tool nobody installs twice.
+//!   Those are PRINTED and left; `--purge` opts into removing the ones it can prove are ours.
+//! * **The per-machine cache IS ours, and goes with the rest of `~/.docli`.** Since v0.29.2 a
+//!   derived mount lives in our own home, not in anybody's checkout — and uninstall removes the
+//!   BINARY, so no project can be reading that cache afterwards. It is announced in the list
+//!   before the single confirmation, like everything else. `--purge` deliberately says nothing
+//!   about it: that flag is scoped to ONE project, while the cache is shared by every project on
+//!   the machine, so purging from project A must never take away what project B is using.
 //! * **Agent configurations are shared files.** `.mcp.json` and friends usually carry other
 //!   servers, so uninstall names them and leaves the editing to the reader.
 //!
@@ -74,8 +80,21 @@ fn project_paths(cwd: &Path) -> Result<Vec<PathBuf>> {
     // by workspace id, so re-pointing an already-synced workspace at an existing `src/` made
     // that directory look owned, and `--purge` would have deleted the project's own source.
     // `docli.toml` is committed and hand-editable, so this has to be checked against the disk.
-    let control_dir = root.join(".docli");
+    //
+    // The project's REAL control root — since v0.29.2 that is `~/.docli`, not `<project>/.docli`.
+    // This line still said the latter, so every marker was compared against a directory that no
+    // longer exists, every mount came back «not this project's mirror», and `--purge` refused all
+    // of them while saying so.
+    let control_dir = project.control_root().dir;
     for m in &project.config.mounts {
+        // A DERIVED mount is the per-machine cache in `~/.docli/mirror`, which the ordinary
+        // uninstall already removes wholesale — it is not this project's to purge, and it is
+        // not the reader's directory to be told about. `--purge` exists for the mount somebody
+        // put inside their own project with an explicit `dir`; that is the same «a directory is
+        // printed only when the USER chose it» split `docli list` learned in 0.1.14.
+        if m.derived_dir {
+            continue;
+        }
         let abs = crate::config::mount_abs(&root, m);
         let phys = crate::config::physicalize(&abs);
         // Never the project itself or anything containing it: `dir = "."` or `".."` would make
@@ -120,7 +139,7 @@ fn still_ours(cwd: &Path, dir: &Path) -> bool {
     project.config.mounts.iter().any(|m| {
         crate::config::physicalize(&crate::config::mount_abs(&root, m))
             == crate::config::physicalize(dir)
-            && crate::mountfs::verify_mount_identity(dir, &root.join(".docli"), m.workspace)
+            && crate::mountfs::verify_mount_identity(dir, &project.control_root().dir, m.workspace)
     })
 }
 
@@ -561,6 +580,7 @@ mod tests {
 
     #[test]
     fn project_paths_lists_only_what_exists_and_nothing_outside_the_project() {
+        let _home = test_home();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::write(
@@ -588,6 +608,7 @@ mod tests {
 
     #[test]
     fn a_hand_edited_mount_cannot_make_purge_delete_the_project_or_its_parent() {
+        let _home = test_home();
         // `docli.toml` is committed and hand-editable, and nothing revalidates it here; a mount
         // of `.` or `..` must never reach the recursive delete.
         let tmp = tempfile::tempdir().unwrap();
@@ -613,9 +634,45 @@ mod tests {
         }
     }
 
+    /// Point `DOCLI_HOME` at a temp directory for the body of one test.
+    ///
+    /// Without it these tests resolve the control root to the REAL `~/.docli`, write marker
+    /// files naming it, and pass or fail on whatever the developer's machine happens to hold.
+    /// The lock is the crate-wide one, because the variable is process-global.
+    struct TestHome {
+        _dir: tempfile::TempDir,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    fn test_home() -> TestHome {
+        let guard = crate::creds::home_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded within the guard; every reader takes the same lock.
+        unsafe { std::env::set_var("DOCLI_HOME", dir.path()) };
+        TestHome {
+            _dir: dir,
+            _guard: guard,
+        }
+    }
+
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("DOCLI_HOME") };
+        }
+    }
+
     /// Write the `MOUNT.docli` marker a real sync would leave in `dir`.
+    ///
+    /// The owner is the project's REAL control root, which since v0.29.2 is the per-machine home
+    /// — not `<project>/.docli`. This helper still wrote the latter, so these fixtures were
+    /// describing a layout the product had stopped using, and they went on passing because the
+    /// production code was reading the same stale path. Both are fixed together; a fixture that
+    /// agrees with a bug is not a test.
     fn claim(root: &Path, dir: &str, ws: &str) {
-        let owner = std::fs::canonicalize(root.join(".docli"))
+        let project = crate::config::load_project(root).unwrap();
+        let control = project.control_root().dir;
+        std::fs::create_dir_all(&control).unwrap();
+        let owner = std::fs::canonicalize(&control)
             .unwrap()
             .display()
             .to_string();
@@ -629,6 +686,7 @@ mod tests {
 
     #[test]
     fn a_re_pointed_mount_does_not_make_someone_elses_directory_purgeable() {
+        let _home = test_home();
         // State is keyed by WORKSPACE; the directory is what gets deleted. Syncing a workspace
         // once and then re-pointing it at an existing `src/` must not make `src/` ours.
         let tmp = tempfile::tempdir().unwrap();
@@ -695,6 +753,32 @@ mod tests {
     /// one filename — so an ordinary home always looked «not empty», and the refusal asserted
     /// that «a sign-in most likely landed while uninstalling, and its token is live», which had
     /// not happened. Reported from a real run, three releases after the move.
+    /// `--purge` has nothing to say about the per-machine cache.
+    ///
+    /// Reported from a real run: three `~/.docli/mirror/<ws>` directories each announced as «not
+    /// this project's mirror - left untouched». Two faults behind it — the identity check ran
+    /// against `<project>/.docli`, a control root v0.29.2 retired, so NOTHING could match; and a
+    /// derived mount is not the project's to purge in the first place, since the ordinary
+    /// uninstall removes `~/.docli` wholesale. The reader was told about a directory they did
+    /// not choose, about an outcome that was not true.
+    #[test]
+    fn purge_says_nothing_about_the_machine_cache() {
+        let _home = test_home();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("docli.toml"),
+            "server = \"https://docli.ru\"\n\n[[mount]]\nworkspace = \"cd2f1093-4219-4d68-8d2c-dfe7d5125b72\"\n",
+        )
+        .unwrap();
+        // A derived mount resolves into the machine home, which is not under the project at all.
+        let paths = project_paths(root).unwrap();
+        assert!(
+            paths.is_empty(),
+            "a derived mount is the machine cache, not this project's to purge: {paths:?}"
+        );
+    }
+
     #[test]
     fn a_used_home_is_emptied_of_everything_docli_wrote() {
         let tmp = tempfile::tempdir().unwrap();

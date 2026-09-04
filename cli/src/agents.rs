@@ -957,17 +957,25 @@ fn wire_one(project_root: &Path, def: &AgentDef, url: &str) -> Result<()> {
 /// announced with the exact path, and it grants the narrowest directory that works. Everything
 /// else `init` writes ADDS a capability docli owns — an MCP entry, a hook that refuses writes.
 /// This one takes a restriction away, which is why it says so out loud.
-pub fn allow_codex_refresh(project_root: &Path) -> Result<bool> {
-    let Some(def) = agent("codex") else {
-        return Ok(false);
-    };
+pub fn allow_codex_refresh(_project_root: &Path) -> Result<bool> {
     let auth = crate::creds::auth_dir()?;
     let auth = auth.to_str().context("the credentials path is not UTF-8")?;
-    let McpAdapter::CodexToml { path: rel } = def.adapter else {
-        return Ok(false);
+    // The USER's Codex config, never the project's — even though the MCP entry beside it goes
+    // project-local when a `.codex/` is there.
+    //
+    // The two are different KINDS of setting. `url = "https://docli.ru/api/mcp/c/…"` is the same
+    // on every machine and belongs in a committed file. This one is an absolute path through
+    // somebody's home directory, and a project `.codex/config.toml` is committed — writing it
+    // there bakes one developer's machine into a file their colleagues pull, which is the same
+    // rule v0.29.2 minted for a derived `dir` in `docli.toml`. Caught by reading a commit that
+    // had swept the file up, not by a test.
+    let home = std::env::home_dir().context("cannot determine the home directory")?;
+    let abs = home.join(".codex").join("config.toml");
+    let rel = "~/.codex/config.toml";
+    let existing = match fs::read(&abs) {
+        Ok(b) => String::from_utf8(b).ok(),
+        Err(_) => None,
     };
-    let existing = read_existing(project_root, def).unwrap_or(None);
-    let abs = project_root.join(rel);
     match merge_codex_writable_root(existing.as_deref(), auth) {
         MergeOutcome::Write(content) => {
             if let Some(parent) = abs.parent() {
@@ -1657,6 +1665,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The grant goes in the USER's Codex config, never a project one.
+    ///
+    /// A project `.codex/config.toml` is committed. The MCP entry beside it is the same on every
+    /// machine and belongs there; this one is an absolute path through somebody's home
+    /// directory, and writing it there hands a colleague a config naming a directory that does
+    /// not exist on their machine. Caught by reading a commit that had swept the repository's
+    /// own `.codex/config.toml` up — a machine path had gone in, exactly the thing v0.29.2
+    /// stopped `docli.toml` doing with a derived `dir`.
+    #[test]
+    fn the_sandbox_grant_never_lands_in_a_committed_project_config() {
+        let home = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(proj.path().join(".codex")).unwrap();
+        std::fs::write(
+            proj.path().join(".codex/config.toml"),
+            "[mcp_servers.other]\nurl = \"https://x\"\n",
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(proj.path().join(".codex/config.toml")).unwrap();
+
+        let _lock = crate::creds::home_env_lock();
+        // SAFETY: single-threaded under the guard.
+        unsafe {
+            std::env::set_var("HOME", home.path());
+            std::env::set_var("DOCLI_HOME", home.path().join(".docli"));
+        }
+        let wrote = allow_codex_refresh(proj.path()).unwrap();
+        unsafe {
+            std::env::remove_var("DOCLI_HOME");
+        }
+
+        assert!(wrote, "the grant should have been written");
+        assert_eq!(
+            std::fs::read_to_string(proj.path().join(".codex/config.toml")).unwrap(),
+            before,
+            "a committed project config must never receive a machine path"
+        );
+        let user = std::fs::read_to_string(home.path().join(".codex/config.toml")).unwrap();
+        assert!(user.contains("writable_roots"), "{user}");
+        assert!(user.contains(".docli/auth"), "{user}");
     }
 
     /// The sandbox grant APPENDS. Every other root is somebody's own decision about their own
