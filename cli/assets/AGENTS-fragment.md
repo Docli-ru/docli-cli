@@ -5,6 +5,23 @@ This project mounts one or more docli («докли») workspaces as a **read-on
 not through the filesystem: it applies the mirror's freshness and digest checks, and
 `docli search` no longer prints a local mirror path for each result.
 
+**These notes are a primary source for the work here, not a side archive** — the decisions,
+background, research and plans behind it. The files here say what; the notes say why. (That need
+not be source code: this may be a repository, a manuscript, a research folder or a set of
+runbooks.)
+
+- **Consult them whenever the files here cannot answer the question**, unprompted: why something is
+  the way it is, what was decided and why, what was already tried and rejected. Nobody has to say
+  the word «notes» for a search to be the right move.
+- **Write back when something lands** — a decision made, a finding measured, a fork closed. Use
+  `edit_note` (or `write_note`) over the docli MCP connection, then run `docli sync`. Knowledge
+  that stays in a session transcript is lost to every later session and to everyone else. The
+  mirror is never the write path.
+- **When the docli MCP tools are also available, prefer the CLI for reading.** `docli search`
+  and `docli read` answer from the local mirror; `search_notes`/`read_note` reach the server for
+  every note. Fall back to the MCP tools when `docli read` exits 3 (this mirror does not hold it)
+  or discloses that the mirror is stale — and always use them to write.
+
 - **`docli search "…"` finds, `docli read <path>` opens.** Search prints each hit's server path
   and node id; `docli read` prints that note — `--lines 40-80` for a range, `--json` for the
   read_note envelope, `--mount` when more than one mount holds it. **Exit 3 means only that this

@@ -1,6 +1,6 @@
 ---
 name: docli-mirror
-description: The docli (докли) notes mirror in this project — docli.toml, .docli/mirror/, *.docli markers. Use when asked to search, read, or change the user's docli/докли notes, vault, or workspace, and ALWAYS before editing any file under a mirror directory: those files are a read-only cache, and a hand edit there is destroyed with no conflict copy.
+description: The docli (докли) workspace mirrored into this directory — docli.toml, .docli/mirror/, *.docli markers — holding the notes behind the work here: decisions, background, research, plans. Use it whenever you need context the files here cannot give you (why something is the way it is, what was decided and why, what was already tried), whenever a decision or finding lands and should be written back, and whenever you are asked to search, read or change the user's docli/докли notes, vault or workspace. ALWAYS use it before editing any file under a mirror directory: those files are a read-only cache, and a hand edit there is destroyed with no conflict copy.
 allowed-tools: Bash(docli *)
 ---
 
@@ -17,6 +17,37 @@ This project mounts one or more docli workspaces as a **read-only mirror** (see 
 The mirror is a local copy of server state, maintained by the `docli` CLI.
 Every rule below exists because breaking it can silently destroy data or misrepresent what the
 server holds.
+
+## What these notes are, and when to reach for them
+
+**They are a primary source for the work here, not a side archive.** Somebody mounted a
+workspace into this directory so that the knowledge behind it — decisions and their reasons,
+background, research, plans, what was already tried and rejected — is available while working.
+The files here say what; these say why.
+
+(Do not assume that means source code. This may be a repository, but it may equally be a
+manuscript, a research folder or a set of runbooks; read «the files here» literally.)
+
+- **Consult them whenever the files here cannot answer the question.** «Why is this the way it is»,
+  «what did we decide about X», «has this been tried» — search here before concluding from the
+  code alone. Do it unprompted: nobody has to say the word «notes» for this to be the right move.
+- **Write back when something lands.** A decision made, a finding measured, a fork closed — if it
+  only exists in the session transcript it is lost to every later session and to everyone else.
+  Record it with `edit_note` (or `write_note`) over the **docli MCP connection**, then run
+  `docli sync` so the mirror catches up. The mirror itself is never the write path; see below.
+- **Both halves matter.** A knowledge base that is only read goes stale, and one that is only
+  written is never used.
+
+### When the docli MCP tools are also available, prefer the CLI for reading
+
+`docli search` and `docli read` answer from the local mirror; `search_notes` and `read_note`
+reach the server for every note. Same content, but the mirror costs no network round-trip per
+read and no per-read audit row, which is the reason it exists.
+
+Use the MCP tools when the CLI cannot serve the request — `docli read` exits **3** (this mirror
+does not hold that note; it can be scoped to a folder), or it discloses that the mirror is stale
+and you need what the server has right now. And use them for **every write**: the mirror is
+read-only, so `edit_note`/`write_note` are the only way to change anything.
 
 ## Notes are found and read through the CLI
 

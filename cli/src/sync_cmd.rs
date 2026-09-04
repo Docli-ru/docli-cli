@@ -944,7 +944,13 @@ pub fn hook_check(cwd: &Path, agent: crate::hooks::HookAgent) -> i32 {
     if let Some(n) = crate::selfupdate::cached_notice() {
         lines.push(n);
     }
-    for line in freshness_lines(cwd) {
+    let freshness = freshness_lines(cwd);
+    // The orientation goes FIRST and only when there is a mirror to orient about — the
+    // freshness lines below are the answer to a question the agent did not ask yet.
+    if !freshness.is_empty() {
+        lines.push(ORIENTATION.to_string());
+    }
+    for line in freshness {
         lines.push(line);
     }
     if !lines.is_empty() {
@@ -952,6 +958,41 @@ pub fn hook_check(cwd: &Path, agent: crate::hooks::HookAgent) -> i32 {
     }
     0
 }
+
+/// What an agent needs to know about this mirror, on every session.
+///
+/// **Why it rides the freshness hook.** v0.28.6 D1 ranked the channels by how reliably each one
+/// REACHES the agent: the CLI's own output, then a `PreToolUse` deny, then `SessionStart`, then a
+/// document the model must choose to open. `SessionStart` is the only one that arrives
+/// unconditionally in every session, and it was spending that reach on three lines saying
+/// «fresh» — an answer to a question nobody had asked. The contract itself was reaching the
+/// agent only through `AGENTS.md`/`CLAUDE.md`, which are opt-in (`--instructions`) and never
+/// overwrite an existing `CLAUDE.md`, so in plenty of projects nothing taught it anything.
+///
+/// **It leads with WHEN, not HOW.** An agent that does not know what these notes ARE will never
+/// reach for them — it will read whatever files are here, answer from those, and never learn
+/// there was a decision record explaining why they look the way they do. Somebody mounted a
+/// workspace into this directory to give the agent that knowledge; the mechanics are useless
+/// until the agent knows there is a reason to start.
+///
+/// **It says «the files here», never «the code».** Coding agents are who this CLI is FOR, but a
+/// source tree is not a premise: a workspace can just as well be mirrored beside a manuscript,
+/// a research folder or a set of runbooks, and «the code says what, the notes say why» is
+/// meaningless in a directory with no code in it.
+///
+/// **Both directions, because a knowledge base only stays one if things go back in.** Consulting
+/// it is half; a decision or finding that lands in a session and stays in the transcript is lost
+/// to every later session and every other person. The write path is deliberately NOT the mirror
+/// — it is `edit_note` over MCP — which is the same rule the read-only cache already enforces,
+/// stated as a capability rather than as a refusal.
+///
+/// **Kept short, because this is charged to every session's context.** Each mechanical rule
+/// survives the trim because getting it wrong is SILENT: grepping the mirror finds a stale or
+/// scoped copy and reports it as fact; editing it loses the work with no conflict copy; and
+/// reading absence out of an empty grep is how «that note does not exist» gets asserted about a
+/// note that does. The `PreToolUse` deny covers the mirror-write case again at the moment it
+/// matters — this is the version that arrives BEFORE the mistake.
+const ORIENTATION: &str = "This directory has docli workspaces mirrored into it: the notes behind the work here - decisions, background, research, plans - as a read-only mirror. They are a primary source for it, not a side archive. CONSULT them whenever you need context the files here cannot give you: why something is the way it is, what was decided and why, what was already tried. WRITE BACK to them when a decision or finding lands in your session - use `edit_note` (or `write_note`) over the docli MCP connection, then run `docli sync`; knowledge that stays in a transcript is lost to every later session. To READ, prefer the CLI over the docli MCP tools when both are available: `docli search \"...\"` then `docli read <path>` answer from the local mirror without a network round-trip per note, while `search_notes`/`read_note` reach the server every time. Fall back to the MCP tools when `docli read` exits 3 (this mirror does not hold that note) or reports the mirror stale - and always use them to WRITE. Do not grep the mirror or open its files directly: it can be stale or scoped, and reading it that way turns a partial copy into a confident answer. Never edit mirror files - an edit there is never synced and is destroyed the next time that note changes. Only a `docli search` that does not report an incomplete index shows that a note does not exist.";
 
 /// The freshness half, as plain sentences. Separated from the emission so the branches can be
 /// tested without a terminal, a hook, or a schema.
@@ -1182,11 +1223,36 @@ fn one_mount_line(project: &Project, api: &Api, control: &ControlRoot, mount: &M
         Ok(o) if o.fresh => o.message,
         Ok(o) => format!("{} - do not trust local files until it succeeds", o.message),
         Err(e) if is_no_access(&e) => no_access_message(mount.display_name()),
+        Err(e) if is_home_write_refusal(&e) => format!(
+            "{}: freshness unknown - this machine's docli folder is not writable from here \
+             (an agent sandbox), and the check has to record what it learns. Reading still \
+             works; take `docli read`'s own disclosures as the signal.",
+            mount.display_name()
+        ),
         Err(e) => format!(
             "{}: freshness unknown ({e:#}) - run `docli sync --check`",
             mount.display_name()
         ),
     }
+}
+
+/// Was this failure just «the home is read-only here», rather than something to report?
+///
+/// It matters because of WHERE this text goes: straight into a model's context at every session
+/// start. The bare form was `writing /Users/…/.docli/state/<ws>.json.tmp: Operation not permitted
+/// (os error 1)` — a raw errno naming an internal temp file, which is the class 0.1.13 fixed for
+/// the credentials lock and never fixed here, plus the credential home printed into the one
+/// channel that reaches every session. `docli list` learned the same rule in 0.1.14: a directory
+/// is printed only when the USER chose it, and this one is ours.
+///
+/// The CONDITION is ordinary and expected — a coding agent's sandbox leaves `$HOME` read-only —
+/// so it gets a sentence that says what happened and what still works, not an errno.
+fn is_home_write_refusal(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            io.kind() == std::io::ErrorKind::PermissionDenied || io.raw_os_error() == Some(30)
+        })
+    })
 }
 
 #[cfg(test)]
