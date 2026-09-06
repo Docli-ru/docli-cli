@@ -520,8 +520,15 @@ pub fn run(cwd: &Path, api: Option<&Api>, args: &InitArgs) -> Result<i32> {
         for line in crate::hooks::consent_summary(&hook_agents) {
             crate::ui::detail(&line);
         }
+        // The PostToolUse matcher is built from THIS project's MCP label, not a constant: a
+        // project that renamed its server would otherwise get a matcher that never fires, and a
+        // mirror that silently stops being synced after writes.
+        let hook_label = config
+            .mcp_label
+            .clone()
+            .unwrap_or_else(|| crate::hooks::DEFAULT_MCP_LABEL.to_string());
         for agent in &hook_agents {
-            crate::hooks::install(cwd, *agent)?;
+            crate::hooks::install(cwd, *agent, &hook_label)?;
         }
         // D9: enforcement language appears ONLY for agents that got a hook, and it states the
         // limit in the same breath. Every other agent is advisory, and a user who wired Cursor

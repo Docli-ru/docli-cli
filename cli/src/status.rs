@@ -279,7 +279,17 @@ pub fn gather(cwd: &Path, server: &str) -> Result<Status> {
     status.agents_wired = crate::agents::wired_here(&root, &project.config.server);
     status.hooks = crate::hooks::HookAgent::all()
         .into_iter()
-        .map(|a| crate::hooks::status(&root, a))
+        .map(|a| {
+            crate::hooks::status(
+                &root,
+                a,
+                project
+                    .config
+                    .mcp_label
+                    .as_deref()
+                    .unwrap_or(crate::hooks::DEFAULT_MCP_LABEL),
+            )
+        })
         .collect();
     Ok(status)
 }

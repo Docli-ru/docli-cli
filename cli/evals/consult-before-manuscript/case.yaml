@@ -1,0 +1,13 @@
+name: consult-before-manuscript
+description: >
+  The SAME rule in a NON-CODE project — a manuscript with a docli mirror. The shipped
+  prompt goes to every install and a mounted project may be a manuscript, a research
+  folder or runbooks; a trigger phrased around source files or databases would be
+  meaningless here. This case exists to catch that regression.
+runs: 5
+max_turns: 12
+timeout_seconds: 240
+tags: [orientation, consult, non-code]
+prompt: prompt.md
+graders:
+  - graders/searched-first.md

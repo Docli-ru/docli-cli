@@ -31,6 +31,15 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// The server's `nodes.content_changed_at` as it travels: RFC 3339, microsecond precision, `Z`.
+///
+/// A STRING and not a timestamp type, deliberately. Every comparison this field takes part in is
+/// «is this byte-equal to the value the same server handed this client earlier», so what matters
+/// is that one producer formats it one way — not that either side can do arithmetic on it. Keeping
+/// it a string is also what keeps this crate free of a date dependency, which matters: it ships in
+/// the public MIT CLI mirror.
+pub type ContentStamp = String;
+
 /// The keyset pull cursor: strictly-after `(node_rev, id)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub struct WireCursor {
@@ -102,6 +111,17 @@ pub struct WireNode {
     pub sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blob_generation: Option<i64>,
+    /// v0.29.7 D2 — `nodes.content_changed_at`, the value the mid-session gate compares against.
+    ///
+    /// **Absent means the server has NO stamp for this node, and that is an ANSWER, not a gap.**
+    /// The column is written only by `set_body_author`, is never cleared, and every path that
+    /// changes a note's content goes through it — so no stamp proves the content has not changed
+    /// since `0052` (which shipped without a backfill, hence most rows). Non-notes never carry one.
+    ///
+    /// Which is why this needs no presence-awareness: an api too old to send the field and a
+    /// server that has none for this node lead to the same correct conclusion — nothing to mark.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_changed_at: Option<ContentStamp>,
 }
 
 /// v0.7.4 build 7: a server-advertised, version-sensitive feature gate. Each entry names a feature
@@ -326,6 +346,79 @@ pub struct SearchWorkspaceOutcome {
     /// derivation failed; absence is never `"none"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delta: Option<String>,
+    /// v0.29.7 D1 — WHICH nodes changed above the caller's cursor, so `docli read` can refuse
+    /// per NODE instead of the mount being marked wholesale.
+    ///
+    /// A SIBLING field rather than a fifth [`Self::delta`] value, and that is not stylistic:
+    /// every shipped CLI 0.1.4–0.1.20 filters `delta` against a frozen set of four, so an
+    /// unknown fifth value would not degrade to silence — it would REPLACE the `pending` line
+    /// those clients print, exactly when the mirror is furthest behind.
+    ///
+    /// Absent whenever `delta` is (no position sent, a refusal, a derivation failure) and
+    /// whenever this api cannot answer. **Absence is «we do not know», never «nothing
+    /// changed»** — an empty [`ChangedSet::nodes`] with `truncated: false` is the way to say
+    /// nothing changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed: Option<ChangedSet>,
+}
+
+/// The changed set for one workspace (v0.29.7 D1).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangedSet {
+    /// The nodes strictly above the caller's cursor. EMPTY with `truncated: false` means the
+    /// mirror is at head for content purposes.
+    ///
+    /// A SET, not a sequence: the rows are SELECTed in keyset order (that is what makes the
+    /// membership deterministic under the cap) but they are aggregated without an intra-aggregate
+    /// `ORDER BY`, so the emitted order is not promised and nothing may depend on it — the client folds
+    /// them into a map keyed by node id, taking the greatest [`ChangedNode::rev`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<ChangedNode>,
+    /// More changed than the request's remaining budget allowed, so [`Self::nodes`] is EMPTY
+    /// and says nothing about any node.
+    ///
+    /// The set is dropped rather than truncated on purpose: a partial list is indistinguishable
+    /// from a complete one to a client that marks from it, and the nodes it omits are precisely
+    /// the ones it would then serve as fresh. Truncation therefore falls back to the v0.29.0
+    /// behaviour — `delta` still says `pending`, `read` still serves and discloses (D5). It is
+    /// reachable by one ordinary act: `rewrite_paths` stamps a whole renamed subtree with ONE
+    /// cursor value as a deliberate tie group, so renaming a folder of >512 notes truncates.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
+}
+
+/// One changed node: its identity, the comparand, and whether it is a tombstone.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangedNode {
+    pub id: Uuid,
+    /// `nodes.node_rev` — the server's own monotonic position for this node, and the ORDERING key
+    /// for the claim a client records.
+    ///
+    /// The client cannot order claims by when it received them: two searches can append in the
+    /// opposite order to the snapshots they read, so «the last line wins» lets an older observation
+    /// suppress a newer one. A rev makes «newer» a property of the server rather than of the
+    /// filesystem, and makes a claim RETIRABLE — once the mirror has applied this rev, the claim is
+    /// permanently obsolete.
+    ///
+    /// It orders and retires; it never decides WHETHER a node is claimed. That stays
+    /// [`Self::at`]/[`Self::gone`], because `node_rev` moves on a rename or a reorder and the gate
+    /// must not fire on those.
+    pub rev: i64,
+    /// `nodes.content_changed_at`. Absent means the server HAS none for this node — which is a
+    /// real answer, and compares equal to a client that recorded the same absence. Every entry
+    /// comes from an api that serves this field, so unlike [`WireNode::content_changed_at`] no
+    /// presence-awareness is needed here: there is no «we never asked» case to distinguish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<ContentStamp>,
+    /// `trashed_at IS NOT NULL`. Its own flag because a trash bumps `node_rev` and deliberately
+    /// does NOT move `content_changed_at` (`0052`'s own exemption list), so a tombstone would
+    /// otherwise arrive with an EQUAL stamp and read as unchanged — and `docli read` would print
+    /// the body of a note the server considers deleted, the strongest form of the staleness this
+    /// exists to catch. A `gone` entry marks unconditionally.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub gone: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -355,6 +448,7 @@ mod tests {
             position: Some("a0".into()),
             sha256: Some("ab".into()),
             blob_generation: Some(3),
+            content_changed_at: Some("2026-09-05T10:00:00.000000Z".into()),
         }
     }
 
@@ -383,7 +477,8 @@ mod tests {
                 r#""nodes":[{"id":"00000000-0000-0000-0000-000000000001","#,
                 r#""parentId":"00000000-0000-0000-0000-000000000002","kind":"file","name":"a.md","#,
                 r#""path":"f/a.md","rev":7,"trashed":false,"mime":null,"contentBytes":5,"#,
-                r#""body":"hello","blobUrl":null,"position":"a0","sha256":"ab","blobGeneration":3}],"#,
+                r#""body":"hello","blobUrl":null,"position":"a0","sha256":"ab","blobGeneration":3,"#,
+                r#""contentChangedAt":"2026-09-05T10:00:00.000000Z"}],"#,
                 r#""resyncRequired":false,"lastMutationId":4}"#
             )
         );
@@ -541,6 +636,7 @@ mod tests {
             attachments_truncated: false,
             attachments_query_truncated: false,
             delta: Some("pending".into()),
+            changed: None,
         };
         assert_eq!(
             serde_json::to_string(&SearchResponse {
@@ -561,6 +657,7 @@ mod tests {
             attachments_truncated: false,
             attachments_query_truncated: false,
             delta: None,
+            changed: None,
         };
         assert_eq!(
             serde_json::to_string(&SearchResponse {
@@ -667,6 +764,120 @@ mod tests {
         assert!(held.is_some());
         let none: Option<WireGraph> = serde_json::from_str("null").unwrap();
         assert!(none.is_none());
+    }
+
+    // ---- the mid-session gate's pins (v0.29.7 D1/D2) ----------------------------------------
+
+    /// A served stamp is a stamp; a MISSING one is the server saying it has none, which is an
+    /// answer rather than a gap (v0.29.7 D2). An older api and a stampless node therefore lead a
+    /// client to the same correct conclusion, which is why this field needs no presence-awareness.
+    #[test]
+    fn a_missing_content_stamp_deserializes_as_none() {
+        let base = concat!(
+            r#"{"id":"00000000-0000-0000-0000-000000000001","parentId":null,"kind":"file","#,
+            r#""name":"a.md","path":"a.md","rev":1,"trashed":false,"mime":null,"#,
+            r#""contentBytes":0,"body":"","blobUrl":null"#
+        );
+        let parse =
+            |tail: &str| -> WireNode { serde_json::from_str(&format!("{base}{tail}}}")).unwrap() };
+        assert_eq!(parse("").content_changed_at, None);
+        assert_eq!(
+            parse(r#","contentChangedAt":null"#).content_changed_at,
+            None
+        );
+        assert_eq!(
+            parse(r#","contentChangedAt":"2026-09-05T10:00:00.000000Z""#).content_changed_at,
+            Some("2026-09-05T10:00:00.000000Z".to_string())
+        );
+    }
+
+    /// The changed set's bytes, and the shape that carries every arm: a plain stamp, a
+    /// known-NULL (`at` omitted), and a tombstone.
+    #[test]
+    fn a_changed_set_is_pinned() {
+        let outcome = SearchWorkspaceOutcome {
+            workspace_id: ws(1),
+            refused: None,
+            hits: vec![],
+            attachments: vec![],
+            degraded: false,
+            attachments_truncated: false,
+            attachments_query_truncated: false,
+            delta: Some("pending".into()),
+            changed: Some(ChangedSet {
+                nodes: vec![
+                    ChangedNode {
+                        id: ws(7),
+                        rev: 10,
+                        at: Some("2026-09-05T10:00:00.000000Z".into()),
+                        gone: false,
+                    },
+                    ChangedNode {
+                        id: ws(8),
+                        rev: 11,
+                        at: None,
+                        gone: false,
+                    },
+                    ChangedNode {
+                        id: ws(9),
+                        rev: 12,
+                        at: Some("2026-09-05T11:00:00.000000Z".into()),
+                        gone: true,
+                    },
+                ],
+                truncated: false,
+            }),
+        };
+        assert_eq!(
+            serde_json::to_string(&SearchResponse {
+                workspaces: vec![outcome]
+            })
+            .unwrap(),
+            concat!(
+                r#"{"workspaces":[{"workspaceId":"00000000-0000-0000-0000-000000000001","#,
+                r#""delta":"pending","changed":{"nodes":["#,
+                r#"{"id":"00000000-0000-0000-0000-000000000007","rev":10,"#,
+                r#""at":"2026-09-05T10:00:00.000000Z"},"#,
+                r#"{"id":"00000000-0000-0000-0000-000000000008","rev":11},"#,
+                r#"{"id":"00000000-0000-0000-0000-000000000009","rev":12,"#,
+                r#""at":"2026-09-05T11:00:00.000000Z","gone":true}]}}]}"#
+            )
+        );
+    }
+
+    /// The three answers the client has to tell apart, and the two that look alike in JSON.
+    ///
+    /// «Nothing changed» is an EMPTY set, «I could not say» is an ABSENT one, and truncation is
+    /// its own flag over an empty list — a client that folded any pair of these together would
+    /// serve stale bytes for the third.
+    #[test]
+    fn an_absent_changed_set_is_not_an_empty_one() {
+        let de = |s: &str| -> SearchWorkspaceOutcome { serde_json::from_str(s).unwrap() };
+        let id = r#""workspaceId":"00000000-0000-0000-0000-000000000001""#;
+        // A pre-v0.29.7 api, or any unanswered outcome: no key.
+        assert!(de(&format!("{{{id}}}")).changed.is_none());
+        // Answered, and the answer is «nothing above your cursor».
+        let empty = de(&format!(r#"{{{id},"changed":{{}}}}"#));
+        let empty = empty.changed.expect("an empty set is still an answer");
+        assert!(empty.nodes.is_empty() && !empty.truncated);
+        // Answered, and the answer is «more than I was allowed to list» — never a partial list.
+        let cut = de(&format!(r#"{{{id},"changed":{{"truncated":true}}}}"#));
+        let cut = cut.changed.expect("truncation is an answer too");
+        assert!(cut.nodes.is_empty() && cut.truncated);
+    }
+
+    /// The forward-compat direction that matters for the INSTALLED fleet: a 0.1.4–0.1.20 CLI
+    /// filters `delta` against a frozen set of four and knows nothing of `changed`. It must keep
+    /// reading `delta` exactly as before while ignoring the sibling — which is the whole reason
+    /// the changed set is not a fifth `delta` value.
+    #[test]
+    fn a_shipped_cli_still_reads_delta_beside_the_new_field() {
+        let json = concat!(
+            r#"{"workspaceId":"00000000-0000-0000-0000-000000000001","delta":"pending","#,
+            r#""changed":{"nodes":[{"id":"00000000-0000-0000-0000-000000000007","rev":1}]}}"#
+        );
+        let o: SearchWorkspaceOutcome = serde_json::from_str(json).unwrap();
+        assert_eq!(o.delta.as_deref(), Some("pending"));
     }
 
     /// The request pin for the flag, and the forward-compat direction that matters: a 0.1.4-era

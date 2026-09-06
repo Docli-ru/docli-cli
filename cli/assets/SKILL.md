@@ -28,25 +28,35 @@ The files here say what; these say why.
 (Do not assume that means source code. This may be a repository, but it may equally be a
 manuscript, a research folder or a set of runbooks; read «the files here» literally.)
 
-- **Consult them whenever the files here cannot answer the question.** «Why is this the way it is»,
-  «what did we decide about X», «has this been tried» — search here before concluding from the
-  code alone. Do it unprompted: nobody has to say the word «notes» for this to be the right move.
-- **Write back when something lands.** A decision made, a finding measured, a fork closed — if it
-  only exists in the session transcript it is lost to every later session and to everyone else.
-  Record it with `edit_note` (or `write_note`) over the **docli MCP connection**, then run
+Both rules below fire on an **event**, not on your assessment of whether you need them — that
+assessment is the thing that fails, because the files always answer *something*.
+
+- **Before you answer a «why is this the way it is / what did we decide about X / has this been
+  tried» question from the files here, search here first.** Not after you have formed a view from
+  them — before. Do it unprompted: nobody has to say the word «notes».
+- **When a decision or finding lands, write it back before you carry on.** Not at the end of the
+  session — batching it to a checkpoint is exactly how it gets lost, and a decision is not less true
+  for being recorded before the work around it is finished; if it later changes, edit the entry in
+  place. Record it with `edit_note` (or `write_note`) over the **docli MCP connection**, then run
   `docli sync` so the mirror catches up. The mirror itself is never the write path; see below.
 - **Both halves matter.** A knowledge base that is only read goes stale, and one that is only
   written is never used.
 
 ### When the docli MCP tools are also available, prefer the CLI for reading
 
-`docli search` and `docli read` answer from the local mirror; `search_notes` and `read_note`
-reach the server for every note. Same content, but the mirror costs no network round-trip per
-read and no per-read audit row, which is the reason it exists.
+`docli read` answers from the local mirror with no network call at all; `docli search` asks the
+SERVER, which is what makes a clean search the only thing that can establish a note does not exist.
+`search_notes` and `read_note` reach the server for every note, including ones the mirror already
+holds. Same content, but a mirrored read costs no network round-trip and no per-read audit row,
+which is the reason the mirror exists.
 
-Use the MCP tools when the CLI cannot serve the request — `docli read` exits **3** (this mirror
-does not hold that note; it can be scoped to a folder), or it discloses that the mirror is stale
-and you need what the server has right now. And use them for **every write**: the mirror is
+Use the MCP tools whenever the CLI cannot serve the request — `docli read` exits **3** (this mirror
+does not hold that note; it can be scoped to a folder), it discloses that the mirror is stale and
+you need what the server has right now, **or it fails outright**: a bad `docli.toml`, no mount in
+this directory, not installed. **A broken CLI is not a reason to stop.** The notes are still
+reachable with `search_notes`/`read_note`, and an unanswered question is worse than a slower
+answer — measured, not assumed: in six eval runs against a broken config, half the agents gave up
+instead of falling back. And use them for **every write**: the mirror is
 read-only, so `edit_note`/`write_note` are the only way to change anything.
 
 ## Notes are found and read through the CLI
@@ -67,6 +77,20 @@ read-only, so `edit_note`/`write_note` are the only way to change anything.
   answer about the mirror and never about the server: it may be outside the mount's folder scope,
   blocked from being written, or simply not synced yet. For a note, only a `docli search` that
   does not report an incomplete index establishes that it does not exist.
+- **`docli read` exits 4 when the server listed that note as changed since this mirror applied
+  it.** What is held here cannot be served as current, so it is not served at all — `docli sync`
+  brings the mirror up to date, after which the note reads normally — or, if the change was a
+  deletion, exits 3, which is the honest answer rather than a failure of the sync. Unlike exit 3 this is a statement about the
+  SERVER's copy, and it is only ever made about a note the server named: a note that merely *might*
+  be stale still reads, with its disclosures. Two honest edges: a note whose stamp this mirror never
+  recorded can be named by an ordinary rename, so an exit 4 can occasionally land on bytes that are
+  already current (one `docli sync` settles it); and the gate learns what changed from
+  `docli search`, so it stays silent until something searches.
+- **In a read-only `$HOME` the gate cannot LEARN, but it still HONOURS what it already knows.**
+  `docli search` cannot persist anything there, so nothing new is ever marked — but a mark an
+  earlier session left on disk is still read, and `docli sync` cannot run in that sandbox either.
+  So exit 4 there is one of the cases the fallback rule covers: read the note with `read_note` over
+  the docli MCP connection.
 - **`docli read` also answers the note's graph** — `links`, `backlinks`, `embeds`, `unresolved`,
   `tags`, `title` and `aliases`, on the `--json` envelope, with a counts line on stderr in plain
   mode. Every one of them is computed on the SERVER and delivered with the sync; the CLI resolves
@@ -77,8 +101,9 @@ read-only, so `edit_note`/`write_note` are the only way to change anything.
   `"backlinks": null` plus its `absent` entry means the CLI does not know — and that entry names
   the fix, which is usually `docli sync`.
 - A refusal under `--json` is `{"error": {"code", "message"}}` on stdout, with the same exit code.
-  `code` is `not_in_mirror` (exit 3), or `usage` / `unavailable` / `ambiguous` / `no_such_mount` /
-  `ambiguous_mount` (exit 2) — a caller's mistake and a gap on our side are never the same code.
+  `code` is `not_in_mirror` (exit 3), `stale` (exit 4), or `usage` / `unavailable` / `ambiguous` /
+  `no_such_mount` / `ambiguous_mount` (exit 2) — a caller's mistake and a gap on our side are never
+  the same code.
 - `disclosures` (and the same sentences on stderr) report what the CLI cannot vouch for. The
   content is still served; the caveat travels with it. Five codes — the first three say
   something about the CONTENT just handed over, the last two about what could not be checked:

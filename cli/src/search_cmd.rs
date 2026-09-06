@@ -14,14 +14,16 @@
 //! than printing a bare empty result.
 
 use anyhow::Result;
+use std::collections::{BTreeMap, HashMap};
+
 use docli_sync_wire::{
-    MirrorPosition, SearchRequest, SearchWorkspaceOutcome, SEARCH_WORKSPACE_CAP,
+    ChangedSet, MirrorPosition, SearchRequest, SearchWorkspaceOutcome, SEARCH_WORKSPACE_CAP,
 };
 use uuid::Uuid;
 
 use crate::config::{validate_config, Mount, Project};
 use crate::http::Api;
-use crate::state::ControlRoot;
+use crate::state::{ControlRoot, NodeState, TrackedKind};
 
 pub fn run(project: &Project, api: &Api, query: &str, json: bool) -> Result<i32> {
     if json {
@@ -92,6 +94,7 @@ pub fn run(project: &Project, api: &Api, query: &str, json: bool) -> Result<i32>
             continue;
         };
         let l = local.get(&o.workspace_id).expect("every mount was read");
+        record_marks(&control, o, l);
         rendered.push(render_workspace(mount, l, o, &mut any_hit));
         any_degraded |= o.degraded;
         any_refused |= o.refused.is_some();
@@ -181,11 +184,22 @@ const NOT_THIS_MIRROR: &str = "this directory is not this workspace's mirror";
 /// «no answer». Forward tolerance at the wire, a frozen set at the surface.
 const KNOWN_DELTA: [&str; 4] = ["none", "pending", "epoch_mismatch", "rebuild_required"];
 
-/// One mount's local half. Since v0.29.1 D1 it is the ask decision and nothing else: the state
-/// snapshot it used to carry existed solely to render per-note local addresses, which `search`
-/// no longer publishes.
+/// One mount's local half: the ask decision, and — since v0.29.7 — the NOTE stamps to compare the
+/// server's answer against.
+///
+/// v0.29.1 D1 stripped this down to the decision alone, because the state snapshot it carried
+/// existed to render per-note local addresses and made the freshness verdict and the addresses
+/// beneath it two snapshots of one instant. The stamps do not reintroduce that: they are the
+/// comparand FOR the very position this run sends up, so using the same snapshot is not a race —
+/// it is the only reading that answers the question actually asked.
 pub struct MountLocal {
     pub decision: AskDecision,
+    /// `id → NodeState`, restricted to NOTES (D2's non-goal: an attachment carries no stamp,
+    /// because `set_body_author` is `AND kind = 'file'`, so a re-upload is invisible to this gate
+    /// and marking one would only ever be a false positive).
+    ///
+    /// Empty unless the decision is [`AskDecision::Ask`] — nothing else can produce a comparison.
+    pub notes: std::collections::HashMap<Uuid, NodeState>,
 }
 
 /// Read one mount's local state and decide whether to ask the server about it.
@@ -203,12 +217,14 @@ fn read_local(project: &Project, control: &ControlRoot, mount: &Mount, now: i64)
         Err(e) => {
             return MountLocal {
                 decision: AskDecision::StateUnreadable(format!("{e:#}")),
+                notes: HashMap::new(),
             };
         }
     };
     let Some(st) = loaded else {
         return MountLocal {
             decision: AskDecision::NeverSynced,
+            notes: HashMap::new(),
         };
     };
     let decision = if !identity_ok {
@@ -223,7 +239,75 @@ fn read_local(project: &Project, control: &ControlRoot, mount: &Mount, now: i64)
             }),
         }
     };
-    MountLocal { decision }
+    let notes = match decision {
+        AskDecision::Ask(_) => st
+            .nodes
+            .into_iter()
+            .filter(|(_, n)| n.kind == TrackedKind::Note)
+            .collect(),
+        _ => std::collections::HashMap::new(),
+    };
+    MountLocal { decision, notes }
+}
+
+/// The claims this mirror should record from one workspace's answer (v0.29.7 D2/D3).
+///
+/// Each entry is `(id, node_rev)` — the server's own position for a node whose CONTENT it says has
+/// moved, or which it says is trashed. The two halves are deliberately different fields: the stamp
+/// (or `gone`) decides WHETHER to claim, so a rename or a reorder never fires the gate; the rev
+/// ORDERS and RETIRES the claim, because append order is not server order and a claim has to stop
+/// firing once the mirror catches up.
+///
+/// Pure, and separated from the I/O so the whole rule is unit-testable.
+///
+/// Three rules, and each is load-bearing:
+///
+/// * a TRUNCATED set claims NOTHING. It carries no rows, and inventing claims from an answer that
+///   said «more than I could list» would refuse nodes the server never named (D5's fallback).
+/// * only ids the mirror TRACKS AS NOTES are claimed. An out-of-scope node, a park and a node this
+///   mount never held are all already refused by `read` for their own reasons, so a claim for one
+///   would be inert weight. **An attachment is NOT in that category and the exclusion costs
+///   something real**: `read` serves a tracked attachment's envelope out of state plus its marker,
+///   so a file TRASHED on the server goes on being served as current until the next sync. `gone`
+///   is kind-independent and already on the wire, so the arm could cover it — attachments are
+///   excluded because the slice scoped itself to notes (their stamp is structurally always NULL,
+///   so the CONTENT half could never work), and the tombstone half is a named residual.
+/// * a claim the mirror already covers is skipped. A rename re-states every node in the tie group
+///   with its existing stamp, and `read` re-checks the same way, so this is an optimisation rather
+///   than the correctness step.
+fn marks_from(changed: &ChangedSet, notes: &HashMap<Uuid, NodeState>) -> BTreeMap<Uuid, i64> {
+    if changed.truncated {
+        return BTreeMap::new();
+    }
+    changed
+        .nodes
+        .iter()
+        .filter_map(|c| {
+            let held = notes.get(&c.id)?;
+            let worth_claiming = c.gone
+                || c.at
+                    .as_deref()
+                    .is_some_and(|at| held.content_moved(Some(at)));
+            (worth_claiming && c.rev > held.rev).then_some((c.id, c.rev))
+        })
+        .collect()
+}
+
+/// Persist what the server just named, so `docli read` can refuse it (v0.29.7 D3).
+///
+/// **«Asked but unanswered» neither marks nor clears.** An absent `changed` has three reachable
+/// producers — a pre-v0.29.7 api, a refusal or `INTERNAL` outcome, and a server-side derivation
+/// failure, which can arrive carrying `delta: "pending"` with no set beside it. None of them is
+/// «the server told us», so none may mark, and marks are never inferred from `delta` alone.
+///
+/// The write is a UNION and it is best-effort: where `$HOME` is read-only — an agent sandbox —
+/// nothing persists, so the gate LEARNS nothing there — which must never fail a search. It is not
+/// wholly inert in that environment: `read` still honours marks a writable-home session left.
+fn record_marks(control: &ControlRoot, o: &SearchWorkspaceOutcome, l: &MountLocal) {
+    let (AskDecision::Ask(_), Some(changed)) = (&l.decision, &o.changed) else {
+        return;
+    };
+    control.merge_marks(o.workspace_id, &marks_from(changed, &l.notes));
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -287,7 +371,11 @@ fn render_workspace(
             RenderedHit {
                 server_path: h.path.clone(),
                 id: h.id,
-                snippet: Some(h.snippet.clone()),
+                // PLAIN text, both here and in `--json`. The `<b>` marks are a RENDERING
+                // instruction, not data: an agent parsing this wants the sentence, and the CLI's
+                // own `--json` is closed over what it emits (the v0.29.0 delta precedent). A
+                // DECLARED contract change — `--json` used to carry the raw markup.
+                snippet: Some(snippet_text(&h.snippet)),
                 marker: false,
             }
         })
@@ -426,8 +514,77 @@ fn mirror_notice(r: &RenderedWorkspace) {
 /// The half of the notice that keeps a stale MIRROR from being read as a weaker ANSWER.
 const GUARDRAIL: &str = "server results are unaffected; this concerns the local mirror only";
 
+/// Split a server snippet into `(text, is_match)` runs.
+///
+/// The server's highlighter emits `<b>`-marked matches and **does not HTML-escape**
+/// (`apps/api/src/search_index/snippet.rs`, parity with `ts_headline`). Two consequences, and
+/// both are why this parser is four lines rather than an HTML dependency: the only markup that
+/// can appear is these two literals, and a note that genuinely contains the text `<b>` is
+/// INDISTINGUISHABLE from a highlight. The second is accepted — it costs a stray bold run in a
+/// snippet, where the alternative is escaping the whole pipeline for a case nobody has hit.
+fn highlight_runs(s: &str) -> Vec<(String, bool)> {
+    let mut runs = Vec::new();
+    let mut rest = s;
+    let mut on = false;
+    while let Some(i) = rest.find(if on { "</b>" } else { "<b>" }) {
+        let (head, tail) = rest.split_at(i);
+        if !head.is_empty() {
+            runs.push((head.to_string(), on));
+        }
+        rest = &tail[if on { 4 } else { 3 }..];
+        on = !on;
+    }
+    if !rest.is_empty() {
+        runs.push((rest.to_string(), on));
+    }
+    runs
+}
+
+/// The snippet as PLAIN text — what `--json` carries and what the width maths measures.
+fn snippet_text(s: &str) -> String {
+    highlight_runs(s).into_iter().map(|(t, _)| t).collect()
+}
+
+/// The snippet for a terminal: context dimmed, matched terms bold, clipped to one line.
+///
+/// Styled per RUN rather than by wrapping the whole string, because a `dim(...)` around embedded
+/// bold escapes resets at the first inner sequence and the rest of the line loses its dim. The
+/// clip budget is counted in PLAIN characters for the same family of reason — ANSI bytes are not
+/// columns.
+fn styled_snippet(s: &str) -> String {
+    let width = console::Term::stdout().size().1.clamp(40, 200) as usize;
+    let max = width.saturating_sub(8);
+    let runs = highlight_runs(s);
+    let total: usize = runs.iter().map(|(t, _)| t.chars().count()).sum();
+    let budget = if total > max {
+        max.saturating_sub(1)
+    } else {
+        max
+    };
+    let mut out = String::new();
+    let mut used = 0usize;
+    for (text, is_match) in runs {
+        if used >= budget {
+            break;
+        }
+        let take = budget - used;
+        let piece: String = text.chars().take(take).collect();
+        used += piece.chars().count();
+        if is_match {
+            out.push_str(&console::style(piece).bold().to_string());
+        } else {
+            out.push_str(&crate::ui::dim(&piece));
+        }
+    }
+    if total > max {
+        out.push_str(&crate::ui::dim("..."));
+    }
+    out
+}
+
 /// One terminal line, ellipsised. A snippet that wraps turns a list of hits into a paragraph
 /// and costs the reader the scannable left edge.
+#[allow(dead_code)]
 fn clip(s: &str) -> String {
     let width = console::Term::stdout().size().1.clamp(40, 200) as usize;
     let max = width.saturating_sub(8);
@@ -480,10 +637,10 @@ fn print_workspace(r: &RenderedWorkspace, show_mount: bool) {
             crate::ui::dim(&h.id.to_string())
         ));
         if let Some(s) = &h.snippet {
-            crate::ui::line(&format!(
-                "    {}",
-                crate::ui::dim(&clip(&s.replace('\n', " ")))
-            ));
+            // The server's `<b>` marks say WHICH terms matched — the most useful thing in the
+            // line. They were being printed literally, so every agent reading search results saw
+            // raw tags (observed 2026-09-05). Rendered as emphasis now, never as text.
+            crate::ui::line(&format!("    {}", styled_snippet(&s.replace('\n', " "))));
         }
     }
     for a in &r.attachments {
@@ -512,6 +669,36 @@ fn print_workspace(r: &RenderedWorkspace, show_mount: bool) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn highlight_marks_never_reach_the_reader_as_text() {
+        // Observed 2026-09-05 in real output: `no <b>author</b>** — but that is three populati...`
+        // Every agent reading search results was seeing raw tags.
+        let plain = snippet_text("of 2 842 live notes had no <b>author</b> at all");
+        assert_eq!(plain, "of 2 842 live notes had no author at all");
+        assert!(!plain.contains("<b>"), "no markup survives into --json");
+    }
+
+    #[test]
+    fn the_runs_carry_which_terms_matched() {
+        // Stripping is not enough on its own: the marks say WHICH terms matched, which is the
+        // most useful thing in the line, so the human path renders them as emphasis.
+        let runs = highlight_runs("a <b>hit</b> and <b>another</b>.");
+        let matched: Vec<&str> = runs
+            .iter()
+            .filter(|(_, m)| *m)
+            .map(|(t, _)| t.as_str())
+            .collect();
+        assert_eq!(matched, vec!["hit", "another"]);
+    }
+
+    #[test]
+    fn an_unmarked_snippet_is_returned_whole() {
+        // The zero-match fuzzy fallback ships an un-bolded fragment; it must survive untouched.
+        let s = "no marks here at all";
+        assert_eq!(snippet_text(s), s);
+        assert_eq!(highlight_runs(s).len(), 1);
+    }
+
     use super::*;
     use crate::config::DocliToml;
     use crate::state::WsState;
@@ -577,6 +764,7 @@ mod tests {
             attachments_truncated: false,
             attachments_query_truncated: false,
             delta: None,
+            changed: None,
         }
     }
 
@@ -596,7 +784,149 @@ mod tests {
             } else {
                 AskDecision::NeverSynced
             },
+            // The render tests assert on the mirror LINE, which the marks never touch — the
+            // marking tests below build their own note map.
+            notes: HashMap::new(),
         }
+    }
+
+    fn note(stamp: Option<&str>) -> NodeState {
+        NodeState {
+            server_path: "a.md".into(),
+            local_path: "a.md".into(),
+            kind: TrackedKind::Note,
+            rev: 1,
+            content_sha256: String::new(),
+            marker_path: None,
+            content_changed_at: stamp.map(str::to_string),
+        }
+    }
+
+    fn changed(id: u128, at: Option<&str>, gone: bool) -> docli_sync_wire::ChangedNode {
+        docli_sync_wire::ChangedNode {
+            id: Uuid::from_u128(id),
+            // Above every fixture's stored `rev: 1`, so the rev never masks what these assert.
+            rev: 9,
+            at: at.map(str::to_string),
+            gone,
+        }
+    }
+
+    fn set(nodes: Vec<docli_sync_wire::ChangedNode>, truncated: bool) -> ChangedSet {
+        ChangedSet { nodes, truncated }
+    }
+
+    /// The comparison at the heart of the gate (v0.29.7 D2), including the case that decides
+    /// whether the whole thing is livable: a RENAME moves `node_rev` but not `content_changed_at`,
+    /// so the same stamp comes back and nothing may be marked.
+    #[test]
+    fn a_matching_stamp_marks_nothing_and_a_different_one_marks() {
+        let mut notes = HashMap::new();
+        notes.insert(Uuid::from_u128(1), note(Some("T1")));
+        // A rename: the server re-states this node with the SAME stamp.
+        assert!(marks_from(&set(vec![changed(1, Some("T1"), false)], false), &notes).is_empty());
+        // A real edit.
+        assert_eq!(
+            marks_from(&set(vec![changed(1, Some("T2"), false)], false), &notes).len(),
+            1
+        );
+    }
+
+    /// **A served NULL never marks, whatever this mirror stored** — and that is what makes the
+    /// gate quiet on the population that actually exists.
+    ///
+    /// `content_changed_at` is written only by `set_body_author`, never cleared, and every content
+    /// path routes through it, so no stamp PROVES the content has not changed since `0052`. That
+    /// migration shipped without a backfill, so on a live workspace almost every note has none —
+    /// under a rule that marked conservatively when the mirror had recorded nothing, one folder
+    /// rename would refuse the whole tie group over bytes that were perfectly current.
+    #[test]
+    fn a_node_the_server_has_no_stamp_for_is_never_marked() {
+        for stored in [None, Some("T1")] {
+            let mut notes = HashMap::new();
+            notes.insert(Uuid::from_u128(1), note(stored));
+            assert!(
+                marks_from(&set(vec![changed(1, None, false)], false), &notes).is_empty(),
+                "a served NULL must not mark (stored: {stored:?})"
+            );
+        }
+        // An entry an older CLI wrote, against a server that DOES have a stamp: we cannot say our
+        // copy matches it, so it marks once and the next sync settles it.
+        let mut never = HashMap::new();
+        never.insert(Uuid::from_u128(1), note(None));
+        assert_eq!(
+            marks_from(&set(vec![changed(1, Some("T1"), false)], false), &never).len(),
+            1
+        );
+    }
+
+    /// `gone` marks unconditionally, and the fixture is the one that makes it necessary: a trash
+    /// arrives with an EQUAL stamp, because `0052` exempts trash from moving the column.
+    #[test]
+    fn a_tombstone_marks_even_though_its_stamp_is_unchanged() {
+        let mut notes = HashMap::new();
+        notes.insert(Uuid::from_u128(1), note(Some("T1")));
+        assert_eq!(
+            marks_from(&set(vec![changed(1, Some("T1"), true)], false), &notes)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![(Uuid::from_u128(1), 9)],
+            "a tombstone is claimed at its own rev — the STAMP is unchanged by a trash, so only \
+             the `gone` flag can decide to claim it, and only the rev can retire it"
+        );
+    }
+
+    /// Truncation marks NOTHING — the D5 fallback, and the property that keeps the gate from ever
+    /// being a regression. A folder rename of more than the budget lands here.
+    #[test]
+    fn a_truncated_set_marks_nothing() {
+        let mut notes = HashMap::new();
+        notes.insert(Uuid::from_u128(1), note(Some("T1")));
+        // The server sends no rows WITH the flag; even if a future one did, the flag wins.
+        assert!(marks_from(&set(vec![], true), &notes).is_empty());
+        assert!(marks_from(&set(vec![changed(1, Some("T2"), false)], true), &notes).is_empty());
+    }
+
+    /// Only ids this mirror TRACKS AS NOTES are marked. An attachment is out of scope by design
+    /// (it carries no stamp at all), and an untracked id is already an exit 3 — so a mark for
+    /// either would be weight in the file rather than a second answer.
+    #[test]
+    fn only_tracked_notes_are_marked() {
+        let mut notes = HashMap::new();
+        notes.insert(Uuid::from_u128(1), note(Some("T1")));
+        // id 2 is not in the map at all: out of scope, parked, or never delivered here.
+        let marks = marks_from(
+            &set(
+                vec![changed(1, Some("T2"), false), changed(2, Some("T9"), true)],
+                false,
+            ),
+            &notes,
+        );
+        assert_eq!(marks.len(), 1);
+        assert!(marks.iter().any(|(id, _)| *id == Uuid::from_u128(1)));
+    }
+
+    /// «Asked but unanswered» neither marks nor clears, and it must never be inferred from
+    /// `delta`. A derivation failure can arrive carrying `delta: "pending"` with no set beside it.
+    #[test]
+    fn an_absent_changed_set_writes_no_marks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let control = ControlRoot::new(tmp.path());
+        let ws = Uuid::from_u128(1);
+        let mut o = outcome(vec![], vec![]);
+        o.delta = Some("pending".into());
+        o.changed = None;
+        let mut l = as_local(true);
+        l.notes.insert(Uuid::from_u128(1), note(Some("T1")));
+        record_marks(&control, &o, &l);
+        assert!(
+            control.load_marks(ws).latest.is_empty(),
+            "a pending delta with no set beside it is not «the server told us»"
+        );
+        assert!(
+            !control.marks_path(ws).exists(),
+            "and it must not even create the file"
+        );
     }
 
     fn hit(id: u128, path: &str) -> SearchHitWire {

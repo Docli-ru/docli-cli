@@ -155,9 +155,13 @@ enum Command {
         #[arg(long)]
         full: bool,
         /// Report freshness on stdout in an agent's SessionStart hook schema, and always
-        /// exit 0 (`claude` or `codex`). Only with --check
-        #[arg(long, requires = "check", conflicts_with = "full")]
+        /// exit 0 (`claude` or `codex`). Use with --check or --post-write
+        #[arg(long, conflicts_with = "full")]
         agent: Option<String>,
+        /// Post-write hook mode: bring the mirror to head after an agent's MCP write, always
+        /// exit 0, and decline a full resync (too long for a hook's budget). Only with --agent
+        #[arg(long, requires = "agent", conflicts_with_all = ["check", "full"])]
+        post_write: bool,
     },
     /// Server search across all mounts; pass a result to `docli read`
     Search {
@@ -415,7 +419,12 @@ fn run(cli: Cli) -> Result<i32> {
             });
             init_cmd::run(&cwd, api.as_ref(), &args)
         }
-        Command::Sync { check, full, agent } => {
+        Command::Sync {
+            check,
+            full,
+            agent,
+            post_write,
+        } => {
             // The HOOK path resolves everything itself and always exits 0. It cannot go through
             // the branch below: `api_for` bails before `sync` is reached at all, so «not signed
             // in» would leave a SessionStart hook emitting an anyhow error to stderr and
@@ -429,11 +438,28 @@ fn run(cli: Cli) -> Result<i32> {
                 // parsing that payload and the field costs nothing. What this path must NOT do
                 // is read stdin for it — a person typing `docli sync --check --agent claude`
                 // in a terminal would hang on a pipe that never delivers a line.
+                if post_write {
+                    // PostToolUse. Unlike `--check` this one DOES read stdin — the payload is
+                    // how it learns the tool name and skips the read-only calls — and unlike
+                    // `guard` it takes the process cwd, for the same documented reason.
+                    return Ok(sync_cmd::hook_post_write(&cwd, agent));
+                }
                 return Ok(sync_cmd::hook_check(&cwd, agent));
+            }
+            if post_write {
+                anyhow::bail!("--post-write needs --agent (claude or codex)");
             }
             let project = config::load_project(&cwd)?;
             let api = api_for(&project)?;
-            sync_cmd::run(&project, &api, &sync_cmd::SyncOptions { check, full })
+            sync_cmd::run(
+                &project,
+                &api,
+                &sync_cmd::SyncOptions {
+                    check,
+                    full,
+                    post_write: false,
+                },
+            )
         }
         Command::Search { query, json } => {
             let project = config::load_project(&cwd)?;

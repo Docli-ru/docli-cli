@@ -31,6 +31,10 @@ const PAGE_LIMIT: i64 = 500;
 pub struct SyncOptions {
     pub check: bool,
     pub full: bool,
+    /// docli-cli 0.1.20 — the post-write hook's bounded mode. It changes exactly one thing: this sync
+    /// REFUSES to start a from-zero bootstrap. See the guard in `sync_mount`'s pass loop for why
+    /// that single branch is the whole fix.
+    pub post_write: bool,
 }
 
 /// The no-access refusal (D4): the AUTHOR's mount name, «ask the owner» — and the word
@@ -308,6 +312,34 @@ fn sync_mount(
     // Up to two passes: an incremental sync that detects a count mismatch flags from-zero and
     // the second pass repairs it in the same invocation (the flag is durable either way).
     for _pass in 0..2 {
+        if state.from_zero && opts.post_write {
+            // THE POST-WRITE DEADLOCK, and the one branch that closes it (docli-cli 0.1.20).
+            //
+            // A `PostToolUse` hook runs under a ~10-second kill. A from-zero bootstrap is by
+            // construction longer than that on any real workspace, so without this guard:
+            //
+            //   1. the hook's incremental pass detects an epoch change or a missed hard purge
+            //      and persists `from_zero = true` — correctly, that IS the truth;
+            //   2. pass 2 starts the bootstrap and the kill lands mid-run;
+            //   3. the next write fires the hook, which now goes STRAIGHT to the bootstrap;
+            //   4. killed again. Permanently — the repair is longer than the budget, every
+            //      time, and `hook_check` is «Reports; never syncs», so nothing else repairs it.
+            //
+            // The mirror would sit unusable while the very mechanism meant to keep it fresh
+            // burned a truncated bootstrap after every single write. So the hook declines the
+            // repair and says so. It does NOT clear the flag: from-zero is true and suppressing
+            // it would be the confident-wrong answer this codebase keeps refusing. A person's
+            // `docli sync` has no budget and finishes the job.
+            //
+            // Placed at the TOP of the loop deliberately: the same branch covers both ways in —
+            // entering already flagged, and an incremental pass flagging it and looping.
+            crate::ui::warn(&format!(
+                "{}: this mirror needs a full resync, which is too long for a post-write hook - \
+                 run `docli sync` when convenient",
+                mount.display_name()
+            ));
+            break;
+        }
         if state.from_zero {
             // The authoritative repair also owns write_atomic's crash residue (read-only
             // `.docli-write-*.tmp` strays a process death left mid-swap) — doctor names them
@@ -936,6 +968,100 @@ fn emit_report(agent: crate::hooks::HookAgent, lines: &[String]) {
 /// `ephemeral: true`, so it does not register a client, pin the purge safe horizon, or light the
 /// «deletes after device sync» badge. It does still write a `read_audit` row per mount per
 /// session — write amplification of an existing audit, named rather than glossed.
+/// The docli MCP tools that only READ. Everything else is treated as a write, which is the
+/// fail-safe direction and a deliberate inversion (docli-cli 0.1.20).
+///
+/// Enumerating the WRITERS would have been the obvious shape and it is the wrong one: a write
+/// tool added to the MCP surface later would silently stop syncing, and a stale mirror is
+/// invisible until it misleads someone. Enumerating the READERS instead means an unrecognised
+/// tool defaults to syncing — the cost is one redundant round trip, never a stale mirror. Same
+/// lesson as the fallback clause measured on 2026-09-05: name the category you can be sure of,
+/// and let the unknown fall on the safe side.
+const MCP_READ_ONLY_TOOLS: &[&str] = &[
+    "read_note",
+    "read_notes",
+    "read_vault",
+    "search_notes",
+    "list_notes",
+    "list_tags",
+    "notes_by_tag",
+    "get_backlinks",
+    "related_notes",
+    "attachment_info",
+    "read_attachment",
+];
+
+/// Does this `PostToolUse` tool name warrant a sync? Bare tool name or `mcp__<label>__<tool>`.
+pub fn tool_warrants_sync(tool_name: &str) -> bool {
+    let leaf = tool_name.rsplit("__").next().unwrap_or(tool_name);
+    !MCP_READ_ONLY_TOOLS.contains(&leaf)
+}
+
+/// `PostToolUse` — bring the mirror to head after the agent writes through MCP (docli-cli 0.1.20).
+///
+/// The occasion, from a live session: an agent read the mirror for edit anchors, wrote through
+/// `edit_note`, and the mirror was instantly behind until someone ran `docli sync` by hand. Poke
+/// cannot help here — the channel suppresses an actor's own echo by design — and it does not need
+/// to: writer and reader are the same process, so the write is already known.
+///
+/// **Always exits 0, and stays silent when it worked.** A hook that fails an agent's tool call
+/// over a cache would be trading a working edit for a stale mirror, and one that narrates every
+/// successful sync turns every note write into two lines of transcript noise. It speaks only when
+/// a person has something to do.
+pub fn hook_post_write(cwd: &Path, agent: crate::hooks::HookAgent) -> i32 {
+    // The payload arrives on stdin. A tool name we can read lets us skip the read-only calls;
+    // an unreadable one is not a reason to skip — fall through and sync.
+    let mut raw = String::new();
+    let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut raw);
+    if let Some(name) = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| {
+            v.get("tool_name")
+                .or_else(|| v.get("toolName"))
+                .and_then(|t| t.as_str())
+                .map(str::to_string)
+        })
+    {
+        if !tool_warrants_sync(&name) {
+            return 0;
+        }
+    }
+
+    // Every failure below is silent-and-zero. None of them is the agent's problem, and the
+    // freshness surfaces the agent DOES read (`docli search`'s delta, `SessionStart`) already
+    // report a mirror that fell behind.
+    let project = match crate::config::load_project(cwd) {
+        Ok(p) => p,
+        Err(_) => return 0,
+    };
+    let api = match crate::creds::CredsStore::open_default().and_then(|c| {
+        // Not signed in is not an error here — it is simply nothing to do, silently.
+        if c.signed_in(&project.config.server)? {
+            crate::http::Api::new(&project.config.server, c).map(Some)
+        } else {
+            Ok(None)
+        }
+    }) {
+        Ok(Some(a)) => a,
+        Ok(None) | Err(_) => return 0,
+    };
+    let opts = SyncOptions {
+        check: false,
+        full: false,
+        post_write: true,
+    };
+    let mut lines: Vec<String> = Vec::new();
+    if let Err(e) = run(&project, &api, &opts) {
+        // Worth one line: a sync that ERRORS (as opposed to declining a bootstrap) is a state
+        // the agent may otherwise read as fresh.
+        lines.push(format!("docli: the mirror could not be updated ({e})"));
+    }
+    if !lines.is_empty() {
+        emit_report(agent, &lines);
+    }
+    0
+}
+
 pub fn hook_check(cwd: &Path, agent: crate::hooks::HookAgent) -> i32 {
     let mut lines: Vec<String> = Vec::new();
     // The update notice rides the same line (D11) and is cache-only here: the freshness probe
@@ -992,7 +1118,54 @@ pub fn hook_check(cwd: &Path, agent: crate::hooks::HookAgent) -> i32 {
 /// reading absence out of an empty grep is how «that note does not exist» gets asserted about a
 /// note that does. The `PreToolUse` deny covers the mirror-write case again at the moment it
 /// matters — this is the version that arrives BEFORE the mistake.
-const ORIENTATION: &str = "This directory has docli workspaces mirrored into it: the notes behind the work here - decisions, background, research, plans - as a read-only mirror. They are a primary source for it, not a side archive. CONSULT them whenever you need context the files here cannot give you: why something is the way it is, what was decided and why, what was already tried. WRITE BACK to them when a decision or finding lands in your session - use `edit_note` (or `write_note`) over the docli MCP connection, then run `docli sync`; knowledge that stays in a transcript is lost to every later session. To READ, prefer the CLI over the docli MCP tools when both are available: `docli search \"...\"` then `docli read <path>` answer from the local mirror without a network round-trip per note, while `search_notes`/`read_note` reach the server every time. Fall back to the MCP tools when `docli read` exits 3 (this mirror does not hold that note) or reports the mirror stale - and always use them to WRITE. Do not grep the mirror or open its files directly: it can be stale or scoped, and reading it that way turns a partial copy into a confident answer. Never edit mirror files - an edit there is never synced and is destroyed the next time that note changes. Only a `docli search` that does not report an incomplete index shows that a note does not exist.";
+// docli-cli 0.1.19 — REWRITTEN after a MEASURED failure of the previous body. The old text reached a real
+// session's context verbatim and lost: the agent went to source files and a production database to
+// answer «why do notes show an unknown author», re-deriving a decision the notes already held, and
+// had to be asked twice to write anything back. That is the v0.28.6 finding again — «did the
+// instruction reach context» and «did the instruction WIN» are separate measurements.
+//
+// The diagnosis, and what changed:
+//
+//   * «CONSULT them whenever you need context the files here cannot give you» is a SELF-ASSESSMENT
+//     trigger, and it fires never — the files always answer something, so the agent never notices
+//     the gap. Replaced with an OBSERVABLE precondition: before ANSWERING a why-question from the
+//     files here, search first.
+//
+//     MEDIUM-AGNOSTIC ON PURPOSE. This string ships to every install, and a mounted project may be
+//     a manuscript, a research folder or a set of runbooks as easily as a repository. A first draft
+//     said «before you open source files or query a database» and «before your next build, test or
+//     deploy step» — precise for this repo and meaningless for most of them. Name the ACT (answer a
+//     why-question / carry on with the work), never the artefact.
+//   * «WRITE BACK when a decision lands in your session» names no moment, so it slides to the end
+//     and gets lost or chased. Replaced with an anchor to the next thing the agent will do anyway.
+//   * The two behavioural asks were buried mid-paragraph among five operational rules. They now
+//     lead, and the mechanics follow.
+//   * The FALLBACK clause enumerated only two failure modes — exit 3 and a stale mirror — so an
+//     agent meeting any third one had no instruction. Measured 2026-09-05 across six eval runs
+//     against a deliberately broken `docli.toml` (exit 2, a config error, which is neither named
+//     case): THREE OF SIX STOPPED and asked the user for a workspace id rather than falling back to
+//     the MCP tools, which were available and would have answered. Enumerating failure modes invites
+//     exactly that gap; the clause now names the CATEGORY («cannot answer») and says plainly that a
+//     broken CLI is not a reason to stop.
+//
+// Kept to roughly the previous length on purpose: this is injected into EVERY session (~334 tokens
+// measured at v0.28.6), so it is restructured, never extended.
+const ORIENTATION: &str = "This directory has docli workspaces mirrored into it: the notes behind \
+the work here - decisions, background, research, plans. They answer WHY; the files answer WHAT. \
+TWO RULES, and both fire on an event rather than on your judgement. (1) BEFORE you answer a «why \
+is this the way it is / what did we decide / was this already tried» question from the files here, \
+run `docli search` FIRST. Not «when you feel you need context» - you will not feel it, because the \
+files always answer something; they just answer a different question. (2) WHEN a decision or \
+finding lands, write it back BEFORE you carry on - `edit_note` over the docli MCP connection, then \
+`docli sync`. Not at the end of the session: batching it to a checkpoint is exactly how it gets \
+lost, and a decision is not less true for being recorded before the work around it is finished. Reading: `docli search \"...\"` then `docli read <path>` answer \
+from the local mirror; `search_notes`/`read_note` reach the server every time. Fall back to the MCP \
+tools whenever the CLI cannot answer: it exits 3 (this mirror does not hold that note), it reports \
+the mirror stale, OR it fails outright - a bad docli.toml, no mount here, not installed. A broken \
+CLI is not a reason to stop; the notes are still reachable, and an unanswered question is worse \
+than a slower answer. Always use the MCP tools to WRITE. Never grep the mirror or open its files directly, and never edit them: \
+it can be stale or scoped, and an edit there is never synced. Only a `docli search` that does not \
+report an incomplete index shows that a note does not exist.";
 
 /// The freshness half, as plain sentences. Separated from the emission so the branches can be
 /// tested without a terminal, a hook, or a schema.
@@ -1257,6 +1430,38 @@ fn is_home_write_refusal(e: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_post_write_hook_syncs_for_an_unrecognised_tool() {
+        // The FAIL-SAFE direction, and the reason the read list is what is enumerated. A write
+        // tool added to the MCP surface later must keep the mirror fresh without anyone
+        // remembering to update this file; the cost of guessing wrong is one redundant round
+        // trip, never a mirror that quietly stops tracking the server.
+        assert!(tool_warrants_sync("mcp__docli__some_future_write_tool"));
+        assert!(tool_warrants_sync("mcp__docli__edit_note"));
+        assert!(tool_warrants_sync("write_note"));
+    }
+
+    #[test]
+    fn the_post_write_hook_skips_the_known_readers() {
+        for t in [
+            "mcp__docli__read_note",
+            "mcp__docli__search_notes",
+            "mcp__docli__list_notes",
+            "read_vault",
+        ] {
+            assert!(!tool_warrants_sync(t), "{t} is a read and must not sync");
+        }
+    }
+
+    #[test]
+    fn a_custom_mcp_label_still_matches() {
+        // The tool name carries the PROJECT's label, so the leaf is what decides. A project that
+        // renamed its MCP server must not silently stop syncing — the matcher is built from the
+        // project's label for the same reason.
+        assert!(tool_warrants_sync("mcp__notes__edit_note"));
+        assert!(!tool_warrants_sync("mcp__notes__read_note"));
+    }
+
     use super::*;
 
     /// The D4/D10.3 copy pin (the publish-substring-ban precedent): the no-access branch never
@@ -1289,6 +1494,7 @@ mod tests {
                 rev: 1,
                 content_sha256: String::new(),
                 marker_path: Some(format!(".docli/markers/{ws_a}/{kept}.docli")),
+                content_changed_at: None,
             },
         );
         sweep_orphan_markers(&control, ws_a, &state).unwrap();
@@ -1423,6 +1629,7 @@ mod tests {
                     position: None,
                     sha256: None,
                     blob_generation: None,
+                    content_changed_at: None,
                 })
                 .collect(),
             capabilities: vec![],

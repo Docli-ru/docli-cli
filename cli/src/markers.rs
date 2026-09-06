@@ -113,6 +113,8 @@ mod tests {
             position: None,
             sha256: sha.map(|s| s.into()),
             blob_generation: Some(0),
+            // An attachment never carries one — `set_body_author` is `AND kind = 'file'`.
+            content_changed_at: None,
         }
     }
 

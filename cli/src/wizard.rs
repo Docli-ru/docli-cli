@@ -629,11 +629,30 @@ pub fn run(cwd: &Path, server_flag: Option<&str>) -> Result<i32> {
         .iter()
         .map(|w| format!("@{}  {}", w.handle, ui::dim(&w.name)))
         .collect();
+    // Workspaces THIS project already mounts arrive TICKED. That is not the v0.28.6-D6 family
+    // of «offer a write pre-accepted» — it is the opposite concern: `init` is idempotent and
+    // re-run often, and with everything unticked a bare Enter DROPS mounts the reader already
+    // had. Pre-ticking preserves the state they are looking at; the choice being made here is
+    // «change this», not «accept this». (The 2026-09-03 ruling that unticked the AGENT picker
+    // was about not writing configs nobody chose — a different question from not discarding
+    // configuration that already exists.)
+    let already: std::collections::HashSet<uuid::Uuid> = existing
+        .as_ref()
+        .map(|c| c.mounts.iter().map(|m| m.workspace).collect())
+        .unwrap_or_default();
+    let defaults: Vec<bool> = spaces.iter().map(|w| already.contains(&w.id)).collect();
+    let carried = defaults.iter().filter(|b| **b).count();
+    if carried > 0 {
+        ui::detail(&format!(
+            "{} already mirrored here and pre-selected - clear one to stop mirroring it.",
+            crate::ui::plural(carried, "workspace", "workspaces")
+        ));
+    }
     ui::detail("Space toggles, Enter confirms. Pick as many as you like.");
     let picked = MultiSelect::with_theme(&prompt_theme())
         .with_prompt("Which workspaces should be mirrored?")
         .items(&labels)
-        .defaults(&vec![false; labels.len()])
+        .defaults(&defaults)
         .interact()?;
     if picked.is_empty() {
         ui::warn("No workspace picked - there would be nothing to mirror.");
@@ -855,6 +874,7 @@ fn apply(cwd: &Path, api: &Api, plan: Plan) -> Result<i32> {
             &crate::sync_cmd::SyncOptions {
                 check: false,
                 full: false,
+                post_write: false,
             },
         );
     }

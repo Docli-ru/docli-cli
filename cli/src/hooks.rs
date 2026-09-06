@@ -116,7 +116,14 @@ impl HookAgent {
 }
 
 /// The two hook events this slice installs. Ordered as they are written.
-const EVENTS: [&str; 2] = ["PreToolUse", "SessionStart"];
+/// docli-cli 0.1.20 — `PostToolUse` joins the two. Ordered as the session experiences them.
+/// The `mcp_label` a project uses when it does not say otherwise. The matcher for `PostToolUse`
+/// is built from the PROJECT's label, never this constant directly — a project that renamed its
+/// MCP server would otherwise get a matcher that silently never fires, which is the stale-mirror
+/// failure this hook exists to prevent.
+pub const DEFAULT_MCP_LABEL: &str = "docli";
+
+const EVENTS: [&str; 3] = ["PreToolUse", "PostToolUse", "SessionStart"];
 
 /// The rendered command for one event, guarded so a missing binary is silence rather than a
 /// broken tool call on every edit (D2).
@@ -178,17 +185,24 @@ fn command_windows_for(agent: HookAgent, event: &str) -> String {
 fn inner_command(agent: HookAgent, event: &str) -> String {
     match event {
         "PreToolUse" => format!("docli guard --agent {} --tool-input -", agent.key()),
+        "PostToolUse" => format!("docli sync --post-write --agent {}", agent.key()),
         "SessionStart" => format!("docli sync --check --agent {}", agent.key()),
         other => unreachable!("unknown hook event {other}"),
     }
 }
 
 /// One matcher object.
-fn entry_for(agent: HookAgent, event: &str) -> Value {
+fn entry_for(agent: HookAgent, event: &str, label: &str) -> Value {
     let matcher = match event {
         "PreToolUse" => agent.pre_tool_use_matcher().to_string(),
         // Freshness belongs where a session BEGINS — see the module docs for why the other
         // three documented sources are deliberately absent.
+        // Every docli MCP tool, not an enumerated list of the WRITE ones. A write tool added
+        // later would silently stop firing this hook, and the resulting stale mirror is
+        // invisible until it misleads someone; a read tool that fires it costs one round trip.
+        // `hook_post_write` does the read/write split in Rust, where it is testable and where
+        // an unrecognised tool falls on the safe side.
+        "PostToolUse" => format!("mcp__{}__.*", label),
         "SessionStart" => "startup|resume".to_string(),
         other => unreachable!("unknown hook event {other}"),
     };
@@ -264,8 +278,8 @@ fn ours_commands(agent: HookAgent, event: &str) -> [String; 3] {
 
 /// Would this element actually FIRE, and run our command? The health question, as against the
 /// ownership question [`is_ours`] answers.
-fn effectively_ours(v: &Value, agent: HookAgent, event: &str) -> bool {
-    let desired = entry_for(agent, event);
+fn effectively_ours(v: &Value, agent: HookAgent, event: &str, label: &str) -> bool {
+    let desired = entry_for(agent, event, label);
     if v.get("matcher") != desired.get("matcher") {
         return false;
     }
@@ -347,12 +361,12 @@ pub enum HookOutcome {
 ///
 /// Anything it cannot locate unambiguously falls to the print branch. A file we author from
 /// scratch is pretty-printed, because there is no formatting to preserve.
-pub fn merge(agent: HookAgent, existing: Option<&str>) -> HookOutcome {
+pub fn merge(agent: HookAgent, existing: Option<&str>, label: &str) -> HookOutcome {
     let text = existing.map(str::trim).filter(|t| !t.is_empty());
     let Some(text) = text else {
         let mut hooks = serde_json::Map::new();
         for event in EVENTS {
-            hooks.insert(event.to_string(), json!([entry_for(agent, event)]));
+            hooks.insert(event.to_string(), json!([entry_for(agent, event, label)]));
         }
         let doc = json!({ "hooks": Value::Object(hooks) });
         let mut out = serde_json::to_string_pretty(&doc).expect("a literal serializes");
@@ -365,7 +379,7 @@ pub fn merge(agent: HookAgent, existing: Option<&str>) -> HookOutcome {
     // order, pretty-printed. Letting the per-event loop below build it instead produced the
     // events in reverse (each one splices to the front of what the previous one wrote) and
     // crammed 400 characters onto the opening brace's line.
-    match whole_block(&out, agent) {
+    match whole_block(&out, agent, label) {
         Ok(Some(next)) => {
             out = next;
             changed = true;
@@ -385,7 +399,7 @@ pub fn merge(agent: HookAgent, existing: Option<&str>) -> HookOutcome {
     for event in EVENTS {
         let mut settled = false;
         for _ in 0..16 {
-            match splice_event(&out, agent, event) {
+            match splice_event(&out, agent, event, label) {
                 Ok(Some(next)) => {
                     out = next;
                     changed = true;
@@ -411,7 +425,7 @@ pub fn merge(agent: HookAgent, existing: Option<&str>) -> HookOutcome {
 }
 
 /// The one-splice path for a file that carries no `hooks` key yet. `Ok(None)` = it has one.
-fn whole_block(text: &str, agent: HookAgent) -> Result<Option<String>, String> {
+fn whole_block(text: &str, agent: HookAgent, label: &str) -> Result<Option<String>, String> {
     let root: Value = serde_json::from_str(text)
         .map_err(|_| "does not parse as strict JSON (it may contain comments)".to_string())?;
     let Some(obj) = root.as_object() else {
@@ -422,7 +436,7 @@ fn whole_block(text: &str, agent: HookAgent) -> Result<Option<String>, String> {
     }
     let mut hooks = serde_json::Map::new();
     for event in EVENTS {
-        hooks.insert(event.to_string(), json!([entry_for(agent, event)]));
+        hooks.insert(event.to_string(), json!([entry_for(agent, event, label)]));
     }
     let pretty = serde_json::to_string_pretty(&Value::Object(hooks))
         .expect("a literal serializes")
@@ -442,8 +456,13 @@ fn ensure_trailing_newline(s: &mut String) {
 }
 
 /// Splice ONE event's entry into `text`. `Ok(None)` = already exactly ours.
-fn splice_event(text: &str, agent: HookAgent, event: &str) -> Result<Option<String>, String> {
-    let desired = entry_for(agent, event);
+fn splice_event(
+    text: &str,
+    agent: HookAgent,
+    event: &str,
+    label: &str,
+) -> Result<Option<String>, String> {
+    let desired = entry_for(agent, event, label);
     let rendered = desired.to_string();
     // A full parse first, purely to REFUSE the shapes we will not touch. The splice below then
     // works on the text, so the user's own bytes are what survives.
@@ -700,7 +719,7 @@ pub struct HookStatus {
     pub binary_resolves: Option<bool>,
 }
 
-pub fn status(project_root: &Path, agent: HookAgent) -> HookStatus {
+pub fn status(project_root: &Path, agent: HookAgent, label: &str) -> HookStatus {
     let installed = std::fs::read_to_string(project_root.join(agent.config_path()))
         .ok()
         .and_then(|body| serde_json::from_str::<Value>(&body).ok())
@@ -721,7 +740,7 @@ pub fn status(project_root: &Path, agent: HookAgent) -> HookStatus {
                     // over it is the lie this report exists to prevent. And an entry with
                     // `timeout: 20` instead of `10` works perfectly, so calling it absent
                     // would send a reader to fix a gate that is not broken.
-                    .is_some_and(|a| a.iter().any(|v| effectively_ours(v, agent, e)))
+                    .is_some_and(|a| a.iter().any(|v| effectively_ours(v, agent, e, label)))
             })
         });
     HookStatus {
@@ -799,7 +818,7 @@ const PATH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis
 
 /// Write our entries into `agent`'s config under `project_root`. Reports through `ui`, and — like
 /// `agents::wire` — is best-effort per agent: a config it cannot merge is named, never fatal.
-pub fn install(project_root: &Path, agent: HookAgent) -> Result<()> {
+pub fn install(project_root: &Path, agent: HookAgent, label: &str) -> Result<()> {
     let rel = agent.config_path();
     let abs = project_root.join(rel);
     let existing = match std::fs::read_to_string(&abs) {
@@ -809,12 +828,12 @@ pub fn install(project_root: &Path, agent: HookAgent) -> Result<()> {
             crate::ui::warn(&format!(
                 "{}: could not read {rel} ({e}) - hooks were not installed; add them by hand:\n    {}",
                 agent.display(),
-                snippet(agent)
+                snippet(agent, label)
             ));
             return Ok(());
         }
     };
-    match merge(agent, existing.as_deref()) {
+    match merge(agent, existing.as_deref(), label) {
         HookOutcome::Write(content) => {
             if let Some(parent) = abs.parent() {
                 std::fs::create_dir_all(parent)
@@ -837,7 +856,7 @@ pub fn install(project_root: &Path, agent: HookAgent) -> Result<()> {
             crate::ui::warn(&format!(
                 "{}: {rel} - {reason}; add them by hand:\n    {}",
                 agent.display(),
-                snippet(agent)
+                snippet(agent, label)
             ));
         }
     }
@@ -845,11 +864,11 @@ pub fn install(project_root: &Path, agent: HookAgent) -> Result<()> {
 }
 
 /// The copy-paste form for the occupied branch.
-pub fn snippet(agent: HookAgent) -> String {
+pub fn snippet(agent: HookAgent, label: &str) -> String {
     let mut doc = serde_json::Map::new();
     let mut hooks = serde_json::Map::new();
     for event in EVENTS {
-        hooks.insert(event.to_string(), json!([entry_for(agent, event)]));
+        hooks.insert(event.to_string(), json!([entry_for(agent, event, label)]));
     }
     doc.insert("hooks".into(), Value::Object(hooks));
     format!(
@@ -879,11 +898,41 @@ pub fn consent_summary(agents: &[HookAgent]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_post_tool_use_matcher_follows_the_projects_mcp_label() {
+        // A project that renamed its MCP server gets a matcher built from ITS label. Hardcoding
+        // «docli» here would emit a matcher that never fires on such a project, and the mirror
+        // would silently stop being synced after writes — the exact failure this hook exists to
+        // prevent, reintroduced by the hook itself.
+        let v = merge(HookAgent::Claude, None, "notes");
+        let HookOutcome::Write(out) = v else {
+            panic!("a fresh config writes")
+        };
+        assert!(
+            out.contains("mcp__notes__"),
+            "matcher must carry the project's label: {out}"
+        );
+        assert!(
+            out.contains("docli sync --post-write --agent claude"),
+            "the post-write command must be wired: {out}"
+        );
+    }
+
+    #[test]
+    fn all_three_events_are_written() {
+        let HookOutcome::Write(out) = merge(HookAgent::Codex, None, DEFAULT_MCP_LABEL) else {
+            panic!("a fresh config writes")
+        };
+        for e in ["PreToolUse", "PostToolUse", "SessionStart"] {
+            assert!(out.contains(e), "{e} missing from {out}");
+        }
+    }
+
     use super::*;
 
     #[test]
     fn a_fresh_file_gets_both_events_with_the_documented_shape() {
-        let HookOutcome::Write(out) = merge(HookAgent::Claude, None) else {
+        let HookOutcome::Write(out) = merge(HookAgent::Claude, None, DEFAULT_MCP_LABEL) else {
             panic!("a fresh file must write");
         };
         let v: Value = serde_json::from_str(&out).unwrap();
@@ -908,7 +957,7 @@ mod tests {
     fn the_codex_matcher_names_the_edit_tool_and_not_bash() {
         // Codex's PreToolUse fires for Bash and MCP calls too; an unmatched entry would spawn
         // `docli guard` on every shell command, which is the opposite of «has to be cheap».
-        let HookOutcome::Write(out) = merge(HookAgent::Codex, None) else {
+        let HookOutcome::Write(out) = merge(HookAgent::Codex, None, DEFAULT_MCP_LABEL) else {
             panic!("write");
         };
         let v: Value = serde_json::from_str(&out).unwrap();
@@ -967,7 +1016,7 @@ mod tests {
         }
         // Codex documents a slot for the other spelling; Claude Code documents none, so it
         // NAMES the shell instead of inheriting a default that varies by machine.
-        let HookOutcome::Write(codex) = merge(HookAgent::Codex, None) else {
+        let HookOutcome::Write(codex) = merge(HookAgent::Codex, None, DEFAULT_MCP_LABEL) else {
             panic!("write");
         };
         let v: Value = serde_json::from_str(&codex).unwrap();
@@ -978,7 +1027,7 @@ mod tests {
             .starts_with("where docli"));
         assert!(h.get("shell").is_none(), "Codex documents no shell field");
 
-        let HookOutcome::Write(claude) = merge(HookAgent::Claude, None) else {
+        let HookOutcome::Write(claude) = merge(HookAgent::Claude, None, DEFAULT_MCP_LABEL) else {
             panic!("write");
         };
         let v: Value = serde_json::from_str(&claude).unwrap();
@@ -1001,7 +1050,8 @@ mod tests {
     ]
   }
 }"#;
-        let HookOutcome::Write(out) = merge(HookAgent::Claude, Some(mine)) else {
+        let HookOutcome::Write(out) = merge(HookAgent::Claude, Some(mine), DEFAULT_MCP_LABEL)
+        else {
             panic!("must merge");
         };
         let v: Value = serde_json::from_str(&out).unwrap();
@@ -1055,7 +1105,8 @@ mod tests {
         assert!(!back.contains("docli"), "{back}");
 
         // Re-installing into the emptied arrays converges rather than accumulating.
-        let HookOutcome::Write(again) = merge(HookAgent::Claude, Some(&back)) else {
+        let HookOutcome::Write(again) = merge(HookAgent::Claude, Some(&back), DEFAULT_MCP_LABEL)
+        else {
             panic!("must merge back in");
         };
         let v: Value = serde_json::from_str(&again).unwrap();
@@ -1066,11 +1117,11 @@ mod tests {
     #[test]
     fn merging_twice_is_a_no_op() {
         // «Run twice, diff» — the identity marker is what makes this answerable at all.
-        let HookOutcome::Write(first) = merge(HookAgent::Codex, None) else {
+        let HookOutcome::Write(first) = merge(HookAgent::Codex, None, DEFAULT_MCP_LABEL) else {
             panic!("write");
         };
         assert_eq!(
-            merge(HookAgent::Codex, Some(&first)),
+            merge(HookAgent::Codex, Some(&first), DEFAULT_MCP_LABEL),
             HookOutcome::AlreadyInstalled
         );
     }
@@ -1087,7 +1138,8 @@ mod tests {
         // hand-TRUNCATED copy of ours stops converging; the benefit is that nothing of theirs
         // is ever eaten. That is the right side of the trade.
         let stale = r#"{"hooks": {"PreToolUse": [{"matcher": "Write", "hooks": [{"type": "command", "command": "docli guard --agent claude --tool-input -"}]}]}}"#;
-        let HookOutcome::Write(out) = merge(HookAgent::Claude, Some(stale)) else {
+        let HookOutcome::Write(out) = merge(HookAgent::Claude, Some(stale), DEFAULT_MCP_LABEL)
+        else {
             panic!("must rewrite");
         };
         let v: Value = serde_json::from_str(&out).unwrap();
@@ -1098,7 +1150,8 @@ mod tests {
         // …and the other half of that trade, pinned so it cannot be loosened by accident: a
         // command that only shares a PREFIX with ours is somebody else's line.
         let theirs = r#"{"hooks": {"PreToolUse": [{"matcher": "Write", "hooks": [{"type": "command", "command": "printf 'docli guard --agent ' >> audit.log"}]}]}}"#;
-        let HookOutcome::Write(out) = merge(HookAgent::Claude, Some(theirs)) else {
+        let HookOutcome::Write(out) = merge(HookAgent::Claude, Some(theirs), DEFAULT_MCP_LABEL)
+        else {
             panic!("must merge beside it");
         };
         let v: Value = serde_json::from_str(&out).unwrap();
@@ -1120,7 +1173,8 @@ mod tests {
             {"matcher": "Bash", "hooks": [{"type": "command", "command": "keep-me.sh"}]},
             {"matcher": "Edit", "hooks": [{"type": "command", "command": "docli guard --agent claude --tool-input -"}]}
         ]}}"#;
-        let HookOutcome::Write(out) = merge(HookAgent::Claude, Some(dupes)) else {
+        let HookOutcome::Write(out) = merge(HookAgent::Claude, Some(dupes), DEFAULT_MCP_LABEL)
+        else {
             panic!("must converge");
         };
         let v: Value = serde_json::from_str(&out).unwrap();
@@ -1130,7 +1184,7 @@ mod tests {
         assert_eq!(arr[1]["hooks"][0]["command"], "keep-me.sh");
         // …and the result is a FIXED POINT: the whole point of converging.
         assert_eq!(
-            merge(HookAgent::Claude, Some(&out)),
+            merge(HookAgent::Claude, Some(&out), DEFAULT_MCP_LABEL),
             HookOutcome::AlreadyInstalled
         );
     }
@@ -1143,7 +1197,7 @@ mod tests {
         // nothing in the vendor docs says an unknown key inside a matcher object lands in the
         // milder tier. D10 is minted by this very slice; betting a settings file on an
         // unverified vendor claim was not available. Identity lives in `command` instead.
-        let HookOutcome::Write(out) = merge(HookAgent::Claude, None) else {
+        let HookOutcome::Write(out) = merge(HookAgent::Claude, None, DEFAULT_MCP_LABEL) else {
             panic!("write");
         };
         let v: Value = serde_json::from_str(&out).unwrap();
@@ -1176,14 +1230,14 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    merge(HookAgent::Claude, Some(bad)),
+                    merge(HookAgent::Claude, Some(bad), DEFAULT_MCP_LABEL),
                     HookOutcome::Occupied(_)
                 ),
                 "{bad:?} must fall to the print branch"
             );
         }
         // …and the snippet it prints is itself valid JSON the reader can paste.
-        let s = snippet(HookAgent::Claude);
+        let s = snippet(HookAgent::Claude, DEFAULT_MCP_LABEL);
         let body = s.split_once(":\n").expect("path prefix").1;
         serde_json::from_str::<Value>(body).expect("a pasteable snippet");
     }
@@ -1197,7 +1251,8 @@ mod tests {
         let theirs = r#"{"hooks": {"SessionStart": [
             {"matcher": "startup", "hooks": [{"type": "command", "command": "docli sync --check | tee /tmp/log"}]}
         ]}}"#;
-        let HookOutcome::Write(out) = merge(HookAgent::Claude, Some(theirs)) else {
+        let HookOutcome::Write(out) = merge(HookAgent::Claude, Some(theirs), DEFAULT_MCP_LABEL)
+        else {
             panic!("must merge");
         };
         let v: Value = serde_json::from_str(&out).unwrap();
@@ -1219,7 +1274,8 @@ mod tests {
         // element because ONE of its handlers is ours would take the handler the user added
         // beside ours with it. Leaving it alone costs a duplicate entry; claiming it costs
         // somebody their hook.
-        let HookOutcome::Write(installed) = merge(HookAgent::Claude, None) else {
+        let HookOutcome::Write(installed) = merge(HookAgent::Claude, None, DEFAULT_MCP_LABEL)
+        else {
             panic!("write");
         };
         let mut v: Value = serde_json::from_str(&installed).unwrap();
@@ -1234,7 +1290,8 @@ mod tests {
             "PreToolUse"
         ));
 
-        let HookOutcome::Write(out) = merge(HookAgent::Claude, Some(&theirs)) else {
+        let HookOutcome::Write(out) = merge(HookAgent::Claude, Some(&theirs), DEFAULT_MCP_LABEL)
+        else {
             panic!("must add beside it");
         };
         assert!(out.contains("my-audit.sh"), "their handler survives: {out}");
@@ -1260,7 +1317,8 @@ mod tests {
             HookAgent::Claude,
             "PreToolUse"
         ));
-        let HookOutcome::Write(out) = merge(HookAgent::Claude, Some(&theirs)) else {
+        let HookOutcome::Write(out) = merge(HookAgent::Claude, Some(&theirs), DEFAULT_MCP_LABEL)
+        else {
             panic!("must merge beside it");
         };
         assert!(out.contains("audit.log"), "{out}");
@@ -1290,7 +1348,8 @@ mod tests {
             "PreToolUse"
         ));
         // …and it survives both operations.
-        let HookOutcome::Write(out) = merge(HookAgent::Claude, Some(&theirs)) else {
+        let HookOutcome::Write(out) = merge(HookAgent::Claude, Some(&theirs), DEFAULT_MCP_LABEL)
+        else {
             panic!("must merge beside it");
         };
         assert_eq!(
@@ -1330,7 +1389,8 @@ mod tests {
         // The reachable case, on a perfectly ordinary settings file: a backslash-escaped
         // top-level string (a Windows path in `statusLine`) makes the textual locator refuse.
         // Reporting that as «nothing of ours» deleted the binary and left the entries live.
-        let HookOutcome::Write(installed) = merge(HookAgent::Claude, None) else {
+        let HookOutcome::Write(installed) = merge(HookAgent::Claude, None, DEFAULT_MCP_LABEL)
+        else {
             panic!("write");
         };
         let with_escape =
@@ -1345,16 +1405,16 @@ mod tests {
     #[test]
     fn status_reports_a_present_gate_and_notices_a_missing_binary() {
         let tmp = tempfile::tempdir().unwrap();
-        let s = status(tmp.path(), HookAgent::Claude);
+        let s = status(tmp.path(), HookAgent::Claude, DEFAULT_MCP_LABEL);
         assert!(!s.installed);
         assert_eq!(s.binary_resolves, None, "nothing to resolve");
 
-        let HookOutcome::Write(out) = merge(HookAgent::Claude, None) else {
+        let HookOutcome::Write(out) = merge(HookAgent::Claude, None, DEFAULT_MCP_LABEL) else {
             panic!("write");
         };
         std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
         std::fs::write(tmp.path().join(".claude/settings.json"), out).unwrap();
-        let s = status(tmp.path(), HookAgent::Claude);
+        let s = status(tmp.path(), HookAgent::Claude, DEFAULT_MCP_LABEL);
         assert!(s.installed);
         // Installed ⇒ the question is asked. WHAT it answers depends on the machine running
         // the test, so the answer itself is pinned on the pure half below.
@@ -1428,7 +1488,7 @@ mod tests {
         // calling it absent would send a reader to fix a gate that is not broken. Health turns
         // on the matcher and the command, and nothing else.
         let tmp = tempfile::tempdir().unwrap();
-        let HookOutcome::Write(good) = merge(HookAgent::Claude, None) else {
+        let HookOutcome::Write(good) = merge(HookAgent::Claude, None, DEFAULT_MCP_LABEL) else {
             panic!("write");
         };
         let mut v: Value = serde_json::from_str(&good).unwrap();
@@ -1439,7 +1499,8 @@ mod tests {
         assert!(!effectively_ours(
             &broken["hooks"]["PreToolUse"][0],
             HookAgent::Claude,
-            "PreToolUse"
+            "PreToolUse",
+            DEFAULT_MCP_LABEL
         ));
         // …and so is `shell`: PowerShell cannot parse `if command -v …; then …; fi`, so a
         // Claude entry switched to it runs neither hook. The rule is «every field we write
@@ -1449,7 +1510,8 @@ mod tests {
         assert!(!effectively_ours(
             &broken["hooks"]["PreToolUse"][0],
             HookAgent::Claude,
-            "PreToolUse"
+            "PreToolUse",
+            DEFAULT_MCP_LABEL
         ));
         // An EXTRA field can disable the gate just as thoroughly as a changed one: `async: true`
         // is documented, and Claude Code runs an async hook without waiting, so its denial
@@ -1459,23 +1521,26 @@ mod tests {
         assert!(!effectively_ours(
             &broken["hooks"]["PreToolUse"][0],
             HookAgent::Claude,
-            "PreToolUse"
+            "PreToolUse",
+            DEFAULT_MCP_LABEL
         ));
         // Codex's Windows override is ours to check too.
-        let HookOutcome::Write(cx) = merge(HookAgent::Codex, None) else {
+        let HookOutcome::Write(cx) = merge(HookAgent::Codex, None, DEFAULT_MCP_LABEL) else {
             panic!("write");
         };
         let mut cv: Value = serde_json::from_str(&cx).unwrap();
         assert!(effectively_ours(
             &cv["hooks"]["PreToolUse"][0],
             HookAgent::Codex,
-            "PreToolUse"
+            "PreToolUse",
+            DEFAULT_MCP_LABEL
         ));
         cv["hooks"]["PreToolUse"][0]["hooks"][0]["commandWindows"] = json!("echo nope");
         assert!(!effectively_ours(
             &cv["hooks"]["PreToolUse"][0],
             HookAgent::Codex,
-            "PreToolUse"
+            "PreToolUse",
+            DEFAULT_MCP_LABEL
         ));
         std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
         std::fs::write(
@@ -1483,7 +1548,7 @@ mod tests {
             serde_json::to_string_pretty(&v).unwrap(),
         )
         .unwrap();
-        assert!(status(tmp.path(), HookAgent::Claude).installed);
+        assert!(status(tmp.path(), HookAgent::Claude, DEFAULT_MCP_LABEL).installed);
     }
 
     #[test]
@@ -1493,7 +1558,7 @@ mod tests {
         // Edit, and «file edits in the mirror are refused» over it would be exactly the lie this
         // report exists to prevent.
         let tmp = tempfile::tempdir().unwrap();
-        let HookOutcome::Write(good) = merge(HookAgent::Claude, None) else {
+        let HookOutcome::Write(good) = merge(HookAgent::Claude, None, DEFAULT_MCP_LABEL) else {
             panic!("write");
         };
         let mut v: Value = serde_json::from_str(&good).unwrap();
@@ -1511,6 +1576,6 @@ mod tests {
             "PreToolUse"
         ));
         // …and NOT reported as a working gate.
-        assert!(!status(tmp.path(), HookAgent::Claude).installed);
+        assert!(!status(tmp.path(), HookAgent::Claude, DEFAULT_MCP_LABEL).installed);
     }
 }

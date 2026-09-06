@@ -220,6 +220,7 @@ checksum = "25f104b501bf2364e78d0d3974cbc774f738f5865306ed128e1e0d7499c0ad96"
 dependencies = [
  "console",
  "shell-words",
+ "zeroize",
 ]
 
 [[package]]
@@ -246,7 +247,7 @@ dependencies = [
 
 [[package]]
 name = "docli-cli"
-version = "0.1.9"
+version = "0.1.21"
 dependencies = [
  "anyhow",
  "base64",

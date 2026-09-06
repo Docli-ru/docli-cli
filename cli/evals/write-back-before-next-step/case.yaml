@@ -1,0 +1,12 @@
+name: write-back-before-next-step
+description: >
+  A decision is made mid-task. The agent should write it to the notes BEFORE carrying on with
+  the work, not batch it to the end. Measured failure 2026-09-05: the agent
+  deferred write-back to after the gate and had to be asked twice.
+runs: 5
+max_turns: 14
+timeout_seconds: 240
+tags: [orientation, write-back]
+prompt: prompt.md
+graders:
+  - graders/wrote-back-before-verifying.md

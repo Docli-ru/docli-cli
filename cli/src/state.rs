@@ -40,6 +40,31 @@ pub struct NodeState {
     /// Where the attachment's sidecar actually lives when it RELOCATED (D6) — resolved through
     /// state by search and doctor, never by re-deriving. `None` = the derived `<local>.docli`.
     pub marker_path: Option<String>,
+    /// v0.29.7 D2 — the server's `content_changed_at` for this node, as the server last stated it.
+    /// The comparand the mid-session gate uses. `None` = the server had none when we applied it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_changed_at: Option<String>,
+}
+
+impl NodeState {
+    /// Has this node's CONTENT moved since the mirror applied it?
+    ///
+    /// `served` is what the server says now. Both sides of the comparison are values THE SAME
+    /// SERVER produced about the SAME node, which is why no clock is compared across machines and
+    /// no two nodes' stamps are ever ordered.
+    ///
+    /// **A served `None` is proof of «unchanged», not a gap in what we know** — and that is what
+    /// keeps this a two-line function instead of a tri-state. `content_changed_at` is written only
+    /// by `set_body_author`, is never cleared, and every path that changes a note's content routes
+    /// through it (the web editor, MCP, and the plugin's push via `merge_note_save`). So a node the
+    /// server has no stamp for has not had its content change since `0052` — whatever this mirror
+    /// did or did not record about it.
+    ///
+    /// That also means an older CLI's state (no stamp recorded) and an older api (no stamp served)
+    /// both reach the right answer instead of needing to be told apart.
+    pub fn content_moved(&self, served: Option<&str>) -> bool {
+        served.is_some_and(|v| self.content_changed_at.as_deref() != Some(v))
+    }
 }
 
 /// The two park classes fail differently (D2a): TRANSIENT keeps `sync --check` failing and
@@ -260,8 +285,136 @@ pub struct GraphCache {
     pub graph: docli_sync_wire::WireGraph,
 }
 
-/// The control root: `.docli/` next to `docli.toml`. Holds `state/<ws>.json`, `markers/`, and
-/// gets the same containment discipline as the mount (D2 — two validated roots, not one).
+/// What the server has TOLD us about a node whose copy this mirror may be behind on (v0.29.7 D3).
+///
+/// **A claim is `(node id, node_rev)`** — the server's own monotonic position for the node at the
+/// moment it named it. It is OBSOLETE once the mirror has applied that rev or a later one, so
+/// nothing has to remove claims for them to stop firing: catching up retires them, and a claim for
+/// a rev the mirror has already passed never fires at all.
+///
+/// # Why the rev, and not the content stamp or the file's order
+///
+/// `content_changed_at` decides WHETHER a node is claimed — that is what keeps a rename or a
+/// reorder from firing the gate, which is the whole point of D2. It cannot ORDER claims: two
+/// searches can append in the opposite order to the server snapshots they read, so «the last line
+/// wins» lets an older observation suppress a newer one and the mirror then serves content the
+/// server has already named. Ordering has to be a property of the SERVER, and `node_rev` is the one
+/// the sync plane already keys on.
+///
+/// It also makes claims self-retiring, which removed the last piece of lifecycle machinery here.
+/// Earlier drafts kept every claim and refused if any was unsatisfied (a note edited twice then
+/// stranded forever), then kept the last line per node (unsound across concurrent appends), then
+/// deleted the whole file on a from-zero rebuild to unstick them (which lost true claims, and for
+/// a `gone` node followed by a hard purge lost them permanently — a stale serve).
+///
+/// # The file is APPEND-ONLY and nothing ever deletes it
+///
+/// One `<uuid> <rev>` per line. Adding is an `O_APPEND` write, so a concurrent writer cannot be
+/// lost. Folding takes the GREATEST rev per node, which is order-independent — the property the
+/// last-line rule lacked. It is a separate file from `WsState` because `save_state` writes the
+/// whole state and nothing locks it: a `search` that did load→mutate→save would clobber a
+/// concurrent `sync`'s cursor, ledger and parks wholesale.
+#[derive(Debug, Clone, Default)]
+pub struct StaleMarks {
+    /// node id → the GREATEST rev claimed for it. Order-independent by construction.
+    pub latest: BTreeMap<Uuid, i64>,
+}
+
+impl StaleMarks {
+    /// Is the mirror behind on this node, by the server's own reckoning?
+    ///
+    /// `stored` is the node's `rev` as this mirror applied it. A claim at or below it has been
+    /// caught up with and is permanently obsolete — including a claim made for a trashed node,
+    /// which retires the moment the tombstone (a later rev) is applied.
+    pub fn contradict(&self, id: Uuid, stored: i64) -> bool {
+        self.latest
+            .get(&id)
+            .is_some_and(|claimed| *claimed > stored)
+    }
+}
+
+impl ControlRoot {
+    pub fn marks_path(&self, ws: Uuid) -> PathBuf {
+        self.dir.join("state").join(format!("{ws}.stale"))
+    }
+
+    /// The claims for `ws`, or an empty set when there are none or the file will not read.
+    ///
+    /// An unreadable or partly-garbled file yields whatever lines DO parse, never an error: this
+    /// is a derived projection whose only remedy is the next `search`, and failing a `docli read`
+    /// over it would turn a cache miss into an outage (the `load_graph` precedent).
+    pub fn load_marks(&self, ws: Uuid) -> StaleMarks {
+        let Ok(raw) = fs::read_to_string(self.marks_path(ws)) else {
+            return StaleMarks::default();
+        };
+        let mut latest: BTreeMap<Uuid, i64> = BTreeMap::new();
+        for line in raw.lines() {
+            let Some((id, rev)) = line.trim().split_once(' ') else {
+                continue;
+            };
+            let (Ok(id), Ok(rev)) = (Uuid::parse_str(id), rev.parse::<i64>()) else {
+                continue;
+            };
+            // GREATEST, not last: file order is append order, which is not server order.
+            let e = latest.entry(id).or_insert(rev);
+            *e = (*e).max(rev);
+        }
+        StaleMarks { latest }
+    }
+
+    /// APPEND `claims`, skipping any the file already covers with an equal or greater rev.
+    ///
+    /// The skip is a read-then-APPEND, never a read-modify-replace, so losing that race costs a
+    /// duplicate line and never a claim. It exists because without it every search re-appends the
+    /// same claim for as long as the mirror is behind.
+    ///
+    /// **Best-effort by contract**: where `$HOME` is read-only — an agent sandbox, the environment
+    /// that broke v0.29.1's live gate — this cannot persist and MUST NOT fail the command (the
+    /// `0.1.11` rule). The gate then learns nothing new there, though `read` still honours claims
+    /// an earlier writable-home session left.
+    pub fn merge_marks(&self, ws: Uuid, claims: &BTreeMap<Uuid, i64>) {
+        if claims.is_empty() {
+            return;
+        }
+        let held = self.load_marks(ws);
+        let fresh: Vec<(Uuid, i64)> = claims
+            .iter()
+            .filter(|(id, rev)| held.latest.get(id).is_none_or(|h| *rev > h))
+            .map(|(id, rev)| (*id, *rev))
+            .collect();
+        if fresh.is_empty() {
+            return;
+        }
+        let _ = self.append_marks(ws, &fresh);
+    }
+
+    fn append_marks(&self, ws: Uuid, claims: &[(Uuid, i64)]) -> Result<()> {
+        use std::io::Write;
+        let p = self.marks_path(ws);
+        fs::create_dir_all(p.parent().expect("state dir")).context("creating .docli/state")?;
+        let mut buf = String::with_capacity(claims.len() * 48);
+        for (id, rev) in claims {
+            buf.push_str(&format!("{id} {rev}\n"));
+        }
+        // `O_APPEND` positions each underlying write atomically. A torn record — reachable only if
+        // the kernel short-writes, which regular files do not do in practice — costs at most that
+        // line: the parser skips anything that is not `<uuid> <i64>`, and the next `search`
+        // re-derives the claim, because the node is still above the mirror's cursor.
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&p)
+            .with_context(|| format!("opening {}", p.display()))?
+            .write_all(buf.as_bytes())
+            .with_context(|| format!("appending to {}", p.display()))?;
+        Ok(())
+    }
+}
+
+/// The control root — `~/.docli` in production, since the mirror became per-MACHINE in v0.29.2
+/// (see [`ControlRoot::at`]; the `<project>/.docli` shape survives only for tests and the legacy
+/// layout). Holds `state/<ws>.json`, `state/<ws>.stale`, `markers/`, and gets the same containment
+/// discipline as the mount (D2 — two validated roots, not one).
 pub struct ControlRoot {
     pub dir: PathBuf,
 }
@@ -371,6 +524,94 @@ impl ControlRoot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn claim(n: u128, rev: i64) -> BTreeMap<Uuid, i64> {
+        BTreeMap::from([(Uuid::from_u128(n), rev)])
+    }
+
+    /// The whole model: a claim is OBSOLETE once the mirror has applied that rev or later.
+    ///
+    /// This is what retired the prune, the head-clear and the from-zero delete in turn — catching
+    /// up retires a claim, so nothing has to remove one for it to stop firing.
+    #[test]
+    fn a_claim_retires_once_the_mirror_reaches_its_rev() {
+        let marks = StaleMarks {
+            latest: BTreeMap::from([(Uuid::from_u128(1), 10)]),
+        };
+        let id = Uuid::from_u128(1);
+        assert!(marks.contradict(id, 9), "behind the claimed rev is stale");
+        assert!(!marks.contradict(id, 10), "reaching it retires the claim");
+        assert!(
+            !marks.contradict(id, 11),
+            "and passing it must not resurrect the claim - a trashed node's tombstone is a LATER \
+             rev, so this is what retires a `gone` claim too"
+        );
+        assert!(
+            !marks.contradict(Uuid::from_u128(2), 0),
+            "claims do not bleed"
+        );
+    }
+
+    /// Folding takes the GREATEST rev, not the last line — file order is APPEND order, which is not
+    /// server order.
+    ///
+    /// Two searches can append in the opposite order to the snapshots they read. Under a
+    /// last-line-wins rule an older observation then suppresses a newer one, and the mirror serves
+    /// content the server has already named — the one unacceptable outcome.
+    #[test]
+    fn folding_takes_the_greatest_rev_whatever_order_it_was_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = ControlRoot::new(tmp.path());
+        let ws = Uuid::from_u128(1);
+        // The NEWER observation lands first, the older one after it.
+        root.merge_marks(ws, &claim(7, 20));
+        root.append_marks(ws, &[(Uuid::from_u128(7), 12)]).unwrap();
+        let loaded = root.load_marks(ws);
+        assert!(
+            loaded.contradict(Uuid::from_u128(7), 15),
+            "an out-of-order older claim must not suppress the newer one"
+        );
+        assert!(!loaded.contradict(Uuid::from_u128(7), 20));
+    }
+
+    /// A claim the file already covers appends nothing — otherwise every search re-appends the same
+    /// claim for as long as the mirror is behind.
+    #[test]
+    fn a_covered_claim_is_not_appended_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = ControlRoot::new(tmp.path());
+        let ws = Uuid::from_u128(1);
+        root.merge_marks(ws, &claim(7, 20));
+        let after_first = fs::read_to_string(root.marks_path(ws)).unwrap();
+        for _ in 0..5 {
+            root.merge_marks(ws, &claim(7, 20));
+        }
+        // …and an OLDER rev is covered too.
+        root.merge_marks(ws, &claim(7, 12));
+        assert_eq!(
+            fs::read_to_string(root.marks_path(ws)).unwrap(),
+            after_first
+        );
+        // A NEWER one is recorded.
+        root.merge_marks(ws, &claim(7, 21));
+        assert!(root.load_marks(ws).contradict(Uuid::from_u128(7), 20));
+    }
+
+    /// A torn tail costs that record alone, never the file.
+    #[test]
+    fn a_garbled_line_does_not_poison_the_other_claims() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = ControlRoot::new(tmp.path());
+        let ws = Uuid::from_u128(1);
+        root.merge_marks(ws, &claim(7, 20));
+        let p = root.marks_path(ws);
+        let mut raw = fs::read_to_string(&p).unwrap();
+        raw.push_str("00000000-0000-0000-0000-0000000000 2"); // a half-written record
+        fs::write(&p, raw).unwrap();
+        let loaded = root.load_marks(ws);
+        assert_eq!(loaded.latest.len(), 1);
+        assert!(loaded.contradict(Uuid::from_u128(7), 19));
+    }
 
     #[test]
     fn state_round_trips_atomically() {

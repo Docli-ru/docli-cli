@@ -186,6 +186,7 @@ fn sync(fx: &mut Fx, server: &str) -> i32 {
         SyncOptions {
             check: false,
             full: false,
+            post_write: false,
         },
     )
     .unwrap()
@@ -198,6 +199,7 @@ fn sync_full(fx: &mut Fx, server: &str) -> i32 {
         SyncOptions {
             check: false,
             full: true,
+            post_write: false,
         },
     )
     .unwrap()
@@ -210,6 +212,7 @@ fn check(fx: &mut Fx, server: &str) -> i32 {
         SyncOptions {
             check: true,
             full: false,
+            post_write: false,
         },
     )
     .unwrap()
@@ -443,6 +446,7 @@ fn a_check_that_cannot_run_is_an_error_not_a_staleness_verdict() {
         SyncOptions {
             check: true,
             full: false,
+            post_write: false,
         },
     );
     assert!(
@@ -662,6 +666,7 @@ fn the_rollback_detector_stops_on_a_head_page_without_the_count() {
             SyncOptions {
                 check: false,
                 full: false,
+                post_write: false,
             },
         )
         .unwrap_err()
@@ -808,7 +813,8 @@ fn transient_parks_fail_check_but_structural_parks_do_not() {
             &server,
             SyncOptions {
                 check: false,
-                full: true
+                full: true,
+                post_write: false,
             }
         )
         .unwrap(),
@@ -855,6 +861,7 @@ fn no_access_is_partial_success_not_an_abort() {
         SyncOptions {
             check: false,
             full: false,
+            post_write: false,
         },
     )
     .unwrap();
@@ -1100,6 +1107,7 @@ fn doctor_no_access_is_partial_success_not_an_abort() {
             SyncOptions {
                 check: false,
                 full: false,
+                post_write: false,
             },
         )
         .unwrap(),
@@ -1325,6 +1333,7 @@ fn a_mid_replay_epoch_bump_leaves_the_repair_pending_not_exit_2() {
         SyncOptions {
             check: false,
             full: false,
+            post_write: false,
         },
     )
     .unwrap();

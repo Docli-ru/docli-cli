@@ -1,0 +1,12 @@
+name: consult-before-files
+description: >
+  A why-question in a mounted project. The agent should run `docli search` BEFORE forming
+  an answer from the files here. This is the exact failure measured 2026-09-05: the
+  orientation text reached context verbatim and lost to the faster local path.
+runs: 5
+max_turns: 12
+timeout_seconds: 240
+tags: [orientation, consult]
+prompt: prompt.md
+graders:
+  - graders/searched-first.md

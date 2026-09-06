@@ -50,6 +50,15 @@ use crate::state::{ControlRoot, NodeState, Park, ParkClass, TrackedKind, WsState
 /// conclusion only `docli search` may reach.
 pub const EXIT_NOT_IN_MIRROR: i32 = 3;
 
+/// **The server told us this note's content changed since the mirror applied it** (v0.29.7 D4).
+///
+/// Its OWN code, never shared with exit 3 or with the generic failure. The research this slice
+/// rests on named the condition precisely: a hard failure is survivable only if it can never fire
+/// on something the agent cannot itself fix, and only if the reader can tell it apart from «not
+/// here» — an agent that read a staleness refusal as absence would conclude the note does not
+/// exist, which is the one conclusion this verb must never permit.
+pub const EXIT_STALE: i32 = 4;
+
 /// Everything else. `main` uses the same code for an `Err` return, and that is the point: these
 /// are the outcomes that are not answers ABOUT THE MIRROR'S CONTENTS — every miss that could not
 /// look, plus the caller's own mistakes (a bad range, an ambiguous selector, and the one
@@ -98,6 +107,30 @@ const FRONTMATTER_ABSENT: &str =
 const RELATED_ABSENT: &str =
     "server-scored per query, never cached here - call `related_notes` over the docli MCP \
      connection";
+
+/// Exit 4's sentence.
+///
+/// **It says what the server NAMED, not what the server DID**, and the difference is not pedantry:
+/// two cases this design names itself can fire over bytes that are perfectly current — a note
+/// edited since `0052` whose stamp this mirror predates, and a claim an unlucky interleaving of
+/// `search` and `sync` left behind. «The server has changed this note» would be false in both, and
+/// re-collapsing the `node_rev`-churn-vs-content-change distinction is precisely what D2 exists to
+/// avoid. `v0.29.5` minted the rule this follows: a claim may only assert what the surface it
+/// feeds can support.
+///
+/// **One command, and it is `docli sync`.** MCP `read_note` would also serve the current text —
+/// faster, even — but naming both is exactly the enumeration `0.1.19` MEASURED as harmful: listing
+/// failure modes beside a remedy made three of six agents stop rather than act. `docli sync` is
+/// also the only one of the two that RESOLVES the refusal: it delivers the current bytes AND
+/// re-seeds the stamp. `read_note` would leave this note refusing.
+///
+/// Note what it does NOT promise: that the next read SUCCEEDS. A `gone` mark is resolved by a sync
+/// applying the tombstone, after which the note is untracked and `read` answers exit 3; a node that
+/// left the mount's scope resolves the same way. «Brings the mirror up to date» is true in every
+/// one of those; «the next read succeeds» would not be.
+const STALE_REFUSAL: &str = "the server listed this note as changed relative to this mirror's \
+                             position, so what is held here cannot be served as current - \
+                             `docli sync` brings the mirror up to date";
 
 const ATTACHMENT_BYTES_ABSENT: &str =
     "an attachment's bytes are not mirrored - `read_attachment` over the docli MCP connection \
@@ -432,6 +465,14 @@ struct Loaded {
     /// scope it names notes this mirror does not hold — which `read` has to disclose rather than
     /// let the reader discover through an exit 3.
     scoped: bool,
+    /// v0.29.7 D4 — the server named this node as content-changed and no sync has applied it yet.
+    ///
+    /// Carried on the HIT rather than turned into a [`Miss`] on purpose. As a miss it would empty
+    /// `hits`, and the two-mounts-hold-one-path case would stop being an ambiguity refusal and
+    /// start being resolved BY staleness — picking whichever copy happened to be fresh, which is
+    /// exactly the «answer depends on something the output never reveals» the ambiguity refusal
+    /// exists to prevent.
+    stale: bool,
 }
 
 /// Held, or absent with a sentence. There is deliberately no third state: a graph we cannot read
@@ -527,6 +568,12 @@ pub fn resolve(project: &Project, args: &ReadArgs, now: i64) -> Outcome {
         );
     }
     if let Some(hit) = hits.pop() {
+        // The staleness gate sits HERE — past the ambiguity refusal, so a second mount holding
+        // the same path is still an ambiguity rather than being silently resolved by which copy
+        // is fresh, and ahead of `serve`, because a refusal must print no body.
+        if hit.stale {
+            return refuse("stale", STALE_REFUSAL, EXIT_STALE);
+        }
         // A sibling that could not answer at all leaves the uniqueness UNVERIFIED (Codex round
         // 1). Serving is still right — the bytes we have are the bytes we have, and refusing
         // would make one broken mount hide every other mount's notes — but D8's rule is that
@@ -699,9 +746,9 @@ fn probe(
 ) -> Probe {
     let mount_root = mount_abs(&project.root, mount);
     // STATE FIRST, then identity — the same order `search_cmd::read_local` takes, and for the
-    // reason that made it right there. State lives in `.docli/state/<ws>.json`, next to
-    // `docli.toml` and nowhere near the mount, so reading it needs no claim on the mount
-    // directory; identity has to precede any OPEN, which is still below it.
+    // reason that made it right there. State lives in the CONTROL ROOT — `~/.docli/state/<ws>.json`
+    // since the mirror went per-machine in v0.29.2 — and nowhere near the mount, so reading it
+    // needs no claim on the mount directory; identity has to precede any OPEN, which is below it.
     //
     // Reversed, the two commands answer a fresh `docli init` differently. Nothing but
     // `sync`/`doctor` CREATES a mount directory (`claim_mount`), so between `init` and the
@@ -725,6 +772,19 @@ fn probe(
     if !claimed {
         return Probe::Miss(Miss::NotThisMirror);
     }
+    // MARKS BEFORE BYTES, and the order is the whole of this gate's correctness (Codex round 1).
+    //
+    // Observed after the read, the check answers about a DIFFERENT moment than the bytes: a
+    // concurrent sync can advance this node's stored rev in between, retiring the claim, so `read`
+    // would find nothing and serve the older bytes it had already captured — defeating a claim that
+    // genuinely applied to the bytes when the file was opened. Nothing locks either file, so the fix is
+    // ordering, not exclusion: a claim seen here means we refuse before reading anything, and one
+    // that appears AFTER this point describes a change we could not have known about when we
+    // looked, which is the temporal blind spot D5 already accepts.
+    //
+    // An absent or unreadable file is simply NO marks — `read` stays offline, and the gate
+    // degrades to the v0.29.0 behaviour rather than to a refusal.
+    let marked = control.load_marks(mount.workspace);
     // PARKS FIRST (open item 1). A parked node is absent from `state.nodes` BY CONSTRUCTION, so
     // a nodes-miss checked first makes every park case unreachable and the reader gets the
     // generic "this mirror does not hold it" over a node whose exact reason we know.
@@ -790,6 +850,10 @@ fn probe(
         unusable: st.unusable_reason(mount.folder.as_deref(), now),
         graph: graph_slot(control, mount.workspace, &st),
         scoped: mount.folder.is_some(),
+        // From the snapshot taken ABOVE, before the bytes were read — and resolved against the
+        // stamp this mirror actually holds, so a mark the mirror has since caught up with is
+        // simply satisfied rather than needing to have been removed.
+        stale: marked.contradict(id, node.rev),
     }))
 }
 
@@ -1464,10 +1528,24 @@ mod tests {
                 rev: 1,
                 content_sha256: crate::apply::sha_hex(body.as_bytes()),
                 marker_path: marker_path.map(str::to_string),
+                content_changed_at: Some("2026-09-05T10:00:00.000000Z".to_string()),
             },
         );
         st.ledger.insert(Uuid::from_u128(id));
         control.save_state(ws, &st).unwrap();
+    }
+
+    /// Claim `id` the way `search` does. The fixtures store `rev: 1`, so any higher rev is a
+    /// server position this mirror has not reached.
+    fn mark(f: &Fx, ws: u128, id: u128) {
+        claim(f, ws, id, 9);
+    }
+
+    fn claim(f: &Fx, ws: u128, id: u128, rev: i64) {
+        ControlRoot::new(&f.project.root).merge_marks(
+            Uuid::from_u128(ws),
+            &std::collections::BTreeMap::from([(Uuid::from_u128(id), rev)]),
+        );
     }
 
     fn args(path: &str) -> ReadArgs {
@@ -1478,6 +1556,105 @@ mod tests {
             lines: None,
             json: false,
         }
+    }
+
+    /// The whole point of the slice: a note the server named is REFUSED, with its own code, and
+    /// no body is printed.
+    #[test]
+    fn a_marked_note_exits_four_and_serves_nothing() {
+        let f = fx(&[("m", 1, None)]);
+        put_note(&f, "m", 1, 7, "a.md", "old body");
+        mark(&f, 1, 7);
+        let r = refused(resolve(&f.project, &args("a.md"), 1));
+        assert_eq!(r.exit, EXIT_STALE);
+        assert_eq!(r.code, "stale");
+        // Its own code, distinct from «not in this mirror» — an agent that confused the two would
+        // conclude the note does not exist, which only `docli search` may ever establish.
+        assert_ne!(r.exit, EXIT_NOT_IN_MIRROR);
+        // ONE remedy, and it is the one that both delivers the current bytes and RETIRES the
+        // claim — by advancing this node's stored rev past it; the record itself is never removed.
+        assert!(r.message.contains("docli sync"), "{}", r.message);
+        assert!(
+            !r.message.contains("read_note"),
+            "enumerating a second path is what 0.1.19 measured as harmful: {}",
+            r.message
+        );
+    }
+
+    /// The PER-NODE claim, which is what separates this from mount-marking: a different note
+    /// changing must not cost this one its read.
+    #[test]
+    fn an_untouched_note_still_reads_while_a_sibling_is_marked() {
+        let f = fx(&[("m", 1, None)]);
+        put_note(&f, "m", 1, 7, "a.md", "body a");
+        put_note(&f, "m", 1, 8, "b.md", "body b");
+        mark(&f, 1, 8);
+        assert_eq!(served(resolve(&f.project, &args("a.md"), 1)).body, "body a");
+        assert_eq!(
+            refused(resolve(&f.project, &args("b.md"), 1)).exit,
+            EXIT_STALE
+        );
+    }
+
+    /// No marks at all — no file, nothing searched yet, or a read-only `$HOME` where `search`
+    /// could not persist — leaves `read` exactly as v0.29.0 left it: it SERVES and discloses.
+    /// This is D5's fallback, and pinning it is what stops the gate drifting into an outage.
+    #[test]
+    fn an_unmarked_mirror_serves_as_before() {
+        let f = fx(&[("m", 1, None)]);
+        put_note(&f, "m", 1, 7, "a.md", "body");
+        let control = ControlRoot::new(&f.project.root);
+        assert!(!control.marks_path(Uuid::from_u128(1)).exists());
+        assert_eq!(served(resolve(&f.project, &args("a.md"), 1)).body, "body");
+    }
+
+    /// A mark naming an id this mirror does not hold is INERT. It cannot promote an exit 3 into
+    /// an exit 4 — «not here» stays the honest answer, and a park keeps its own sentence.
+    #[test]
+    fn a_mark_for_an_unheld_node_changes_nothing() {
+        let f = fx(&[("m", 1, None)]);
+        put_note(&f, "m", 1, 7, "a.md", "body");
+        mark(&f, 1, 99);
+        let r = refused(resolve(&f.project, &args("nope.md"), 1));
+        assert_eq!(r.exit, EXIT_NOT_IN_MIRROR);
+        assert_eq!(r.code, "not_in_mirror");
+        assert_eq!(served(resolve(&f.project, &args("a.md"), 1)).body, "body");
+    }
+
+    /// A mark must not resolve an AMBIGUITY. Two mounts holding one path stays a `--mount`
+    /// refusal even when one copy is marked — otherwise the answer would depend on which mirror
+    /// happened to be stale, which nothing in the output reveals.
+    #[test]
+    fn a_marked_copy_does_not_break_a_tie_between_two_mounts() {
+        let f = fx(&[("m1", 1, None), ("m2", 2, None)]);
+        put_note(&f, "m1", 1, 7, "a.md", "one");
+        put_note(&f, "m2", 2, 8, "a.md", "two");
+        mark(&f, 1, 7);
+        let r = refused(resolve(&f.project, &args("a.md"), 1));
+        assert_eq!(r.code, "ambiguous");
+        assert_eq!(r.exit, EXIT_FAILED);
+    }
+
+    /// A claim retires when the mirror reaches its rev — nothing removes it.
+    ///
+    /// This is the property that made the prune, the head-clear and the from-zero delete all
+    /// unnecessary, and it is what makes the two snapshot races unreachable: a sync delivering an
+    /// OLDER rev leaves the claim standing, and a search naming a rev already applied never fires.
+    #[test]
+    fn a_claim_retires_when_the_mirror_reaches_its_rev() {
+        let f = fx(&[("m", 1, None)]);
+        put_note(&f, "m", 1, 7, "a.md", "body"); // stored at rev 1
+        claim(&f, 1, 7, 9);
+        assert_eq!(
+            refused(resolve(&f.project, &args("a.md"), 1)).exit,
+            EXIT_STALE
+        );
+        // A claim at or below what the mirror already holds never fires — the case a search that
+        // started before a sync produces, which an id-keyed mark stranded forever.
+        let f2 = fx(&[("m", 1, None)]);
+        put_note(&f2, "m", 1, 7, "a.md", "body");
+        claim(&f2, 1, 7, 1);
+        assert_eq!(served(resolve(&f2.project, &args("a.md"), 1)).body, "body");
     }
 
     fn served(o: Outcome) -> Served {
@@ -1914,6 +2091,7 @@ mod tests {
                 rev: 1,
                 content_sha256: String::new(),
                 marker_path: None,
+                content_changed_at: None,
             },
         );
         control.save_state(ws, &st).unwrap();
@@ -2015,6 +2193,7 @@ mod tests {
                 rev: 1,
                 content_sha256: crate::apply::sha_hex(marker.as_bytes()),
                 marker_path: Some(rel),
+                content_changed_at: None,
             },
         );
         control.save_state(ws, &st).unwrap();
@@ -2046,6 +2225,7 @@ mod tests {
                 rev: 1,
                 content_sha256: String::new(),
                 marker_path: Some(rel),
+                content_changed_at: None,
             },
         );
         control.save_state(ws, &st).unwrap();
@@ -2438,6 +2618,7 @@ mod tests {
             RELATED_ABSENT,
             ATTACHMENT_BYTES_ABSENT,
             SCOPE_DISCLOSURE,
+            STALE_REFUSAL,
         ] {
             sentences.push(c.to_string());
         }
@@ -2583,6 +2764,7 @@ mod tests {
                     rev: 1,
                     content_sha256: String::new(),
                     marker_path: None,
+                    content_changed_at: None,
                 },
             );
             control.save_state(Uuid::from_u128(1), &st).unwrap();
@@ -2766,6 +2948,7 @@ mod tests {
                 rev: 1,
                 content_sha256: crate::apply::sha_hex(marker.as_bytes()),
                 marker_path: Some(rel),
+                content_changed_at: None,
             },
         );
         control.save_state(ws, &st).unwrap();

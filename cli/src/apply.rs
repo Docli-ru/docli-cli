@@ -519,6 +519,7 @@ pub fn apply_page(
         marker_path: Option<String>,
         server_path: String,
         rev: i64,
+        content_changed_at: Option<String>,
         prev: Option<NodeState>,
     }
     let mut retries: Vec<RetryPut> = Vec::new();
@@ -597,6 +598,7 @@ pub fn apply_page(
                             marker_path: marker_path.clone(),
                             server_path: node.path.clone(),
                             rev: node.rev,
+                            content_changed_at: node.content_changed_at.clone(),
                             prev,
                         });
                         continue;
@@ -653,6 +655,9 @@ pub fn apply_page(
                             sha_hex(bytes)
                         },
                         marker_path: marker_path.clone(),
+                        // The server's own word, verbatim (v0.29.7 D2): this IS the comparand the
+                        // search plane's changed set is later compared against.
+                        content_changed_at: node.content_changed_at.clone(),
                     },
                 );
             }
@@ -740,6 +745,7 @@ pub fn apply_page(
                             sha_hex(&r.bytes)
                         },
                         marker_path: r.marker_path.clone(),
+                        content_changed_at: r.content_changed_at.clone(),
                     },
                 );
                 if moved {
@@ -1147,12 +1153,58 @@ mod tests {
             position: None,
             sha256: None,
             blob_generation: (kind == "attachment").then_some(0),
+            // The fixtures speak for a CURRENT api: a note carries an explicit stamp, and
+            // anything else carries none because nothing else can have one. Tests that need the
+            // «older api» arm set this to `None` themselves.
+            content_changed_at: (kind == "file").then(|| "2026-09-05T10:00:00.000000Z".to_string()),
         }
     }
 
     fn trashed(mut n: WireNode) -> WireNode {
         n.trashed = true;
         n
+    }
+
+    /// The SEED half of the byte-equality contract (v0.29.7 D2), and the one with the worst
+    /// failure mode in the slice.
+    ///
+    /// If `track_node` were handed `None` instead of the delivered stamp, no note would ever be
+    /// marked for a content change again — the gate would silently answer «nothing changed» for
+    /// every edit. Nothing else in the suite can see that: the mirror's bytes, digests, paths and
+    /// ledger would all be correct.
+    #[test]
+    fn an_applied_node_stores_the_servers_stamp_verbatim() {
+        let mut f = fx();
+        let stored = |f: &Fx, id: u128| {
+            f.state
+                .nodes
+                .get(&Uuid::from_u128(id))
+                .expect("tracked")
+                .content_changed_at
+                .clone()
+        };
+
+        let mut stamped = node(1, "file", "a.md", 1, Some("a"));
+        stamped.content_changed_at = Some("2026-09-05T10:00:00.000000Z".into());
+        // A note the server has no stamp for — untouched since `0052`, which is most of them.
+        let mut unstamped = node(2, "file", "b.md", 1, Some("b"));
+        unstamped.content_changed_at = None;
+        apply(&mut f, &rules(), &[stamped, unstamped]);
+
+        assert_eq!(
+            stored(&f, 1),
+            Some("2026-09-05T10:00:00.000000Z".to_string())
+        );
+        assert_eq!(stored(&f, 2), None);
+
+        // …and a RE-application overwrites it, so a stale stamp cannot outlive the node's content.
+        let mut moved = node(1, "file", "a.md", 2, Some("a2"));
+        moved.content_changed_at = Some("2026-09-05T11:00:00.000000Z".into());
+        apply(&mut f, &rules(), &[moved]);
+        assert_eq!(
+            stored(&f, 1),
+            Some("2026-09-05T11:00:00.000000Z".to_string())
+        );
     }
 
     fn apply(fxt: &mut Fx, r: &FsRules, nodes: &[WireNode]) -> ApplyStats {
@@ -1868,6 +1920,7 @@ mod tests {
                 rev: 1,
                 content_sha256: String::new(),
                 marker_path: None,
+                content_changed_at: None,
             },
         );
         // …and an EMPTY stored path resolves to the mount root itself (round 17).
@@ -1881,6 +1934,7 @@ mod tests {
                 rev: 1,
                 content_sha256: String::new(),
                 marker_path: None,
+                content_changed_at: None,
             },
         );
         fs::write(f.mount.parent().unwrap().join("outside.md"), "keep me").unwrap();
