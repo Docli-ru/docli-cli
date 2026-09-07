@@ -18,7 +18,9 @@
 //!   configs against the same rule the server's labeled routes enforce.
 //!
 //! Plus one four-character doc-twin: [`wikilink_expressible`], mirroring the api's
-//! `upload.rs wikilink_for` NULL rule.
+//! `upload.rs wikilink_for` NULL rule — and, since v0.29.9, the ONE function `related` shares
+//! across the two trains: [`related::cosine`] over the per-note vectors the server ships
+//! (pinned by `vectors/related.json`).
 //!
 //! This crate must never depend on docli-core (UNLICENSED — it cannot ship in the MIT mirror).
 
@@ -111,6 +113,7 @@ pub fn valid_label(label: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+pub mod related;
 pub mod winpath;
 
 /// The shared vector FILES, exposed as crate constants.
@@ -126,6 +129,11 @@ pub mod winpath;
 pub mod vectors {
     /// v0.29.1 D7 — the note graph's five read predicates.
     pub const GRAPH: &str = include_str!("../vectors/graph.json");
+    /// v0.29.9 D5/D7 — `related` evaluated over the shipped artifact: the lexical arm's ranking
+    /// rules and the RRF fusion, pinned as a SEQUENCE (see the file's own header for why order
+    /// is pinned here and not in `graph.json`). Consumed by the api's arm test, core's `fuse`
+    /// test and the CLI's `related_cmd` test.
+    pub const RELATED: &str = include_str!("../vectors/related.json");
 }
 
 #[cfg(test)]

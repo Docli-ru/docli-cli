@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use docli_sync_wire::{PullRequest, PullResponse, WireCursor};
+use docli_sync_wire::{PullRequest, PullResponse, RelatedStamp, WireCursor};
 use uuid::Uuid;
 
 use crate::apply::{apply_page, prune_undelivered};
@@ -161,15 +161,17 @@ impl std::fmt::Display for NotEntitled {
 }
 impl std::error::Error for NotEntitled {}
 
-/// `graph` is a per-CALLER intent, not a per-page one (v0.29.1 D4): the payload only ever rides
-/// the head-reaching page, but the flag has to be set on every request of the run, because which
-/// page reaches head is not knowable in advance.
+/// `graph` and `related` are per-CALLER intents, not per-page ones (v0.29.1 D4, v0.29.9 D6): the
+/// payloads only ever ride the head-reaching page, but the asks have to be set on every request of
+/// the run, because which page reaches head is not knowable in advance. A real sync asks for both;
+/// `--check` and `doctor` ask for neither.
 fn ephemeral_request(
     ws: Uuid,
     cursor: WireCursor,
     epoch: i64,
     limit: i64,
     graph: bool,
+    related: Option<RelatedStamp>,
 ) -> PullRequest {
     PullRequest {
         workspace_id: ws,
@@ -180,7 +182,44 @@ fn ephemeral_request(
         ack: None,
         ephemeral: true,
         graph,
+        related,
     }
+}
+
+/// The `related` ask (v0.29.9 D6): the stamp of the generation this machine already HOLDS, or
+/// zeroes when none — so the server sends the artifact only when its generation differs.
+fn held_related_stamp(control: &ControlRoot, ws: Uuid) -> RelatedStamp {
+    control
+        .load_related(ws)
+        .map(|r| RelatedStamp {
+            covers_rev: r.covers_rev,
+            covers_id: r.covers_id,
+        })
+        .unwrap_or(RelatedStamp {
+            covers_rev: 0,
+            covers_id: Uuid::nil(),
+        })
+}
+
+/// Store the `related` artifact and the head cursor at the moment the mirror commits head
+/// (v0.29.9 D6/D7). The OPPOSITE of `commit_graph`'s absent arm: an absent rider means «keep what
+/// you hold» — the server withholds it when the stamps match, when it has no generation, and when
+/// the fetch failed — so nothing is cleared here. `head_rev` is the page's VERBATIM, `None`
+/// included: an api that does not serve it (a rollback, a mixed fleet) must not leave a frozen
+/// value behind, or the «moved N revisions» disclosure would under-report against a workspace
+/// that keeps moving — and an under-stated disclosure is worse than an absent one.
+fn commit_related(
+    control: &ControlRoot,
+    ws: Uuid,
+    state: &mut WsState,
+    resp: &PullResponse,
+) -> Result<()> {
+    state.related_asked = true;
+    state.head_rev = resp.head_rev;
+    if let Some(r) = &resp.related {
+        control.save_related(ws, r)?;
+    }
+    Ok(())
 }
 
 /// True when this response is the HEAD-REACHING page — RESPONSE-DERIVED on both sides
@@ -452,12 +491,14 @@ fn incremental_pages(
     progress: &crate::ui::Progress,
 ) -> Result<bool> {
     let ws = mount.workspace;
+    // Read ONCE per run, like the from-zero path: the stamp is two integers out of a ~1 MB file.
+    let stamp = held_related_stamp(control, ws);
     loop {
         progress.set(&format!(
             "received: {}",
             crate::ui::plural(state.nodes.len(), "node", "nodes")
         ));
-        let req = ephemeral_request(ws, state.cursor, state.epoch, PAGE_LIMIT, true);
+        let req = ephemeral_request(ws, state.cursor, state.epoch, PAGE_LIMIT, true, Some(stamp));
         let resp = match api.pull(&req)? {
             Ok(r) => r,
             Err(ApiFailure::EpochChanged { .. }) => {
@@ -530,6 +571,7 @@ fn incremental_pages(
                 resp.cursor,
                 resp.graph.as_ref(),
             )?;
+            commit_related(control, ws, state, &resp)?;
             persist_incomplete(control, handle, ws, state)?;
             return Ok(true);
         }
@@ -689,12 +731,14 @@ fn from_zero_pages(
         id: Uuid::nil(),
     };
     // Bootstrap is the CLI's first call — the only way to learn the epoch.
+    let stamp = held_related_stamp(control, ws);
     let first = match api.bootstrap(&ephemeral_request(
         ws,
         cursor,
         state.epoch,
         PAGE_LIMIT,
         true,
+        Some(stamp),
     ))? {
         Ok(r) => r,
         Err(ApiFailure::EpochChanged { .. }) => {
@@ -761,10 +805,18 @@ fn from_zero_pages(
             state.head_reached_at = Some(now_unix());
             settle_pending_removals(state, rules, &handle.root);
             commit_graph(control, ws, state, epoch, cursor, resp.graph.as_ref())?;
+            commit_related(control, ws, state, &resp)?;
             persist_incomplete(control, handle, ws, state)?;
             return Ok(());
         }
-        resp = match api.pull(&ephemeral_request(ws, cursor, epoch, PAGE_LIMIT, true))? {
+        resp = match api.pull(&ephemeral_request(
+            ws,
+            cursor,
+            epoch,
+            PAGE_LIMIT,
+            true,
+            Some(stamp),
+        ))? {
             Ok(r) => r,
             Err(ApiFailure::EpochChanged { .. }) => {
                 // Mid-replay resync: an epoch bump is a normal, self-healing server event, not
@@ -842,7 +894,7 @@ fn check_mount(
     }
     // `--check` reads no graph and runs on every session start of every wired agent, so it never
     // asks for one (D4's opt-out).
-    let req = ephemeral_request(ws, state.cursor, state.epoch, 1, false);
+    let req = ephemeral_request(ws, state.cursor, state.epoch, 1, false, None);
     let resp = match api.pull(&req)? {
         Ok(r) => r,
         Err(ApiFailure::EpochChanged { .. }) => {
@@ -1637,6 +1689,8 @@ mod tests {
             last_mutation_id: 0,
             live_nodes: None,
             graph: None,
+            related: None,
+            head_rev: None,
         };
         assert!(head_reaching(&resp(0), 1));
         assert!(!head_reaching(&resp(1), 1));

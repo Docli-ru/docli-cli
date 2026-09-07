@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 OOO Agitek
 // SPDX-License-Identifier: MIT
 
-//! docli — a read-only agent cache over the docli sync plane (v0.29.1 / docli-cli 0.1.5).
+//! docli — a read-only agent cache over the docli sync plane (the version is `Cargo.toml`'s).
 //!
 //! A library target exists so the integration tests can drive the sync orchestrator against a
 //! scripted stub server; the shipped artifact is the `docli` bin.
@@ -12,6 +12,7 @@ pub mod config;
 pub mod creds;
 pub mod doctor;
 pub mod graph;
+pub mod graph_cmd;
 pub mod guard;
 pub mod hooks;
 pub mod http;
@@ -25,6 +26,7 @@ pub mod markers;
 pub mod mountfs;
 pub mod platform;
 pub mod read_cmd;
+pub mod related_cmd;
 pub mod search_cmd;
 pub mod selfupdate;
 pub mod state;

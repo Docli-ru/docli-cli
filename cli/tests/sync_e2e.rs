@@ -1553,3 +1553,78 @@ fn a_reclaimed_path_cancels_its_removal_debt() {
     );
     assert_eq!(check(&mut f, &server), 0);
 }
+
+// ---- v0.29.9: the `related` artifact rider (D6/D7) ------------------------------------------
+
+/// A real sync ASKS for the artifact naming the stamp it holds; the head page's rider is stored
+/// by its own generation stamp and `headRev` is kept; a later page WITHOUT the rider keeps what
+/// is held (the opposite of the graph's clear-on-absent arm); `--check` never asks.
+#[test]
+fn the_related_artifact_rides_the_head_page_and_absence_keeps_what_is_held() {
+    let mut fx = fx();
+    let asks: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let serve_rider = Arc::new(Mutex::new(true));
+    let seen = asks.clone();
+    let rider = serve_rider.clone();
+    let server = spawn_stub(Arc::new(move |_path, body| {
+        seen.lock()
+            .unwrap()
+            .push(body.get("related").cloned().unwrap_or(Value::Null));
+        // Honour the cursor like a real server: one node at rev 1, nothing past it.
+        let nodes = if body["cursor"]["rev"].as_i64().unwrap_or(0) >= 1 {
+            vec![]
+        } else {
+            vec![wire_node(1, "file", "a.md", 1, Some("alpha"))]
+        };
+        let mut resp = page(1, nodes, Some(1));
+        if resp["nodes"].as_array().unwrap().is_empty() {
+            resp["cursor"] = json!({"rev": 1, "id": Uuid::from_u128(1).to_string()});
+        }
+        resp["headRev"] = json!(7);
+        if body.get("related").is_some() && *rider.lock().unwrap() {
+            resp["related"] = json!({
+                "coversRev": 5,
+                "coversId": Uuid::from_u128(0x55).to_string(),
+                "dict": ["альф"],
+                "subjects": [{
+                    "id": Uuid::from_u128(1).to_string(),
+                    "note": {"wc": 3, "terms": [[0, 1.0]]},
+                }],
+            });
+        }
+        (200, resp)
+    }));
+
+    assert_eq!(sync(&mut fx, &server), 0);
+    let control = ControlRoot::at(&fx.project.control);
+    let held = control.load_related(WS).expect("the rider is stored");
+    assert_eq!(held.covers_rev, 5);
+    let st = control.load_state(WS).unwrap().unwrap();
+    assert!(st.related_asked);
+    assert_eq!(st.head_rev, Some(7));
+    // The FIRST ask named the zero stamp (nothing held yet).
+    assert_eq!(asks.lock().unwrap()[0]["coversRev"], json!(0));
+
+    // The server now withholds the rider (the stamps match): the held artifact survives.
+    *serve_rider.lock().unwrap() = false;
+    assert_eq!(sync(&mut fx, &server), 0);
+    assert_eq!(
+        control.load_related(WS).unwrap().covers_rev,
+        5,
+        "absence keeps what is held"
+    );
+    let last = asks.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        last["coversRev"],
+        json!(5),
+        "the ask names the held generation"
+    );
+    assert_eq!(last["coversId"], json!(Uuid::from_u128(0x55).to_string()));
+
+    // `--check` never asks for it.
+    assert_eq!(check(&mut fx, &server), 0);
+    assert!(
+        asks.lock().unwrap().last().unwrap().is_null(),
+        "--check does not ask"
+    );
+}

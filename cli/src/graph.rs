@@ -85,6 +85,11 @@ impl Graph {
         self.idx(id).and_then(|i| self.at(i))
     }
 
+    /// Every LIVE identity row — the `ls`/`tree`/`tags`/`tagged` verbs' population (v0.29.9).
+    pub fn live_nodes(&self) -> impl Iterator<Item = &GraphNode> {
+        self.g.nodes.iter().filter(|n| !n.trashed)
+    }
+
     fn live(&self, i: u32) -> Option<&GraphNode> {
         self.at(i).filter(|n| !n.trashed)
     }

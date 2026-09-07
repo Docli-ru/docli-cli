@@ -28,17 +28,19 @@
 //!
 //! # Graph absence is not graph emptiness
 //!
-//! The `read_note` envelope carries `links`/`backlinks`/`tags`/`title`/`aliases`. This build
-//! holds none of them: the graph rides the pull payload in the slice after this one. They render
-//! **absent** — `null` plus a named reason — never `[]`, because an empty `backlinks` over a note
-//! that has plenty is indistinguishable from truth, which is D5's false negative inside the verb
-//! built to replace grep. Half 1 names no remedy for it: `docli sync` cannot fetch a graph no api
-//! serves yet, and an instruction that cannot succeed is worse than silence.
+//! The `read_note` envelope carries `links`/`backlinks`/`tags`/`title`/`aliases`. They come from
+//! the workspace graph the server computes and the sync delivers (v0.29.1 Half 2, `graph.rs`);
+//! when the mirror holds no graph — never synced since the feature, a server that serves none, a
+//! stale or rebuilding cache — they render **absent** — `null` plus a named reason and its remedy —
+//! never `[]`, because an empty `backlinks` over a note that has plenty is indistinguishable from
+//! truth, which is D5's false negative inside the verb built to replace grep. `relatedHint` is the
+//! one field `read` never fills: `docli related` (v0.29.9) is where that computation lives, and
+//! the `absent` entry points there.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -64,7 +66,7 @@ pub const EXIT_STALE: i32 = 4;
 /// look, plus the caller's own mistakes (a bad range, an ambiguous selector, and the one
 /// declared oddity, a folder addressed as a note, which we DID look at and which is still not a
 /// statement about whether the note exists). [`Miss::code`] is what separates the two.
-const EXIT_FAILED: i32 = 2;
+pub(crate) const EXIT_FAILED: i32 = 2;
 
 /// The three reasons the graph can be missing, each with the remedy that actually applies.
 ///
@@ -85,7 +87,8 @@ const GRAPH_STALE: &str = "not held - the cached graph belongs to an earlier syn
 
 /// The graph is workspace-wide while a mount can be a folder of it, so a held graph names paths
 /// this mirror does not hold. A constant so the whitespace check below can reach it.
-const SCOPE_DISCLOSURE: &str = "this mount is scoped to a folder while the note graph covers the \
+pub(crate) const SCOPE_DISCLOSURE: &str =
+    "this mount is scoped to a folder while the note graph covers the \
                                 whole workspace, so a linked path may not be mirrored here - \
                                 `read` exits 3 on those, which says nothing about whether they \
                                 exist";
@@ -105,8 +108,8 @@ const FRONTMATTER_ABSENT: &str =
      inside `content`, verbatim unless a `not_utf8` disclosure says otherwise";
 
 const RELATED_ABSENT: &str =
-    "server-scored per query, never cached here - call `related_notes` over the docli MCP \
-     connection";
+    "not computed by `read` - `docli related <path>` ranks this note's relatives offline from \
+     the held artifact, and says when the server's answer could differ";
 
 /// Exit 4's sentence.
 ///
@@ -144,18 +147,263 @@ pub struct ReadArgs {
     pub json: bool,
 }
 
-pub fn run(project: &Project, args: &ReadArgs) -> Result<i32> {
-    if args.json {
+/// `docli read` over one or several addresses (v0.29.9 Part B — the `read_notes` batch), or a
+/// file's BYTES to `--out`.
+pub struct ReadRequest {
+    pub paths: Vec<String>,
+    pub id: Option<Uuid>,
+    pub mount: Option<String>,
+    pub lines: Option<String>,
+    pub json: bool,
+    pub out: Option<PathBuf>,
+    pub force: bool,
+}
+
+pub fn run(project: &Project, req: &ReadRequest, api: Option<&crate::http::Api>) -> Result<i32> {
+    if req.json {
         // Nothing may prompt under `--json`, and the body is the product either way: `read` is
         // deliberately NOT in `report_mode`. Its stdout is the note, so warnings belong on
         // stderr, where they cannot corrupt a redirect into a file.
         crate::ui::machine_mode();
     }
     validate_config(&project.config)?;
-    Ok(render(
-        resolve(project, args, crate::sync_cmd::now_unix()),
-        args.json,
-    ))
+    let one = |path: Option<String>| ReadArgs {
+        path,
+        id: req.id,
+        mount: req.mount.clone(),
+        lines: req.lines.clone(),
+        json: req.json,
+    };
+    if let Some(out) = &req.out {
+        if req.paths.len() > 1 {
+            // One destination, one file. Refuse rather than pick — everything else in this verb
+            // refuses an ambiguity instead of resolving it by position.
+            return Ok(render_refusal(
+                &Refusal {
+                    code: "usage",
+                    message: "`--out` takes ONE file - give a single path (or `--id`)".into(),
+                    exit: EXIT_FAILED,
+                },
+                req.json,
+            ));
+        }
+        return write_out(
+            project,
+            api,
+            &one(req.paths.first().cloned()),
+            out,
+            req.force,
+        );
+    }
+    if req.paths.len() <= 1 {
+        return Ok(render(
+            resolve(
+                project,
+                &one(req.paths.first().cloned()),
+                crate::sync_cmd::now_unix(),
+            ),
+            req.json,
+        ));
+    }
+    // The batch: every address resolved on its own, the worst exit code kept — «worst» in THIS
+    // verb's own order, not integer order: a failure to look (2) outranks a stale refusal (4)
+    // outranks «not in this mirror» (3), because exit 3 over a set containing an unresolved miss
+    // would let the caller conclude «does not exist» — the one conclusion `read` must never permit
+    // by accident (`across_mounts` states the same precedence for one address across mounts).
+    // Under `--json` the product is ONE array of envelopes/refusals; in plain mode each note is
+    // preceded by a `==> path <==` line, `head`'s convention — a whole-note read stays
+    // byte-verbatim only for a single address.
+    let severity = |exit: i32| match exit {
+        EXIT_FAILED => 3,
+        EXIT_STALE => 2,
+        EXIT_NOT_IN_MIRROR => 1,
+        _ => 0,
+    };
+    let worse = |a: i32, b: i32| if severity(b) > severity(a) { b } else { a };
+    let now = crate::sync_cmd::now_unix();
+    let mut worst = 0;
+    let mut values: Vec<serde_json::Value> = Vec::new();
+    for path in &req.paths {
+        let outcome = resolve(project, &one(Some(path.clone())), now);
+        if req.json {
+            values.push(match &outcome {
+                Outcome::Served(s) => {
+                    for d in s.envelope.disclosures() {
+                        crate::ui::warn(&format!("[{}] {}", crate::ui::sanitize(path), d.message));
+                    }
+                    serde_json::to_value(&s.envelope)?
+                }
+                Outcome::Refused(r) => {
+                    worst = worse(worst, r.exit);
+                    serde_json::json!({"path": path, "error": {"code": r.code, "message": r.message}})
+                }
+            });
+        } else {
+            // Through the pipe-safe writer, like the body: `println!` PANICS on a closed pipe,
+            // and `docli read a.md b.md | head` closes it on purpose. A closed pipe also ENDS the
+            // batch — the reader has what it asked for, and resolving the rest is wasted work.
+            match write_product(&format!("==> {} <==\n", crate::ui::sanitize(path)), false) {
+                Ok(()) => {}
+                Err(e) if broken_pipe(&e) => break,
+                Err(e) => {
+                    crate::ui::refuse(&format!("could not write the result: {e}"));
+                    return Ok(EXIT_FAILED);
+                }
+            }
+            worst = worse(worst, render(outcome, false));
+        }
+    }
+    if req.json {
+        return Ok(write_json(&values, worst));
+    }
+    Ok(worst)
+}
+
+/// `docli read <file> --out <path>` (Part B): the attachment's bytes, fetched over
+/// `GET /api/attachments/{id}` — the sync plane already admits it — and written to a path the
+/// caller named. It never overwrites (`--force` replaces) and refuses a destination inside a
+/// mirror directory, which is never writable.
+fn write_out(
+    project: &Project,
+    api: Option<&crate::http::Api>,
+    args: &ReadArgs,
+    out: &Path,
+    force: bool,
+) -> Result<i32> {
+    let now = crate::sync_cmd::now_unix();
+    let served = match resolve(project, args, now) {
+        Outcome::Refused(r) => return Ok(render_refusal(&r, args.json)),
+        Outcome::Served(s) => s,
+    };
+    let (id, name) = match &served.envelope {
+        Envelope::File(f) => (f.id, f.name.clone()),
+        Envelope::Note(_) => {
+            return Ok(render_refusal(
+                &Refusal {
+                    code: "usage",
+                    message: "`--out` fetches a FILE's bytes; this is a note - `docli read` \
+                              without `--out` prints it"
+                        .into(),
+                    exit: EXIT_FAILED,
+                },
+                args.json,
+            ))
+        }
+    };
+    // The destination's DIRECTORY, resolved the way the read side resolves a mirror path
+    // (`canonical_within`, both sides canonical) — a bare filename has an empty `parent()`, which
+    // is the working directory, and a symlinked mount root would defeat a lexical prefix test.
+    // The directory has to exist: a missing one is refused rather than guessed at.
+    let dest = if out.is_absolute() {
+        out.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| anyhow::anyhow!("reading the working directory: {e}"))?
+            .join(out)
+    };
+    let parent = dest.parent().map(Path::to_path_buf).unwrap_or_default();
+    if !parent.is_dir() {
+        return Ok(render_refusal(
+            &Refusal {
+                code: "usage",
+                message: format!("{} is not a directory", parent.display()),
+                exit: EXIT_FAILED,
+            },
+            args.json,
+        ));
+    }
+    for m in &project.config.mounts {
+        let Ok(root) = canonical_root(&mount_abs(&project.root, m)) else {
+            continue; // a mount directory that does not exist yet cannot contain anything
+        };
+        if let crate::mountfs::Containment::Inside(_) =
+            crate::mountfs::canonical_within(&root, &parent)
+        {
+            return Ok(render_refusal(
+                &Refusal {
+                    code: "usage",
+                    message: "the destination is inside a mirror directory, which is never \
+                              writable - choose a path outside every mount"
+                        .into(),
+                    exit: EXIT_FAILED,
+                },
+                args.json,
+            ));
+        }
+    }
+    if dest.exists() && !force {
+        return Ok(render_refusal(
+            &Refusal {
+                code: "usage",
+                message: format!(
+                    "{} exists - `docli read --out` never overwrites; pass `--force` to replace it",
+                    dest.display()
+                ),
+                exit: EXIT_FAILED,
+            },
+            args.json,
+        ));
+    }
+    let Some(api) = api else {
+        anyhow::bail!("fetching a file's bytes needs a sign-in - run `docli login`");
+    };
+    let bytes = api.attachment_bytes(id)?;
+    // The write is the check (Loop B, Codex round 1): without `--force` the file is created
+    // `create_new`, so a file that appeared between the existence test and this write is refused
+    // rather than truncated — and `O_EXCL` also refuses a symlink at the destination, dangling
+    // or not, which is the second way a write could land inside a mirror. Under `--force` the
+    // symlink case is refused explicitly, since `truncate` would follow it.
+    if dest
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
+        return Ok(render_refusal(
+            &Refusal {
+                code: "usage",
+                message: format!(
+                    "{} is a symlink - `docli read --out` writes only to a plain path",
+                    dest.display()
+                ),
+                exit: EXIT_FAILED,
+            },
+            args.json,
+        ));
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true);
+    if force {
+        opts.create(true).truncate(true);
+    } else {
+        opts.create_new(true);
+    }
+    {
+        use std::io::Write;
+        let mut f = opts
+            .open(&dest)
+            .with_context(|| format!("creating {}", dest.display()))?;
+        f.write_all(&bytes)
+            .with_context(|| format!("writing {}", dest.display()))?;
+    }
+    if args.json {
+        // A machine caller gets an answer on stdout, not only a file on disk (Loop B round 2).
+        return Ok(write_json(
+            &serde_json::json!({
+                "kind": "attachment",
+                "id": id,
+                "name": name,
+                "bytes": bytes.len(),
+                "out": dest.display().to_string(),
+            }),
+            0,
+        ));
+    }
+    crate::ui::ok(&format!(
+        "{} - {} written to {}",
+        crate::ui::sanitize(&name),
+        crate::ui::plural(bytes.len(), "byte", "bytes"),
+        dest.display()
+    ));
+    Ok(0)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -293,14 +541,14 @@ fn refuse(code: &'static str, message: impl Into<String>, exit: i32) -> Outcome 
 // Resolution
 // ---------------------------------------------------------------------------------------------
 
-enum Target {
+pub(crate) enum Target {
     Path(String),
     Id(Uuid),
 }
 
 /// Why one mount could not answer. Every variant is a SENTENCE the reader can act on; none of
 /// them is ever rendered as "the note does not exist".
-enum Miss {
+pub(crate) enum Miss {
     NeverSynced,
     /// The directory carries our `MOUNT.docli` — so this mirror WAS synced — but its state file
     /// is gone. `doctor` already has a name for it: `state-missing`.
@@ -426,7 +674,7 @@ impl Miss {
                               `docli sync --check` tests the mirror, and a `docli search` that \
                               does not report an incomplete index tests the server"
                 .into(),
-            Miss::Folder => "that is a folder - give `docli read` a note or file path, or an \
+            Miss::Folder => "that is a folder - give a note or file path, or an \
                              `--id` that names a note or a file"
                 .into(),
             Miss::Gone(e) => format!(
@@ -443,11 +691,6 @@ impl Miss {
             ),
         }
     }
-}
-
-enum Probe {
-    Hit(Box<Loaded>),
-    Miss(Miss),
 }
 
 struct Loaded {
@@ -478,7 +721,7 @@ struct Loaded {
 /// Held, or absent with a sentence. There is deliberately no third state: a graph we cannot read
 /// and a graph nobody fetched are both «not held», and the sentence is the only thing that
 /// differs.
-enum GraphSlot {
+pub(crate) enum GraphSlot {
     Held(Box<crate::graph::Graph>),
     Absent(&'static str),
 }
@@ -499,7 +742,7 @@ enum GraphSlot {
 /// relational claim, which is the one failure mode D5 exists to forbid, so it outranks the
 /// disclose-don't-refuse rule: a `mirror_not_usable` disclosure fires here too, but a caveat
 /// beside a confidently wrong list is not the same as not answering.
-fn graph_slot(control: &ControlRoot, ws: Uuid, st: &WsState) -> GraphSlot {
+pub(crate) fn graph_slot(control: &ControlRoot, ws: Uuid, st: &WsState) -> GraphSlot {
     if st.from_zero {
         return GraphSlot::Absent(GRAPH_REBUILDING);
     }
@@ -516,108 +759,89 @@ fn graph_slot(control: &ControlRoot, ws: Uuid, st: &WsState) -> GraphSlot {
     })
 }
 
-pub fn resolve(project: &Project, args: &ReadArgs, now: i64) -> Outcome {
-    let target = match (args.path.as_deref(), args.id) {
+/// The one address space, parsed: a server path or `--id`, exactly one of them. `usage` is the
+/// verb's own usage line, since two verbs share this.
+pub(crate) fn parse_target(
+    path: Option<&str>,
+    id: Option<Uuid>,
+    usage: &str,
+) -> Result<Target, Refusal> {
+    match (path, id) {
         (Some(p), None) => {
             let p = normalize_server_path(p);
             if p.is_empty() {
-                return refuse(
-                    "usage",
-                    "usage: docli read <server-path>   (the path `docli search` prints)",
-                    EXIT_FAILED,
-                );
+                return Err(Refusal {
+                    code: "usage",
+                    message: usage.to_string(),
+                    exit: EXIT_FAILED,
+                });
             }
-            Target::Path(p)
+            Ok(Target::Path(p))
         }
-        (None, Some(id)) => Target::Id(id),
-        _ => {
-            return refuse(
-                "usage",
-                "give exactly one address: a server path, or `--id <uuid>`",
-                EXIT_FAILED,
-            )
-        }
-    };
-    let mounts = match select_mounts(project, args.mount.as_deref()) {
-        Ok(m) => m,
-        Err(r) => return Outcome::Refused(r),
-    };
-    let control = project.control_root();
+        (None, Some(id)) => Ok(Target::Id(id)),
+        _ => Err(Refusal {
+            code: "usage",
+            message: "give exactly one address: a server path, or `--id <uuid>`".into(),
+            exit: EXIT_FAILED,
+        }),
+    }
+}
 
-    let mut hits: Vec<Loaded> = Vec::new();
+/// Which mount a hit came from — what the ambiguity refusal's `--mount` tokens are built from.
+pub(crate) struct MountKey {
+    pub name: String,
+    pub workspace: Uuid,
+}
+
+/// Ask every selected mount the same question and settle the answer the way `read` does (D2),
+/// so `related` — which asks about the same subject without opening its bytes — cannot drift
+/// into a second resolver.
+///
+/// Two mounts CAN hold one server path. Refuse rather than pick: picking would make the answer
+/// depend on mount order in `docli.toml`, which nothing in the output reveals. With one hit, the
+/// mounts that could not answer AT ALL come back as `unverified` names — the caller discloses
+/// that «this is the only copy» was not established (Codex round 1). With no hit, every mount's
+/// own reason is reported; a mount that could not answer dominates one that answered «not here»
+/// (the second is a fact about the mirror, the first a gap in what we know), and the precedence
+/// is TOTAL and mount-order-independent: `unavailable` outranks `usage` outranks
+/// `not_in_mirror`.
+pub(crate) fn across_mounts<T>(
+    project: &Project,
+    sel: Option<&str>,
+    mut probe: impl FnMut(&Mount) -> Result<(MountKey, T), Miss>,
+) -> Result<(T, Vec<String>), Refusal> {
+    let mounts = select_mounts(project, sel)?;
+    let mut hits: Vec<(MountKey, T)> = Vec::new();
     let mut misses: Vec<(String, Miss)> = Vec::new();
     for m in &mounts {
-        match probe(project, &control, m, &target, now) {
-            Probe::Hit(l) => hits.push(*l),
-            Probe::Miss(miss) => misses.push((m.display_name().to_string(), miss)),
+        match probe(m) {
+            Ok(hit) => hits.push(hit),
+            Err(miss) => misses.push((m.display_name().to_string(), miss)),
         }
     }
-
-    // Two mounts CAN hold one server path (D2). Refuse rather than pick: picking would make the
-    // answer depend on mount order in `docli.toml`, which nothing in the output reveals.
     if hits.len() > 1 {
-        let tokens: Vec<String> = hits.iter().map(|h| selector_token(project, h)).collect();
-        return refuse(
-            "ambiguous",
-            format!(
+        let tokens: Vec<String> = hits
+            .iter()
+            .map(|(k, _)| selector_token(project, k))
+            .collect();
+        return Err(Refusal {
+            code: "ambiguous",
+            message: format!(
                 "{} mounts hold the requested note or file - select one with `--mount`: {}",
                 hits.len(),
                 tokens.join(", ")
             ),
-            EXIT_FAILED,
-        );
+            exit: EXIT_FAILED,
+        });
     }
-    if let Some(hit) = hits.pop() {
-        // The staleness gate sits HERE — past the ambiguity refusal, so a second mount holding
-        // the same path is still an ambiguity rather than being silently resolved by which copy
-        // is fresh, and ahead of `serve`, because a refusal must print no body.
-        if hit.stale {
-            return refuse("stale", STALE_REFUSAL, EXIT_STALE);
-        }
-        // A sibling that could not answer at all leaves the uniqueness UNVERIFIED (Codex round
-        // 1). Serving is still right — the bytes we have are the bytes we have, and refusing
-        // would make one broken mount hide every other mount's notes — but D8's rule is that
-        // what cannot be vouched for is disclosed, and «this is the only copy» is exactly such a
-        // claim. Silent, it is the ambiguity refusal defeated by a mount that happens to be
-        // broken instead of by one that happens to hold the path.
-        let unverified: Vec<&str> = misses
+    if let Some((_, hit)) = hits.pop() {
+        let unverified = misses
             .iter()
             .filter(|(_, m)| !m.answered())
-            .map(|(name, _)| name.as_str())
+            .map(|(name, _)| name.clone())
             .collect();
-        return match serve(hit, args) {
-            Ok(mut s) => {
-                if !unverified.is_empty() {
-                    s.envelope.disclose(Disclosure {
-                        code: "mounts_unresolved",
-                        message: format!(
-                            "{} could not be consulted, so another mount may also hold the \
-                             requested note or file - select the intended mount with `--mount`; \
-                             `docli status` lists them",
-                            unverified
-                                .iter()
-                                .map(|n| format!("`{}`", crate::ui::sanitize(n)))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ),
-                    });
-                }
-                Outcome::Served(Box::new(s))
-            }
-            Err(r) => Outcome::Refused(r),
-        };
+        return Ok((hit, unverified));
     }
-
-    // Nothing held it. Report every mount's own reason — a single aggregated "not found" would
-    // hide the one case that matters (a mount whose state would not read said nothing about its
-    // contents at all).
-    // A mount that could not answer AT ALL dominates one that answered «not here»: the second is
-    // a fact about the mirror, the first is a gap in what we know. Its code travels with it.
-    //
-    // The precedence is TOTAL and mount-order-independent, deliberately: `unavailable` (our
-    // outage) outranks `usage` (the caller's mistake) outranks `not_in_mirror`. Taking the first
-    // exit-2 miss in `docli.toml` order would make the headline code depend on the order of a
-    // config file — the very thing the ambiguity refusal above refuses to let decide an answer.
     let rank = |m: &Miss| match m.code() {
         "unavailable" => 2,
         "usage" => 1,
@@ -637,7 +861,74 @@ pub fn resolve(project: &Project, args: &ReadArgs, now: i64) -> Outcome {
             .collect::<Vec<_>>()
             .join("\n")
     };
-    refuse(code, message, exit)
+    Err(Refusal {
+        code,
+        message,
+        exit,
+    })
+}
+
+/// The «another mount could not be consulted» disclosure both verbs attach to a served answer.
+pub(crate) fn unverified_disclosure(unverified: &[String]) -> Option<Disclosure> {
+    if unverified.is_empty() {
+        return None;
+    }
+    Some(Disclosure {
+        code: "mounts_unresolved",
+        message: format!(
+            "{} could not be consulted, so another mount may also hold the requested note or \
+             file - select the intended mount with `--mount`; `docli status` lists them",
+            unverified
+                .iter()
+                .map(|n| format!("`{}`", crate::ui::sanitize(n)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    })
+}
+
+pub fn resolve(project: &Project, args: &ReadArgs, now: i64) -> Outcome {
+    let target = match parse_target(
+        args.path.as_deref(),
+        args.id,
+        "usage: docli read <server-path>   (the path `docli search` prints)",
+    ) {
+        Ok(t) => t,
+        Err(r) => return Outcome::Refused(r),
+    };
+    let control = project.control_root();
+    let (hit, unverified) = match across_mounts(project, args.mount.as_deref(), |m| {
+        probe(project, &control, m, &target, now).map(|l| {
+            (
+                MountKey {
+                    name: l.mount.clone(),
+                    workspace: l.workspace,
+                },
+                l,
+            )
+        })
+    }) {
+        Ok(v) => v,
+        Err(r) => return Outcome::Refused(r),
+    };
+    // The staleness gate sits HERE — past the ambiguity refusal, so a second mount holding the
+    // same path is still an ambiguity rather than being silently resolved by which copy is
+    // fresh, and ahead of `serve`, because a refusal must print no body.
+    if hit.stale {
+        return refuse("stale", STALE_REFUSAL, EXIT_STALE);
+    }
+    // Serving over an unconsulted sibling is still right — the bytes we have are the bytes we
+    // have, and refusing would make one broken mount hide every other mount's notes — but D8's
+    // rule is that what cannot be vouched for is disclosed.
+    match serve(hit, args) {
+        Ok(mut s) => {
+            if let Some(d) = unverified_disclosure(&unverified) {
+                s.envelope.disclose(d);
+            }
+            Outcome::Served(Box::new(s))
+        }
+        Err(r) => Outcome::Refused(r),
+    }
 }
 
 /// A `--mount` token that really would select this hit.
@@ -647,10 +938,10 @@ pub fn resolve(project: &Project, args: &ReadArgs, now: i64) -> Outcome {
 /// to exactly this mount. Re-deriving the condition (uniqueness among names, say) is the «two
 /// readers of one question» defect: a name can also collide with another mount's workspace id,
 /// and a hand-written uniqueness check would happily print a token the resolver then refuses.
-fn selector_token(project: &Project, l: &Loaded) -> String {
-    match select_mounts(project, Some(&l.mount)) {
-        Ok(m) if m.len() == 1 && m[0].workspace == l.workspace => crate::ui::sanitize(&l.mount),
-        _ => l.workspace.to_string(),
+fn selector_token(project: &Project, k: &MountKey) -> String {
+    match select_mounts(project, Some(&k.name)) {
+        Ok(m) if m.len() == 1 && m[0].workspace == k.workspace => crate::ui::sanitize(&k.name),
+        _ => k.workspace.to_string(),
     }
 }
 
@@ -670,7 +961,10 @@ fn normalize_server_path(p: &str) -> String {
 /// Display names are not unique — `validate_config` enforces uniqueness on `workspace` only — so
 /// an ambiguous name is REFUSED with the ids that disambiguate it, rather than resolved by
 /// position (open item 3).
-fn select_mounts<'a>(project: &'a Project, sel: Option<&str>) -> Result<Vec<&'a Mount>, Refusal> {
+pub(crate) fn select_mounts<'a>(
+    project: &'a Project,
+    sel: Option<&str>,
+) -> Result<Vec<&'a Mount>, Refusal> {
     let all: Vec<&Mount> = project.config.mounts.iter().collect();
     let Some(sel) = sel else {
         return Ok(all);
@@ -737,13 +1031,23 @@ fn select_mounts<'a>(project: &'a Project, sel: Option<&str>) -> Result<Vec<&'a 
     })
 }
 
-fn probe(
+/// What `probe` establishes BEFORE it opens any bytes — and all that `related` needs: the mount's
+/// state, the node the target names, and the staleness marks (loaded here, ahead of any read —
+/// «marks before bytes» is the gate's whole correctness, see `probe`).
+pub(crate) struct Located {
+    pub mount_root: PathBuf,
+    pub st: WsState,
+    pub id: Uuid,
+    pub node: NodeState,
+    pub marks: crate::state::StaleMarks,
+}
+
+pub(crate) fn locate(
     project: &Project,
     control: &ControlRoot,
     mount: &Mount,
     target: &Target,
-    now: i64,
-) -> Probe {
+) -> Result<Located, Miss> {
     let mount_root = mount_abs(&project.root, mount);
     // STATE FIRST, then identity — the same order `search_cmd::read_local` takes, and for the
     // reason that made it right there. State lives in the CONTROL ROOT — `~/.docli/state/<ws>.json`
@@ -761,16 +1065,16 @@ fn probe(
     // — it is also what tells a mount that was never synced apart from one whose RECORD was lost.
     let claimed = crate::mountfs::verify_mount_identity(&mount_root, &control.dir, mount.workspace);
     let st = match control.load_state(mount.workspace) {
-        Err(e) => return Probe::Miss(Miss::StateUnreadable(format!("{e:#}"))),
+        Err(e) => return Err(Miss::StateUnreadable(format!("{e:#}"))),
         // No state and no claim: nothing was ever synced here. That IS an answer.
-        Ok(None) if !claimed => return Probe::Miss(Miss::NeverSynced),
+        Ok(None) if !claimed => return Err(Miss::NeverSynced),
         // No state but the directory carries our marker: it was synced, and we lost the record
         // of what it holds — the mirror may hold the note perfectly well. Not an answer.
-        Ok(None) => return Probe::Miss(Miss::StateLost),
+        Ok(None) => return Err(Miss::StateLost),
         Ok(Some(st)) => st,
     };
     if !claimed {
-        return Probe::Miss(Miss::NotThisMirror);
+        return Err(Miss::NotThisMirror);
     }
     // MARKS BEFORE BYTES, and the order is the whole of this gate's correctness (Codex round 1).
     //
@@ -784,28 +1088,53 @@ fn probe(
     //
     // An absent or unreadable file is simply NO marks — `read` stays offline, and the gate
     // degrades to the v0.29.0 behaviour rather than to a refusal.
-    let marked = control.load_marks(mount.workspace);
+    let marks = control.load_marks(mount.workspace);
     // PARKS FIRST (open item 1). A parked node is absent from `state.nodes` BY CONSTRUCTION, so
     // a nodes-miss checked first makes every park case unreachable and the reader gets the
     // generic "this mirror does not hold it" over a node whose exact reason we know.
     if let Some(park) = find_park(&st, target) {
-        return Probe::Miss(Miss::Parked(park.class, park.reason.clone()));
+        return Err(Miss::Parked(park.class, park.reason.clone()));
     }
     let Some((id, node)) = find_node(&st, target) else {
-        return Probe::Miss(match target {
+        return Err(match target {
             Target::Id(id) if st.ledger.contains(id) => Miss::LedgerOnly,
             _ => Miss::NotHeld,
         });
     };
     if node.kind == TrackedKind::Folder {
-        return Probe::Miss(Miss::Folder);
+        return Err(Miss::Folder);
     }
-    let (abs, containment_root) = match file_abs(&project.root, control, &mount_root, mount, node) {
+    let node = node.clone();
+    Ok(Located {
+        mount_root,
+        st,
+        id,
+        node,
+        marks,
+    })
+}
+
+fn probe(
+    project: &Project,
+    control: &ControlRoot,
+    mount: &Mount,
+    target: &Target,
+    now: i64,
+) -> Result<Loaded, Miss> {
+    let Located {
+        mount_root,
+        st,
+        id,
+        node,
+        marks,
+    } = locate(project, control, mount, target)?;
+    let (abs, containment_root) = match file_abs(&project.root, control, &mount_root, mount, &node)
+    {
         Ok(v) => v,
         // A state record we cannot turn into a path at all — an attachment with no marker
         // recorded, a stored path that escapes containment, a project root that will not
         // resolve — is a failure to look, never a statement about what the mirror holds.
-        Err(e) => return Probe::Miss(Miss::Unreadable(e)),
+        Err(e) => return Err(Miss::Unreadable(e)),
     };
     // Canonical containment: `contained_join` is lexical, so a symlink planted inside the mirror
     // would otherwise let `docli read` print any file the user can open. Canonicalizing also
@@ -820,14 +1149,14 @@ fn probe(
     let real = match crate::mountfs::canonical_within(&containment_root, &abs) {
         crate::mountfs::Containment::Inside(real) => real,
         crate::mountfs::Containment::Missing => {
-            return Probe::Miss(Miss::Gone("nothing is at that path".into()))
+            return Err(Miss::Gone("nothing is at that path".into()))
         }
         // It exists — it is just not ours. A fact about this mirror, so exit 3; and a sentence
         // that does not claim the file vanished, because it did not.
-        crate::mountfs::Containment::Escaped => return Probe::Miss(Miss::Escaped),
+        crate::mountfs::Containment::Escaped => return Err(Miss::Escaped),
         // We could not look. Same rule as the read below: never exit 3, never «answered».
         crate::mountfs::Containment::Unresolvable(e) => {
-            return Probe::Miss(Miss::Unreadable(e.to_string()))
+            return Err(Miss::Unreadable(e.to_string()))
         }
     };
     let bytes = match std::fs::read(&real) {
@@ -837,24 +1166,24 @@ fn probe(
         // (`NotFound` is still reachable despite the resolve above — the file can go between
         // resolving it and opening it.)
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Probe::Miss(Miss::Gone(e.to_string()))
+            return Err(Miss::Gone(e.to_string()))
         }
-        Err(e) => return Probe::Miss(Miss::Unreadable(e.to_string())),
+        Err(e) => return Err(Miss::Unreadable(e.to_string())),
     };
-    Probe::Hit(Box::new(Loaded {
+    Ok(Loaded {
         mount: mount.display_name().to_string(),
         workspace: mount.workspace,
         id,
-        node: node.clone(),
         bytes,
         unusable: st.unusable_reason(mount.folder.as_deref(), now),
         graph: graph_slot(control, mount.workspace, &st),
         scoped: mount.folder.is_some(),
-        // From the snapshot taken ABOVE, before the bytes were read — and resolved against the
-        // stamp this mirror actually holds, so a mark the mirror has since caught up with is
+        // From the snapshot taken in `locate`, before the bytes were read — and resolved against
+        // the stamp this mirror actually holds, so a mark the mirror has since caught up with is
         // simply satisfied rather than needing to have been removed.
-        stale: marked.contradict(id, node.rev),
-    }))
+        stale: marks.contradict(id, node.rev),
+        node,
+    })
 }
 
 fn find_park<'a>(st: &'a WsState, t: &Target) -> Option<&'a Park> {
@@ -971,13 +1300,7 @@ fn serve(mut l: Loaded, args: &ReadArgs) -> Result<Served, Refusal> {
         });
     }
     if let Some(reason) = l.unusable {
-        disclosures.push(Disclosure {
-            code: "mirror_not_usable",
-            message: format!(
-                "the local mirror cannot be vouched for right now - {reason}; \
-                 `docli sync --check` either clears the condition or names the fix"
-            ),
-        });
+        disclosures.push(crate::related_cmd::mirror_not_usable(reason));
     }
     let text = match String::from_utf8(std::mem::take(&mut l.bytes)) {
         Ok(t) => t,
@@ -1361,68 +1684,86 @@ fn broken_pipe(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::BrokenPipe
 }
 
-fn render(outcome: Outcome, json: bool) -> i32 {
-    match outcome {
-        Outcome::Refused(r) => {
-            if json {
-                // A machine caller gets a parseable answer even on a refusal — an agent that has
-                // to fall back to reading stderr prose is an agent that will guess.
-                let body = serde_json::json!({"error": {"code": r.code, "message": r.message}});
-                match write_product(&body.to_string(), true) {
-                    // The reader hung up. The answer was produced; the refusal's own code stands.
-                    Ok(()) => r.exit,
-                    Err(e) if broken_pipe(&e) => r.exit,
-                    // Anything else and the JSON never landed, so `r.exit` would be a LIE: exit 3
-                    // over an undelivered answer is indistinguishable from «not in this mirror»,
-                    // which is the one conclusion this verb must never let a caller draw by
-                    // accident.
-                    Err(e) => {
-                        crate::ui::refuse(&format!("could not write the refusal: {e}"));
-                        EXIT_FAILED
-                    }
-                }
-            } else {
-                for line in r.message.lines() {
-                    crate::ui::refuse(line);
-                }
-                r.exit
+/// Render a refusal in either mode — shared with `related`, whose refusals ARE `read`'s (the
+/// subject is located the same way).
+pub(crate) fn render_refusal(r: &Refusal, json: bool) -> i32 {
+    if json {
+        // A machine caller gets a parseable answer even on a refusal — an agent that has
+        // to fall back to reading stderr prose is an agent that will guess.
+        let body = serde_json::json!({"error": {"code": r.code, "message": r.message}});
+        match write_product(&body.to_string(), true) {
+            // The reader hung up. The answer was produced; the refusal's own code stands.
+            Ok(()) => r.exit,
+            Err(e) if broken_pipe(&e) => r.exit,
+            // Anything else and the JSON never landed, so `r.exit` would be a LIE: exit 3
+            // over an undelivered answer is indistinguishable from «not in this mirror»,
+            // which is the one conclusion this verb must never let a caller draw by
+            // accident.
+            Err(e) => {
+                crate::ui::refuse(&format!("could not write the refusal: {e}"));
+                EXIT_FAILED
             }
         }
-        Outcome::Served(s) => {
-            // Disclosures go to STDERR in both modes (D8: never into `content`, and never into
-            // the stdout product). Under `--json` they also ride the envelope, which is the
-            // surface a machine reads.
-            for d in s.envelope.disclosures() {
-                crate::ui::warn(&d.message);
+    } else {
+        for line in r.message.lines() {
+            crate::ui::refuse(line);
+        }
+        r.exit
+    }
+}
+
+/// Write one machine-readable value to stdout and translate the write's fate into an exit code
+/// the way `read` does: a closed pipe is the reader's decision (the answer was produced), any
+/// other failure is ours. Shared with `related`.
+pub(crate) fn write_json(value: &impl Serialize, exit_when_written: i32) -> i32 {
+    match serde_json::to_string_pretty(value) {
+        Ok(text) => match write_product(&text, true) {
+            Ok(()) => exit_when_written,
+            Err(e) if broken_pipe(&e) => exit_when_written,
+            Err(e) => {
+                crate::ui::refuse(&format!("could not write the result: {e}"));
+                EXIT_FAILED
             }
-            if let Some(n) = &s.note {
-                crate::ui::detail(n);
-            }
-            let written = if json {
-                match serde_json::to_string_pretty(&s.envelope) {
-                    Ok(text) => write_product(&text, true),
-                    Err(e) => {
-                        crate::ui::refuse(&format!("could not render the envelope: {e}"));
-                        return EXIT_FAILED;
-                    }
-                }
-            } else {
-                // The body is bytes-as-asked, not a UI line: no prefix, no styling, no
-                // `--quiet` suppression.
-                write_product(
-                    &s.body,
-                    needs_closing_newline(&s.body, console::Term::stdout().is_term()),
-                )
-            };
-            match written {
-                Ok(()) => 0,
-                // The reader hung up. It got what it asked for; so did we.
-                Err(e) if broken_pipe(&e) => 0,
-                Err(e) => {
-                    crate::ui::refuse(&format!("could not write the result: {e}"));
-                    EXIT_FAILED
-                }
-            }
+        },
+        Err(e) => {
+            crate::ui::refuse(&format!("could not render the envelope: {e}"));
+            EXIT_FAILED
+        }
+    }
+}
+
+fn render(outcome: Outcome, json: bool) -> i32 {
+    match outcome {
+        Outcome::Refused(r) => render_refusal(&r, json),
+        Outcome::Served(s) => render_served(&s, json),
+    }
+}
+
+fn render_served(s: &Served, json: bool) -> i32 {
+    // Disclosures go to STDERR in both modes (D8: never into `content`, and never into
+    // the stdout product). Under `--json` they also ride the envelope, which is the
+    // surface a machine reads.
+    for d in s.envelope.disclosures() {
+        crate::ui::warn(&d.message);
+    }
+    if let Some(n) = &s.note {
+        crate::ui::detail(n);
+    }
+    if json {
+        return write_json(&s.envelope, 0);
+    }
+    // The body is bytes-as-asked, not a UI line: no prefix, no styling, no
+    // `--quiet` suppression.
+    match write_product(
+        &s.body,
+        needs_closing_newline(&s.body, console::Term::stdout().is_term()),
+    ) {
+        Ok(()) => 0,
+        // The reader hung up. It got what it asked for; so did we.
+        Err(e) if broken_pipe(&e) => 0,
+        Err(e) => {
+            crate::ui::refuse(&format!("could not write the result: {e}"));
+            EXIT_FAILED
         }
     }
 }
@@ -1560,6 +1901,108 @@ mod tests {
 
     /// The whole point of the slice: a note the server named is REFUSED, with its own code, and
     /// no body is printed.
+    /// The batch keeps the WORST code in `read`'s own order: a failure to look (2) over a set that
+    /// also holds a «not in this mirror» (3) must not exit 3 — that is the conclusion this verb
+    /// never lets a caller draw by accident.
+    #[test]
+    fn a_batch_reports_the_worst_code_by_severity_not_by_number() {
+        let f = fx(&[("mirror", 1, Some("m"))]);
+        put_note(&f, "mirror", 1, 1, "a.md", "body");
+        let req = |paths: &[&str]| ReadRequest {
+            paths: paths.iter().map(|p| p.to_string()).collect(),
+            id: None,
+            mount: None,
+            lines: None,
+            json: true,
+            out: None,
+            force: false,
+        };
+        // Held + not held ⇒ 3.
+        assert_eq!(
+            run(&f.project, &req(&["a.md", "nowhere.md"]), None).unwrap(),
+            EXIT_NOT_IN_MIRROR
+        );
+        // …and an address this verb refuses as a caller's mistake (a folder) outranks it: 2.
+        put_file(
+            &f,
+            "mirror",
+            1,
+            9,
+            "dir",
+            "dir",
+            "",
+            TrackedKind::Folder,
+            None,
+        );
+        assert_eq!(
+            run(&f.project, &req(&["nowhere.md", "dir"]), None).unwrap(),
+            EXIT_FAILED
+        );
+    }
+
+    fn out_req(paths: &[&str], out: &std::path::Path, force: bool) -> ReadRequest {
+        ReadRequest {
+            paths: paths.iter().map(|p| p.to_string()).collect(),
+            id: None,
+            mount: None,
+            lines: None,
+            json: true,
+            out: Some(out.to_path_buf()),
+            force,
+        }
+    }
+
+    /// `--out` (v0.29.9 Part B): every refusal happens BEFORE any fetch, so they are testable with
+    /// no api — several paths, a note subject, a destination inside a mirror, an existing file.
+    #[test]
+    fn out_refuses_before_it_fetches() {
+        let f = fx(&[("mirror", 1, Some("m"))]);
+        put_note(&f, "mirror", 1, 1, "a.md", "body");
+        put_file(
+            &f,
+            "mirror",
+            1,
+            2,
+            "p.png",
+            "p.png.docli",
+            "id 00000000-0000-0000-0000-000000000002\nmime image/png\nsize 10\n",
+            TrackedKind::Attachment,
+            None,
+        );
+        let elsewhere = tempfile::tempdir().unwrap();
+        let dest = elsewhere.path().join("p.png");
+        // Several paths: refused, nothing written.
+        let code = run(&f.project, &out_req(&["p.png", "a.md"], &dest, false), None).unwrap();
+        assert_eq!(code, EXIT_FAILED);
+        assert!(!dest.exists());
+        // A NOTE subject: refused.
+        assert_eq!(
+            run(&f.project, &out_req(&["a.md"], &dest, false), None).unwrap(),
+            EXIT_FAILED
+        );
+        // A destination inside the mirror — through the mount root's canonical form, so a bare
+        // filename resolved against the working directory would be caught the same way.
+        let inside = f.project.root.join("mirror").join("fetched.png");
+        assert_eq!(
+            run(&f.project, &out_req(&["p.png"], &inside, false), None).unwrap(),
+            EXIT_FAILED
+        );
+        assert!(!inside.exists());
+        // An existing file without --force: refused before any fetch.
+        std::fs::write(&dest, b"old").unwrap();
+        assert_eq!(
+            run(&f.project, &out_req(&["p.png"], &dest, false), None).unwrap(),
+            EXIT_FAILED
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"old");
+        // A missing destination directory is refused, not created.
+        let missing = elsewhere.path().join("no-such-dir").join("p.png");
+        assert_eq!(
+            run(&f.project, &out_req(&["p.png"], &missing, false), None).unwrap(),
+            EXIT_FAILED
+        );
+    }
+
     #[test]
     fn a_marked_note_exits_four_and_serves_nothing() {
         let f = fx(&[("m", 1, None)]);

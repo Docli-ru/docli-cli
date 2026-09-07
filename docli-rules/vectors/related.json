@@ -1,0 +1,62 @@
+{
+  "_": [
+    "v0.29.9 D5/D7 — `related` evaluated over the shipped artifact, pinned as shared vectors.",
+    "",
+    "Two implementations evaluate one artifact on opposite ends of the sync wire: the api's lexical",
+    "arm (cosine over the per-note vectors, then core's `fuse`) and the CLI's `docli related`",
+    "(the same cosine from docli-rules, its own fifteen-line RRF). They ship on different release",
+    "trains, so this file is the contract.",
+    "",
+    "SEQUENCE is pinned here, unlike graph.json: `related` is a ranked list and its parity claim is",
+    "rank order. Fusion breaks score ties by PATH under Rust `String::cmp` on both sides — byte",
+    "order, no collation anywhere in fusion — so the order is reproducible without a collation",
+    "engine. The lexical arm breaks cosine ties by NODE ID ascending; the fixture's ids are",
+    "assigned in `subjects` order (`Uuid::from_u128(position + 1)`), so an earlier subject wins a tie.",
+    "",
+    "The rules under test, stated once: (1) lexical candidates = every OTHER note row with cosine",
+    "> 0, ordered (cosine desc, id asc), the EXCLUSION set dropped BEFORE truncation to 20 and",
+    "trashed candidates dropped AFTER it (the server's `names_for_ids` order); (2) the two HELD arms",
+    "are the server's own top-20 lists and only ever SHRINK under the client's fresher exclusion and",
+    "liveness; (3) RRF k=60, weights 1/1/1, the lexical arm weighted 0.4 when the subject's word",
+    "count is under 150; (4) an attachment subject has no vector and no lexical arm.",
+    "",
+    "Tied cosines are constructed to be bit-identical (identical candidate vectors), never merely",
+    "close: two f32 results agree only when they are the same arithmetic.",
+    "",
+    "Tags are interned into `dict` like lexemes — it is a string table. `excluded` lists the ids the",
+    "client's fresher exclusion set names BEYOND self. Synthetic fixture only — this crate is MIT",
+    "and ships in the public CLI mirror, so real workspace paths must never land here."
+  ],
+  "dict": ["alpha", "beta", "gamma", "delta", "proj", "work"],
+  "subjects": [
+    { "key": "s", "kind": "file", "path": "s.md", "trashed": false, "note": { "wc": 300, "terms": [[0, 1.0], [1, 1.0]] }, "graph": [["g", 2], ["a", 1], ["x", 1]], "tags": [["c", [4]], ["h", [4]]] },
+    { "key": "q", "kind": "file", "path": "q.md", "trashed": false, "note": { "wc": 100, "terms": [[2, 1.0]] }, "graph": [["a", 1]], "tags": [["b", [5]]] },
+    { "key": "a", "kind": "file", "path": "a.md", "trashed": false, "note": { "wc": 200, "terms": [[0, 1.0]] }, "graph": [], "tags": [] },
+    { "key": "b", "kind": "file", "path": "b.md", "trashed": false, "note": { "wc": 200, "terms": [[0, 1.0], [1, 1.0]] }, "graph": [], "tags": [] },
+    { "key": "c", "kind": "file", "path": "c.md", "trashed": false, "note": { "wc": 200, "terms": [[1, 1.0], [2, 1.0]] }, "graph": [], "tags": [] },
+    { "key": "d", "kind": "file", "path": "d.md", "trashed": false, "note": { "wc": 200, "terms": [[1, 1.0]] }, "graph": [], "tags": [] },
+    { "key": "e", "kind": "file", "path": "e.md", "trashed": false, "note": { "wc": 200, "terms": [[3, 1.0]] }, "graph": [], "tags": [] },
+    { "key": "f", "kind": "file", "path": "f.md", "trashed": false, "note": { "wc": 200, "terms": [[2, 1.0], [3, 1.0]] }, "graph": [], "tags": [] },
+    { "key": "g", "kind": "file", "path": "0-g.md", "trashed": false, "note": { "wc": 200, "terms": [[3, 1.0]] }, "graph": [], "tags": [] },
+    { "key": "h", "kind": "file", "path": "h.md", "trashed": true, "note": { "wc": 200, "terms": [[3, 1.0]] }, "graph": [], "tags": [] },
+    { "key": "t", "kind": "file", "path": "t.md", "trashed": true, "note": { "wc": 200, "terms": [[0, 1.0]] }, "graph": [], "tags": [] },
+    { "key": "x", "kind": "file", "path": "x.md", "trashed": false, "note": { "wc": 200, "terms": [[0, 1.0], [1, 1.0]] }, "graph": [], "tags": [] },
+    { "key": "p", "kind": "attachment", "path": "p.png", "trashed": false, "note": null, "graph": [["a", 1]], "tags": [] }
+  ],
+  "excluded": { "s": ["x"], "q": [], "p": [] },
+  "expect": {
+    "_": [
+      "s (wc 300, full lexical weight): cosines b 1.0, x 1.0 (EXCLUDED, dropped before truncation),",
+      "a/d/t 0.7071 tied → id order a, d, t; t is trashed → dropped after; c 0.5. Held graph",
+      "[g, a, x] shrinks to [g, a]; held tags [c, h] shrink to [c]. RRF: a = 1/62 + 1/62 (graph r2,",
+      "lexical r2) > c = 1/64 + 1/61 > g = 1/61 = b = 1/61 (TIE → path: `0-g.md` < `b.md`) > d = 1/63.",
+      "",
+      "q (wc 100, lexical weight 0.4): cosines c 0.7071, f 0.7071 tied → id order c, f. RRF: a = 1/61",
+      "(graph) = b = 1/61 (tags) → path tie `a.md` < `b.md`; c = 0.4/61; f = 0.4/62.",
+      "",
+      "p (attachment): no lexical arm; graph [a] → [a]."
+    ],
+    "lexical": { "s": ["b", "a", "d", "c"], "q": ["c", "f"], "p": [] },
+    "fused": { "s": ["a", "c", "g", "b", "d"], "q": ["a", "b", "c", "f"], "p": ["a"] }
+  }
+}

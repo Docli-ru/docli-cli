@@ -1005,7 +1005,9 @@ pub fn allow_codex_refresh(_project_root: &Path) -> Result<bool> {
     }
 }
 
-pub fn wired_here(project_root: &Path, server: &str) -> Vec<String> {
+/// Which agents' project configs carry OUR MCP entry, as `(key, display)` — `status` renders the
+/// display names, the wizard pre-ticks the keys (v0.29.9 Part B).
+pub fn wired_here(project_root: &Path, server: &str) -> Vec<(&'static str, &'static str)> {
     let needle = server.trim_end_matches('/');
     let mut out = Vec::new();
     for def in AGENTS {
@@ -1017,7 +1019,26 @@ pub fn wired_here(project_root: &Path, server: &str) -> Vec<String> {
         };
         if entry_points_at(def, &body, needle) {
             // `display` already names the file it writes; appending `rel` printed it twice.
-            out.push(def.display.to_string());
+            out.push((def.key, def.display));
+        }
+    }
+    out
+}
+
+/// Which agents docli has ALREADY wired in this project — an MCP entry pointing at `server`, or
+/// the mirror contract copied into the agent's own skills directory. The set the pickers pre-tick
+/// (v0.29.9 Part B), derived in ONE place for the wizard and the flag path.
+pub fn wired_or_skilled_here(project_root: &Path, server: &str) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = wired_here(project_root, server)
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    for a in AGENTS {
+        let skilled = a
+            .skill_copy_dir
+            .is_some_and(|d| project_root.join(d).join("SKILL.md").is_file());
+        if skilled && !out.contains(&a.key) {
+            out.push(a.key);
         }
     }
     out
@@ -1865,7 +1886,7 @@ mod tests {
             .unwrap();
             let wired = wired_here(root, server);
             assert!(
-                !wired.iter().any(|w| w.contains("Claude")),
+                !wired.iter().any(|(_, w)| w.contains("Claude")),
                 "{url} is not the MCP route: {wired:?}"
             );
         }
@@ -1882,7 +1903,7 @@ mod tests {
             assert!(
                 wired_here(root, server)
                     .iter()
-                    .any(|w| w.contains("Claude")),
+                    .any(|(_, w)| w.contains("Claude")),
                 "{url} should count"
             );
         }
@@ -1905,7 +1926,7 @@ mod tests {
             .unwrap();
             let wired = wired_here(root, server);
             assert!(
-                !wired.iter().any(|w| w.contains("Claude")),
+                !wired.iter().any(|(_, w)| w.contains("Claude")),
                 "{url} is not a servable route: {wired:?}"
             );
         }
@@ -1917,7 +1938,7 @@ mod tests {
         .unwrap();
         assert!(!wired_here(root, server)
             .iter()
-            .any(|w| w.contains("Claude")));
+            .any(|(_, w)| w.contains("Claude")));
 
         // A LOOKALIKE host must not pass: `docli.ru.evil` is not `docli.ru`.
         fs::write(
@@ -1927,7 +1948,7 @@ mod tests {
         .unwrap();
         let wired = wired_here(root, server);
         assert!(
-            !wired.iter().any(|w| w.contains("Claude")),
+            !wired.iter().any(|(_, w)| w.contains("Claude")),
             "an unbounded prefix accepted a lookalike origin: {wired:?}"
         );
 
@@ -1939,7 +1960,7 @@ mod tests {
         .unwrap();
         let wired = wired_here(root, server);
         assert!(
-            !wired.iter().any(|w| w.contains("Codex")),
+            !wired.iter().any(|(_, w)| w.contains("Codex")),
             "prefix match leaked: {wired:?}"
         );
         fs::write(
@@ -1950,7 +1971,7 @@ mod tests {
         .unwrap();
         let wired = wired_here(root, server);
         assert!(
-            !wired.iter().any(|w| w.contains("Codex")),
+            !wired.iter().any(|(_, w)| w.contains("Codex")),
             "a following table's url was read as ours: {wired:?}"
         );
     }

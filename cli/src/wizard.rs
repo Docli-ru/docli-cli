@@ -400,34 +400,41 @@ pub fn has_intent(args: &init_cmd::InitArgs) -> bool {
         || args.instructions
 }
 
-/// The ONE agent picker: every configuration on one screen, the ones detected here already
-/// ticked, and writing limited to what stays ticked. Shared with the flag path's prompt so
-/// there is a single answer to «which configs am I about to change» — 0.1.0 had a free-text
-/// list where a bare Enter meant «all five detected», which is how five configs got written
-/// by someone who meant to look at the list first.
-pub fn pick_agents(detected: &[&'static str]) -> Result<Vec<&'static str>> {
+/// The ONE agent picker: every configuration on one screen, and writing limited to what stays
+/// ticked. Shared with the flag path's prompt so there is a single answer to «which configs am
+/// I about to change» — 0.1.0 had a free-text list where a bare Enter meant «all five
+/// detected», which is how five configs got written by someone who meant to look at the list
+/// first.
+///
+/// `detected` are the agents whose configs exist here; `wired` are the ones docli ALREADY wired
+/// (an MCP entry pointing at this server, or the contract copied into the agent's skills
+/// directory). Only `wired` arrives ticked (user ruling 2026-09-06, superseding the 2026-09-03
+/// «nothing is pre-ticked» on a different axis): that earlier ruling was about DETECTED configs
+/// — not writing every config found — and it stands; this one is about DOCLI-WRITTEN configs,
+/// where the box describes the state the reader is looking at, so `init` re-run stays
+/// idempotent instead of quietly dropping a wiring on a bare Enter (the same reasoning the
+/// workspace picker already follows). At least one must be picked: a setup that wires nothing
+/// is almost never what was wanted, so an empty pick asks again rather than proceeding.
+pub fn pick_agents(detected: &[&'static str], wired: &[&'static str]) -> Result<Vec<&'static str>> {
     let all: Vec<&crate::agents::AgentDef> = crate::agents::AGENTS.iter().collect();
     let items: Vec<String> = all
         .iter()
         .map(|a| {
-            if detected.contains(&a.key) {
+            if wired.contains(&a.key) {
+                format!("{}  {}", a.display, ui::dim("(wired here)"))
+            } else if detected.contains(&a.key) {
                 format!("{}  {}", a.display, ui::dim("(found here)"))
             } else {
                 a.display.to_string()
             }
         })
         .collect();
-    // NOTHING is pre-ticked, and at least one must be picked (user ruling 2026-09-03). This
-    // REVERSES v0.28.2's «detected configurations arrive pre-ticked»: that rule was written to
-    // stop `docli init` writing every config it found, and a pre-ticked box is still a box the
-    // reader has to notice and clear. The choice is theirs to make, not ours to make and theirs
-    // to undo — and a setup that wires nothing is almost never what was wanted, so an empty
-    // pick asks again rather than proceeding.
+    let defaults: Vec<bool> = all.iter().map(|a| wired.contains(&a.key)).collect();
     let chosen = loop {
         let picked = MultiSelect::with_theme(&prompt_theme())
             .with_prompt("Where to wire this project's MCP connection (pick at least one)")
             .items(&items)
-            .defaults(&vec![false; items.len()])
+            .defaults(&defaults)
             .interact()?;
         if !picked.is_empty() {
             break picked;
@@ -473,7 +480,9 @@ fn pick_enforcement(
              enforcement at all.",
         );
         let items: Vec<String> = candidates.iter().map(|a| a.display().to_string()).collect();
-        // TICKED (user ruling 2026-09-03), reversing v0.28.6 D6's «offered UNTICKED». The
+        // TICKED (user ruling 2026-09-03), reversing v0.28.6 D6's «offered UNTICKED». The v0.29.9
+        // pre-tick rule for docli-written configs changes nothing here: every hook is ticked
+        // already, installed or not, so `hooks::status` need not be consulted. The
         // argument for unticking was that a hook runs a program while a config entry only names
         // a server — true, and the reason the offer still spells out exactly what is written and
         // where. But a lone «no» sitting among yeses reads as a warning the reader cannot
@@ -735,11 +744,12 @@ pub fn run(cwd: &Path, server_flag: Option<&str>) -> Result<i32> {
     // ── 5. Агенты ────────────────────────────────────────────────────────────────────────
     ui::step(4, STEPS, "Coding agents");
     let detected = crate::agents::detect(cwd, std::env::home_dir().as_deref());
+    let wired = crate::agents::wired_or_skilled_here(cwd, &server);
     ui::detail(
-        "Space toggles, Enter confirms. The configurations found here are ticked; only what \
-         stays ticked is written.",
+        "Space toggles, Enter confirms. The agents docli already wired here are ticked; the \
+         ones merely found here are not. Only what stays ticked is written.",
     );
-    let agents = pick_agents(&detected)?;
+    let agents = pick_agents(&detected, &wired)?;
 
     // ── 6. Правила и хуки ────────────────────────────────────────────────────────────────
     ui::step(5, STEPS, "Rules and enforcement");

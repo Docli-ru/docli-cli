@@ -276,7 +276,10 @@ pub fn gather(cwd: &Path, server: &str) -> Result<Status> {
             }
         }
     }
-    status.agents_wired = crate::agents::wired_here(&root, &project.config.server);
+    status.agents_wired = crate::agents::wired_here(&root, &project.config.server)
+        .into_iter()
+        .map(|(_, display)| display.to_string())
+        .collect();
     status.hooks = crate::hooks::HookAgent::all()
         .into_iter()
         .map(|a| {

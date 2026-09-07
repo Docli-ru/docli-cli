@@ -30,6 +30,14 @@ Two rules, and both fire on an **event**, not on your judgement of whether you n
   `docli.toml`, no mount here, not installed. **A broken CLI is not a reason to stop**: the notes
   are still reachable with `search_notes`/`read_note`, and an unanswered question is worse than a
   slower answer. Always use the MCP tools to write.
+- **If `docli` is not installed here, nothing is lost — the notes stay reachable over the docli
+  MCP connection, and installing the CLI is optional.** It buys offline reads, cheaper searches
+  and `docli related`. One line installs it — `curl -fsSL https://docli.ru/install.sh | sh`
+  (macOS / Linux) or `irm https://docli.ru/install.ps1 | iex` (Windows PowerShell) — then
+  `docli login` signs the device in (a browser round; `docli login --token -` or `DOCLI_TOKEN`
+  where there is no browser) and `docli sync` fetches the mirror. When `docli.toml` is committed
+  beside this file (the normal case) no `docli init` is needed; when a project keeps it local,
+  `docli init` once.
 - **The fallback is PER VERB, not per CLI.** The verbs have different dependencies: `sync` needs the
   network AND a writable `~/.docli`; `search` needs the network; **`read` needs neither** — it serves
   the local mirror offline. So a failing `docli sync` says nothing about `docli read`, and «the CLI
@@ -61,7 +69,19 @@ Two rules, and both fire on an **event**, not on your judgement of whether you n
 - **`docli read` answers the note's graph too** — `links`, `backlinks`, `embeds`, `unresolved`,
   `tags`, `title`, `aliases` under `--json`, and a counts line on stderr without it. The server
   computes it; the CLI only holds it. An empty list means empty; a `null` plus its `absent` entry
-  means the CLI does not know, and that entry names the fix.
+  means the CLI does not know, and that entry names the fix. Several paths read several notes.
+- **`docli related <path>` ranks the notes and files related to a note or file, offline** — the
+  MCP tool `related_notes`' three arms, evaluated from an artifact the server built and the sync
+  delivered. Call it before concluding you have found everything on a topic. It says on stderr
+  (and under `--json`'s `disclosures`) when the server's live answer could differ — the subject
+  changed after the artifact was built, or the workspace has moved since — the graph and tag lists
+  are then the server's answer as of that build: a neighbour linked or tagged since is missing, one
+  unlinked since may still be listed. `related: null` plus its `absent` reason means the CLI cannot
+  answer; the reason names the fix, and `related_notes` over MCP always answers — also for a note
+  outside a folder-scoped mount, which `related` refuses (exit 3) like `read` does.
+- **`docli ls [folder]`, `docli tree`, `docli tags`, `docli tagged <tag>`** list the workspace
+  from the held graph, complete even under a folder-scoped mount; rows this mirror does not hold
+  are marked. None of them settles absence — only `docli search` does.
 - **The mirror is never writable.** An edit made inside it is never synced, and it is destroyed
   with no conflict copy the next time that note changes on the server. To change a note, write
   through the docli MCP connection with `edit_note`, then run `docli sync`.
@@ -74,7 +94,8 @@ Two rules, and both fire on an **event**, not on your judgement of whether you n
   `docli search "…"` that does not report an incomplete index establishes that a note does not
   exist.
 - **`docli read` on a file** prints its id, MIME type, size, digest, wikilink and the notes that
-  embed it. The bytes stay on the server; `read_attachment` over the docli MCP connection
-  fetches them.
+  embed it. The bytes stay on the server; `docli read <file> --out <path>` fetches them to a path
+  outside every mirror (never overwriting), as does `read_attachment` over the docli MCP
+  connection.
 
 `docli status` reports sign-in, mounts, freshness and what is wired here.

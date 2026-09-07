@@ -210,6 +210,42 @@ impl Api {
         self.post_sync("/api/sync/search", req)
     }
 
+    /// An attachment's bytes — `GET /api/attachments/{id}` (v0.29.9 Part B, `docli read --out`).
+    /// The sync plane's audience fence already admits this route for the device token; no api
+    /// change. One refresh-and-retry on 401, like the sync surface.
+    pub fn attachment_bytes(&self, id: Uuid) -> Result<Vec<u8>> {
+        let path = format!("/api/attachments/{id}");
+        let mut token = self.bearer()?;
+        for attempt in 0..2 {
+            let resp = self
+                .http
+                .get(format!("{}{path}", self.server))
+                .header("authorization", format!("Bearer {token}"))
+                .header("x-docli-cli-version", env!("CARGO_PKG_VERSION"))
+                .send()
+                .with_context(|| format!("GET {path}"))?;
+            let status = resp.status();
+            if status.is_success() {
+                return Ok(resp.bytes().context("reading the attachment")?.to_vec());
+            }
+            if status.as_u16() == 401 && attempt == 0 {
+                token = self.creds.refresh_single_flight(
+                    &self.server,
+                    &self.refresh_fn(),
+                    Some(&token),
+                )?;
+                continue;
+            }
+            // The route answers every refusal with one uniform 404 (no existence oracle), so the
+            // sentence names the two ordinary causes rather than guessing between them.
+            bail!(
+                "the server did not serve the file ({status}) - it may have been trashed since \
+                 the mirror was synced, or this sign-in cannot reach it"
+            );
+        }
+        unreachable!("the loop returns on both branches");
+    }
+
     /// Who this device is signed in as, for `docli status` — the display name when the account
     /// has one, else the email. `viewer` self-introspection is open to a sync-scoped PAT by
     /// design (`deny_scoped_pat_via_graphql` deliberately does not gate it), so this needs no

@@ -6,8 +6,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use docli_cli::{
-    config, creds, doctor, guard, hooks, http, init_cmd, list_cmd, login, logout, read_cmd,
-    search_cmd, selfupdate, status, sync_cmd, ui, uninstall, wizard,
+    config, creds, doctor, graph_cmd, guard, hooks, http, init_cmd, list_cmd, login, logout,
+    read_cmd, related_cmd, search_cmd, selfupdate, status, sync_cmd, ui, uninstall, wizard,
 };
 
 /// D12.5 - the identity block: name, version, site, copyright.
@@ -174,11 +174,12 @@ enum Command {
     },
     /// Print a mirrored note, or a file's metadata, by server path or node id
     Read {
-        /// The server path - the address search, wikilinks and the MCP tools all use
+        /// The server path - the address search, wikilinks and the MCP tools all use. Several
+        /// paths read several notes (`--json` returns an array)
         #[arg(value_name = "PATH")]
-        path: Option<String>,
+        paths: Vec<String>,
         /// Address by node id instead of path
-        #[arg(long, conflicts_with = "path")]
+        #[arg(long, conflicts_with = "paths")]
         id: Option<uuid::Uuid>,
         /// Which mount to read from - a mount name or a workspace id
         #[arg(long)]
@@ -187,6 +188,73 @@ enum Command {
         #[arg(long, value_name = "A-B")]
         lines: Option<String>,
         /// Machine-readable output (JSON) - the read_note envelope
+        #[arg(long)]
+        json: bool,
+        /// For a FILE: fetch its bytes from the server into this path (never overwrites; never
+        /// inside a mirror directory)
+        #[arg(long, value_name = "FILE", conflicts_with = "lines")]
+        out: Option<std::path::PathBuf>,
+        /// With --out: replace an existing file
+        #[arg(long, requires = "out")]
+        force: bool,
+    },
+    /// Notes and files related to a note or file - ranked offline from the held artifact
+    Related {
+        /// The server path
+        #[arg(value_name = "PATH")]
+        path: Option<String>,
+        /// Address by node id instead of path
+        #[arg(long, conflicts_with = "path")]
+        id: Option<uuid::Uuid>,
+        /// Which mount - a mount name or a workspace id
+        #[arg(long)]
+        mount: Option<String>,
+        /// How many (1-25)
+        #[arg(long, default_value_t = related_cmd::LIMIT_DEFAULT)]
+        limit: usize,
+        /// Machine-readable output (JSON)
+        #[arg(long)]
+        json: bool,
+    },
+    /// List a folder of the workspace (the root by default), from the held graph
+    Ls {
+        /// The server folder path
+        #[arg(value_name = "FOLDER")]
+        folder: Option<String>,
+        /// Which mount - a mount name or a workspace id
+        #[arg(long)]
+        mount: Option<String>,
+        /// Machine-readable output (JSON)
+        #[arg(long)]
+        json: bool,
+    },
+    /// The whole workspace tree, from the held graph
+    Tree {
+        /// Which mount - a mount name or a workspace id
+        #[arg(long)]
+        mount: Option<String>,
+        /// Machine-readable output (JSON)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Every tag in the workspace with its note count
+    Tags {
+        /// Which mount - a mount name or a workspace id
+        #[arg(long)]
+        mount: Option<String>,
+        /// Machine-readable output (JSON)
+        #[arg(long)]
+        json: bool,
+    },
+    /// The notes carrying a tag
+    Tagged {
+        /// The tag, without `#`
+        #[arg(value_name = "TAG")]
+        tag: String,
+        /// Which mount - a mount name or a workspace id
+        #[arg(long)]
+        mount: Option<String>,
+        /// Machine-readable output (JSON)
         #[arg(long)]
         json: bool,
     },
@@ -471,25 +539,86 @@ fn run(cli: Cli) -> Result<i32> {
             search_cmd::run(&project, &api, &q, json)
         }
         Command::Read {
-            path,
+            paths,
             id,
             mount,
             lines,
             json,
+            out,
+            force,
         } => {
             // Deliberately NOT `api_for`: `read` answers off the mirror, which is the whole
             // point of having one (latency and egress — v0.29.1 D1). A signed-out device with a
-            // synced mirror still reads.
+            // synced mirror still reads. The one exception is `--out`, which fetches a file's
+            // BYTES — those live on the server, so it needs the sign-in.
             let project = config::load_project(&cwd)?;
+            let api = if out.is_some() {
+                Some(api_for(&project)?)
+            } else {
+                None
+            };
             read_cmd::run(
                 &project,
-                &read_cmd::ReadArgs {
-                    path,
+                &read_cmd::ReadRequest {
+                    paths,
                     id,
                     mount,
                     lines,
                     json,
+                    out,
+                    force,
                 },
+                api.as_ref(),
+            )
+        }
+        Command::Related {
+            path,
+            id,
+            mount,
+            limit,
+            json,
+        } => {
+            // Offline, like `read`: the artifact and the graph are held.
+            let project = config::load_project(&cwd)?;
+            related_cmd::run(
+                &project,
+                &related_cmd::RelatedArgs {
+                    path,
+                    id,
+                    mount,
+                    limit,
+                    json,
+                },
+            )
+        }
+        Command::Ls {
+            folder,
+            mount,
+            json,
+        } => {
+            let project = config::load_project(&cwd)?;
+            graph_cmd::run(
+                &project,
+                &graph_cmd::Verb::Ls { folder },
+                mount.as_deref(),
+                json,
+            )
+        }
+        Command::Tree { mount, json } => {
+            let project = config::load_project(&cwd)?;
+            graph_cmd::run(&project, &graph_cmd::Verb::Tree, mount.as_deref(), json)
+        }
+        Command::Tags { mount, json } => {
+            let project = config::load_project(&cwd)?;
+            graph_cmd::run(&project, &graph_cmd::Verb::Tags, mount.as_deref(), json)
+        }
+        Command::Tagged { tag, mount, json } => {
+            let project = config::load_project(&cwd)?;
+            graph_cmd::run(
+                &project,
+                &graph_cmd::Verb::Tagged { tag },
+                mount.as_deref(),
+                json,
             )
         }
         Command::Doctor { json } => {
@@ -601,6 +730,11 @@ mod tests {
             "sync",
             "search",
             "read",
+            "related",
+            "ls",
+            "tree",
+            "tags",
+            "tagged",
             "status",
             "list",
             "logout",

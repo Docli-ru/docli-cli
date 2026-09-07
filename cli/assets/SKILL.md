@@ -59,6 +59,13 @@ answer — measured, not assumed: in six eval runs against a broken config, half
 instead of falling back. And use them for **every write**: the mirror is
 read-only, so `edit_note`/`write_note` are the only way to change anything.
 
+If `docli` is not installed on this machine, that is not a blocker either — installing it is
+optional (it buys offline reads, cheaper searches and `docli related`): `curl -fsSL
+https://docli.ru/install.sh | sh` on macOS / Linux, `irm https://docli.ru/install.ps1 | iex` in
+Windows PowerShell; then `docli login` (a browser round; `docli login --token -` or `DOCLI_TOKEN`
+where there is no browser) and `docli sync`. When `docli.toml` is committed in the project (the
+normal case) no `docli init` is needed; when a project keeps it local, `docli init` once.
+
 ## Notes are found and read through the CLI
 
 - **`docli search "<query>"` finds; `docli read <server-path>` opens.** Search runs the product's
@@ -94,7 +101,25 @@ read-only, so `edit_note`/`write_note` are the only way to change anything.
 - **`docli read` also answers the note's graph** — `links`, `backlinks`, `embeds`, `unresolved`,
   `tags`, `title` and `aliases`, on the `--json` envelope, with a counts line on stderr in plain
   mode. Every one of them is computed on the SERVER and delivered with the sync; the CLI resolves
-  no wikilinks of its own, so a link the server resolved is the link you get.
+  no wikilinks of its own, so a link the server resolved is the link you get. Several paths read
+  several notes (`--json` returns an array).
+- **`docli related <path>` ranks the notes and files related to a note or file, offline** — the
+  same three arms as the MCP tool `related_notes` (shared link-graph neighbours, lexical
+  similarity, shared tags), evaluated from an artifact the server built and the sync delivered.
+  Call it before concluding you have found everything on a topic. Its `why` names each arm's
+  evidence like the tool's does. It says, on stderr and under `--json`'s `disclosures`, when the
+  server's live answer could differ: the subject changed after the artifact was built, or the
+  workspace has moved N revisions since — the graph and tag lists are then the server's answer AS
+  OF THAT BUILD: a neighbour linked or tagged since is missing, one unlinked since may still be
+  listed. `related: null` plus its `absent` reason means the CLI cannot answer (no artifact held
+  yet, a server that serves none, a note newer than the artifact); the reason names the fix, and
+  `related_notes` over the docli MCP connection always answers — also for a note outside a
+  folder-scoped mount, which `related` refuses (exit 3) exactly as `read` does. An absent answer
+  exits 1 (like the listing verbs when a mount's graph is not held); a ranked answer, empty
+  included, exits 0.
+- **`docli ls [folder]`, `docli tree`, `docli tags`, `docli tagged <tag>`** list the workspace
+  from the held graph — complete for the WHOLE workspace even under a folder-scoped mount, with
+  rows this mirror does not hold marked `(not mirrored here)`. None of them settles absence.
 - The envelope's `absent` map names every field the CLI could not fill and why. Fields it cannot
   answer are `null` and listed there — never an empty list, which would be indistinguishable from
   a note that genuinely has none. So `"backlinks": []` means nothing links here, while
@@ -177,8 +202,9 @@ read-only, so `edit_note`/`write_note` are the only way to change anything.
 ## Files are metadata here, not bytes
 
 - `docli read` on a file prints its ID, MIME type, size, SHA-256 digest and a wikilink, plus the
-  notes that embed it (`embeddedIn`). The bytes live on the server; `read_attachment` over the
-  docli MCP connection fetches them.
+  notes that embed it (`embeddedIn`). The bytes live on the server; `docli read <file> --out
+  <path>` fetches them to a path OUTSIDE every mirror directory (it never overwrites; `--force`
+  replaces), and `read_attachment` over the docli MCP connection does the same.
 - `sha256 unknown` means the digest is genuinely unknown server-side — not zero, not empty.
   `wikilink not-expressible` means no correct wikilink exists for that path, so the `path` is the
   one to use. In `--json` both arrive as `null` with the reason named in `absent`.
@@ -191,13 +217,17 @@ read-only, so `edit_note`/`write_note` are the only way to change anything.
 | `docli sync --check` | cheap freshness gate — 0 = current, 1 = behind (follow the printed remedy), 2 = could not check |
 | `docli sync --full` | authoritative resync: re-derive the mirror, prune stale files |
 | `docli search "q"` | server search across mounts — server paths and node ids |
-| `docli read "path"` | print a mirrored note; `--lines`, `--id`, `--mount`, `--json` |
+| `docli read "path"…` | print a mirrored note (or several); `--lines`, `--id`, `--mount`, `--json`; a file's bytes with `--out` |
+| `docli related "path"` | notes and files related to a note or file, ranked offline; `--limit`, `--id`, `--mount`, `--json` |
+| `docli ls [folder]` · `docli tree` · `docli tags` · `docli tagged tag` | the workspace listed from the held graph; `--mount`, `--json`; exit 1 when a mount's graph is not held |
 | `docli doctor` | full three-way reconciliation (server / disk / state) — slow, thorough |
 | `docli status` | one screen: sign-in, mounts, mirror freshness, wired agents |
 | `docli list` | every workspace this account reaches; `*` marks the ones mounted here |
 
-`--json` works on `search`, `read`, `doctor`, `status` and `list`, and `--no-input` guarantees
-nothing prompts. **Parse `--json`, not the human output**: for `search`, `doctor`, `status` and
-`list` the whole screen is the result, so their warnings — including the mirror line above — share
+`--json` works on `search`, `read`, `related`, `ls`, `tree`, `tags`, `tagged`, `doctor`, `status`
+and `list`, and `--no-input` guarantees
+nothing prompts. **Parse `--json`, not the human output**: for `search`, `ls`, `tree`, `tags`,
+`tagged`, `doctor`, `status` and `list` the whole screen is the result, so their warnings —
+including the mirror line above — share
 stdout with it, and only `--json` guarantees stdout carries data alone. `docli read` already splits
 them: the note is on stdout, every warning on stderr.

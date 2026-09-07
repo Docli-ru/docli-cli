@@ -271,10 +271,12 @@ pub fn run(cwd: &Path, api: Option<&Api>, args: &InitArgs) -> Result<i32> {
         // bad flag refuses over an untouched tree, and a suggestion that appears above «записан
         // …» reads as something that already happened.
         McpPlan::Hint => Vec::new(),
-        McpPlan::Prompt => {
-            prompt_selection(&crate::agents::detect(cwd, std::env::home_dir().as_deref()))?
-                .unwrap_or_default()
-        }
+        McpPlan::Prompt => prompt_selection(
+            cwd,
+            &config.server,
+            &crate::agents::detect(cwd, std::env::home_dir().as_deref()),
+        )?
+        .unwrap_or_default(),
         McpPlan::Auto => {
             let detected = crate::agents::detect(cwd, std::env::home_dir().as_deref());
             if detected.is_empty() {
@@ -641,12 +643,17 @@ fn parse_agent_list(list: &str, flag: &str) -> Result<Vec<&'static str>> {
 
 /// One TTY prompt: Enter = detected set, `n` = skip, else a comma list. Unknown keys are
 /// reported and dropped (interactive forgiveness; the FLAG path refuses instead).
-fn prompt_selection(detected: &[&'static str]) -> Result<Option<Vec<&'static str>>> {
+fn prompt_selection(
+    cwd: &Path,
+    server: &str,
+    detected: &[&'static str],
+) -> Result<Option<Vec<&'static str>>> {
     crate::ui::detail(
-        "Space toggles, Enter confirms. The configurations found here are ticked; only what \
-         stays ticked is written.",
+        "Space toggles, Enter confirms. The agents docli already wired here are ticked; only \
+         what stays ticked is written.",
     );
-    let picked = crate::wizard::pick_agents(detected)?;
+    let wired = crate::agents::wired_or_skilled_here(cwd, server);
+    let picked = crate::wizard::pick_agents(detected, &wired)?;
     // An empty selection is a deliberate «ничего не трогать», not an error.
     Ok(Some(picked))
 }

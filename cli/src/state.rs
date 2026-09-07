@@ -130,6 +130,18 @@ pub struct WsState {
     ///   not «your server cannot serve one».
     #[serde(default)]
     pub graph_asked: bool,
+    /// Did the last completed sync ASK for the `related` artifact (v0.29.9 D7)? The same three-way
+    /// split as `graph_asked`, for the `related.json` file — with one difference in what the file's
+    /// ABSENCE means after asking: the server also withholds the rider when the stamps MATCH, so
+    /// «asked, no file» is only «the server serves none» when no file was ever held.
+    #[serde(default)]
+    pub related_asked: bool,
+    /// The server's workspace cursor as observed on the last head-reaching page (v0.29.9 D7) —
+    /// `PullResponse.head_rev`. The `related` disclosure compares it to the artifact's
+    /// `covers_rev`: two server-side numbers, never this mirror's keyset cursor, which a purge's
+    /// row-less barrier rev leaves behind the head indefinitely. `None` until a v0.29.9 api answers.
+    #[serde(default)]
+    pub head_rev: Option<i64>,
 }
 
 /// How long a cursor may go without reaching head before the mirror stops being a projection of
@@ -155,6 +167,8 @@ impl WsState {
             parks: BTreeMap::new(),
             pending_removals: BTreeSet::new(),
             graph_asked: false,
+            related_asked: false,
+            head_rev: None,
         }
     }
 
@@ -411,6 +425,31 @@ impl ControlRoot {
     }
 }
 
+/// Atomic persist of a derived cache (the graph, the `related` artifact): tmp + rename, and the
+/// file is created owner-only (0600 on unix — `creds.rs`' mode discipline, v0.29.9 D7; the two
+/// caches sit beside the credentials and describe a whole workspace). No sealing.
+fn write_private(p: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    fs::create_dir_all(p.parent().expect("state dir")).context("creating .docli/state")?;
+    let tmp = p.with_extension("json.tmp");
+    let _ = fs::remove_file(&tmp);
+    let mut opts = fs::OpenOptions::new();
+    opts.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
+        .open(&tmp)
+        .with_context(|| format!("creating {}", tmp.display()))?;
+    f.write_all(bytes)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    drop(f);
+    fs::rename(&tmp, p).with_context(|| format!("committing {}", p.display()))?;
+    Ok(())
+}
+
 /// The control root — `~/.docli` in production, since the mirror became per-MACHINE in v0.29.2
 /// (see [`ControlRoot::at`]; the `<project>/.docli` shape survives only for tests and the legacy
 /// layout). Holds `state/<ws>.json`, `state/<ws>.stale`, `markers/`, and gets the same containment
@@ -451,6 +490,25 @@ impl ControlRoot {
         self.dir.join("state").join(format!("{ws}.graph.json"))
     }
 
+    /// The `related` artifact for `ws` (v0.29.9 D7): `state/<ws>.related.json`, the wire payload
+    /// verbatim. It is self-identified by its generation stamp and is NOT gated on the mirror's
+    /// `(epoch, cursor)` like the graph — it describes a search-index GENERATION, not the node set,
+    /// and is replaced only by a newer generation.
+    pub fn related_path(&self, ws: Uuid) -> PathBuf {
+        self.dir.join("state").join(format!("{ws}.related.json"))
+    }
+
+    /// The held artifact, or `None` when there is none or it will not read (a derived cache: its
+    /// remedy is the next sync, never a failed command — the `load_graph` rule).
+    pub fn load_related(&self, ws: Uuid) -> Option<docli_sync_wire::WireRelated> {
+        let raw = fs::read(self.related_path(ws)).ok()?;
+        serde_json::from_slice(&raw).ok()
+    }
+
+    pub fn save_related(&self, ws: Uuid, related: &docli_sync_wire::WireRelated) -> Result<()> {
+        write_private(&self.related_path(ws), &serde_json::to_vec(related)?)
+    }
+
     /// The cached graph for `ws`, or `None` when there is none, it cannot be read, or its stamp
     /// does not match `(epoch, cursor)`.
     ///
@@ -472,9 +530,6 @@ impl ControlRoot {
         cursor: WireCursor,
         graph: &docli_sync_wire::WireGraph,
     ) -> Result<()> {
-        let p = self.graph_path(ws);
-        fs::create_dir_all(p.parent().expect("state dir")).context("creating .docli/state")?;
-        let tmp = p.with_extension("json.tmp");
         let cache = GraphCache {
             epoch,
             cursor,
@@ -482,10 +537,7 @@ impl ControlRoot {
         };
         // Compact, not pretty: nothing reads this by eye, and pretty-printing a 10 000-node
         // graph roughly doubles it on disk.
-        fs::write(&tmp, serde_json::to_vec(&cache)?)
-            .with_context(|| format!("writing {}", tmp.display()))?;
-        fs::rename(&tmp, &p).with_context(|| format!("committing {}", p.display()))?;
-        Ok(())
+        write_private(&self.graph_path(ws), &serde_json::to_vec(&cache)?)
     }
 
     /// Drop the cache — the server served no graph, so keeping the previous one would pair a
@@ -611,6 +663,43 @@ mod tests {
         let loaded = root.load_marks(ws);
         assert_eq!(loaded.latest.len(), 1);
         assert!(loaded.contradict(Uuid::from_u128(7), 19));
+    }
+
+    /// v0.29.9 D7 — both derived caches are written owner-only, and the artifact round-trips by
+    /// its own stamp with no cursor gate.
+    #[cfg(unix)]
+    #[test]
+    fn the_two_caches_are_written_owner_only_and_related_round_trips() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = ControlRoot::new(tmp.path());
+        let ws = Uuid::from_u128(1);
+        let cursor = WireCursor {
+            rev: 3,
+            id: Uuid::nil(),
+        };
+        root.save_graph(ws, 1, cursor, &docli_sync_wire::WireGraph::default())
+            .unwrap();
+        let related = docli_sync_wire::WireRelated {
+            covers_rev: 9,
+            covers_id: Uuid::from_u128(7),
+            dict: vec!["a".into()],
+            subjects: vec![],
+        };
+        root.save_related(ws, &related).unwrap();
+        for p in [root.graph_path(ws), root.related_path(ws)] {
+            let mode = fs::metadata(&p).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "{}: mode {mode:o}", p.display());
+        }
+        assert_eq!(root.load_related(ws).unwrap(), related);
+        // A second save REPLACES (a newer generation), whatever the mirror's cursor did.
+        let newer = docli_sync_wire::WireRelated {
+            covers_rev: 10,
+            ..related
+        };
+        root.save_related(ws, &newer).unwrap();
+        assert_eq!(root.load_related(ws).unwrap().covers_rev, 10);
+        assert!(root.load_related(Uuid::from_u128(2)).is_none());
     }
 
     #[test]

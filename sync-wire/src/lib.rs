@@ -83,6 +83,26 @@ pub struct PullRequest {
     /// ignored, so the shape stays one (the `client_id` precedent).
     #[serde(default, skip_serializing_if = "is_false")]
     pub graph: bool,
+    /// v0.29.9 D6 — ask for the `related` artifact on the head-reaching page, naming the
+    /// generation this client already HOLDS (zeroes when none). `None` = do not ask (`sync
+    /// --check`, `doctor`). The server includes [`PullResponse::related`] only when its current
+    /// generation's stamp differs from this one — the artifact is ~12× the graph per note, so
+    /// unlike the graph it does not re-ride whole on every sync.
+    ///
+    /// Honored on the EPHEMERAL arm only, like `graph`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub related: Option<RelatedStamp>,
+}
+
+/// The identity of one search-index generation as the `related` artifact's stamp (v0.29.9 D6):
+/// the `(covers_rev, covers_id)` pair the generation key already carries. The CLI sends the pair
+/// it holds; the server compares it to its current generation and answers with the artifact
+/// only on a mismatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelatedStamp {
+    pub covers_rev: i64,
+    pub covers_id: Uuid,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -162,6 +182,76 @@ pub struct PullResponse {
     /// `None` and must say so; an older client ignores the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph: Option<WireGraph>,
+    /// v0.29.9 D6 — the `related` artifact, present only when the request carried
+    /// [`PullRequest::related`], this page reached head, AND the server's current generation
+    /// differs from the stamp the client sent. **Absent means «keep what you hold»** — the
+    /// opposite of the graph's clear-on-absent arm — because a rider is also withheld when the
+    /// stamps MATCH, when the workspace has no generation yet, and when the fetch failed
+    /// (best-effort: an S3 miss never fails the pull).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub related: Option<WireRelated>,
+    /// v0.29.9 D7 — the server's workspace cursor (`workspaces.sync_cursor`) as observed on the
+    /// EPHEMERAL arm's HEAD-REACHING page, beside `live_nodes`. The CLI's «the workspace has moved
+    /// N revisions since the artifact was built» disclosure is `head_rev − covers_rev`: two
+    /// server-side numbers. Never the client's keyset cursor, which a purge's row-less barrier
+    /// rev leaves behind the head indefinitely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_rev: Option<i64>,
+}
+
+// ---- the `related` artifact (v0.29.9 D5/D6) -------------------------------------------------
+
+/// The server's own per-subject `related` inputs for one search-index generation, as they ride
+/// the pull: a lexeme dictionary and, per live note and live attachment, its KL-pruned term
+/// vector (notes only) plus the server's graph-arm and tag-arm top-20 answers, computed by the
+/// same `graph_candidates`/`tag_candidates` the MCP tool runs, at build time.
+///
+/// **Self-identified by generation** (`covers_rev`, `covers_id`) — it describes the generation it
+/// was built from, not the mirror's node set, which is why the CLI keys it by this stamp and never
+/// by `(epoch, cursor)`. Identity fields (name/path/kind/mime) are NOT here: the held graph
+/// supplies them. The corpus tables the server's fresh-subject path needs (`df`, `n_docs`, the
+/// collection model) stay in the sealed blob and never travel — the client never builds a vector.
+///
+/// Deterministic order — `dict` lexeme-ascending (interned tags appended after, ascending),
+/// `subjects` id-ascending, a vector's `terms` dictionary-index-ascending, arm lists in the
+/// server's own rank order — and the bytes are pinned like the graph's.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WireRelated {
+    pub covers_rev: i64,
+    pub covers_id: Uuid,
+    /// The string table: lexemes (PG's own, the search analyzer's) and tag strings, addressed by
+    /// index from every vector and every tag-arm entry.
+    pub dict: Vec<String>,
+    pub subjects: Vec<RelatedSubject>,
+}
+
+/// One live note or attachment's row. The `graph`/`tags` lists address OTHER subjects by their
+/// index into [`WireRelated::subjects`].
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelatedSubject {
+    pub id: Uuid,
+    /// The vector and word count — notes only. `None` for an attachment: it has arm lists and no
+    /// text, which is exactly what `related_notes` gives a file subject since v0.23.0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<RelatedVector>,
+    /// The server's graph-arm top-20 for this subject: `(subject index, shared mediators)`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub graph: Vec<(u32, u32)>,
+    /// The server's tag-arm top-20: `(subject index, shared tags as dict indices)`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<(u32, Vec<u32>)>,
+}
+
+/// A note's KL-pruned tf·idf vector, `(dict index, weight)` sorted by index ascending — the
+/// exact representation `docli_rules::related::cosine` takes on both ends — plus the word count
+/// the fusion's short-note demotion reads.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelatedVector {
+    pub wc: u32,
+    pub terms: Vec<(u32, f32)>,
 }
 
 // ---- the note graph (v0.29.1 D3/D4) ---------------------------------------------------------
@@ -469,6 +559,8 @@ mod tests {
             last_mutation_id: 4,
             live_nodes: None,
             graph: None,
+            related: None,
+            head_rev: None,
         };
         assert_eq!(
             serde_json::to_string(&resp).unwrap(),
@@ -534,6 +626,7 @@ mod tests {
             ack: None,
             ephemeral: true,
             graph: false,
+            related: None,
         };
         assert_eq!(
             serde_json::to_string(&req).unwrap(),
@@ -896,6 +989,7 @@ mod tests {
             ack: None,
             ephemeral: true,
             graph: true,
+            related: None,
         };
         assert!(serde_json::to_string(&req)
             .unwrap()
@@ -927,5 +1021,148 @@ mod tests {
         let old = r#"{"workspaces":[{"workspaceId":"00000000-0000-0000-0000-000000000001"}]}"#;
         let resp: SearchResponse = serde_json::from_str(old).unwrap();
         assert!(resp.workspaces[0].delta.is_none());
+    }
+
+    // ---- the `related` artifact's byte pins (v0.29.9 D6) -----------------------------------
+
+    fn related_payload() -> WireRelated {
+        WireRelated {
+            covers_rev: 42,
+            covers_id: ws(7),
+            dict: vec!["альф".into(), "beta".into(), "проект".into()],
+            subjects: vec![
+                RelatedSubject {
+                    id: ws(1),
+                    note: Some(RelatedVector {
+                        wc: 312,
+                        terms: vec![(0, 1.5), (1, 0.25)],
+                    }),
+                    graph: vec![(1, 2)],
+                    tags: vec![(1, vec![2])],
+                },
+                RelatedSubject {
+                    id: ws(2),
+                    note: None,
+                    graph: vec![(0, 1)],
+                    tags: vec![],
+                },
+            ],
+        }
+    }
+
+    /// The artifact rides the pull page, so its bytes are pinned like the graph's: a note with
+    /// a vector and both arm lists, and an attachment with arm lists and no `note`.
+    #[test]
+    fn a_related_payload_is_pinned() {
+        let r = related_payload();
+        assert_eq!(
+            serde_json::to_string(&r).unwrap(),
+            concat!(
+                r#"{"coversRev":42,"coversId":"00000000-0000-0000-0000-000000000007","#,
+                r#""dict":["альф","beta","проект"],"#,
+                r#""subjects":[{"id":"00000000-0000-0000-0000-000000000001","#,
+                r#""note":{"wc":312,"terms":[[0,1.5],[1,0.25]]},"graph":[[1,2]],"tags":[[1,[2]]]},"#,
+                r#"{"id":"00000000-0000-0000-0000-000000000002","graph":[[0,1]]}]}"#
+            )
+        );
+        let back: WireRelated = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back, r);
+    }
+
+    /// The response carries the rider and the head cursor AFTER the graph, and an older api's
+    /// answer (neither key) leaves both absent — «keep what you hold» on the client.
+    #[test]
+    fn the_related_rider_and_head_rev_are_pinned_on_the_pull_page() {
+        let resp = PullResponse {
+            epoch: 1,
+            cursor: WireCursor { rev: 7, id: ws(1) },
+            nodes: vec![],
+            capabilities: vec![],
+            resync_required: false,
+            last_mutation_id: 0,
+            live_nodes: Some(2),
+            graph: None,
+            related: Some(related_payload()),
+            head_rev: Some(44),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(
+            json.ends_with(r#""graph":[[0,1]]}]},"headRev":44}"#),
+            "{json}"
+        );
+        assert!(
+            json.contains(r#""liveNodes":2,"related":{"coversRev":42"#),
+            "{json}"
+        );
+        let old = concat!(
+            r#"{"epoch":1,"cursor":{"rev":0,"id":"00000000-0000-0000-0000-000000000000"},"#,
+            r#""nodes":[],"resyncRequired":false,"lastMutationId":0,"liveNodes":0}"#
+        );
+        let back: PullResponse = serde_json::from_str(old).unwrap();
+        assert!(back.related.is_none() && back.head_rev.is_none());
+    }
+
+    /// The request's stamp is opt-in and pinned; a 0.1.21-era request parses as «did not ask».
+    #[test]
+    fn the_related_stamp_is_opt_in_on_the_wire() {
+        let req = PullRequest {
+            workspace_id: ws(1),
+            client_id: "ephemeral".into(),
+            cursor: WireCursor {
+                rev: 0,
+                id: Uuid::nil(),
+            },
+            epoch: 1,
+            limit: Some(500),
+            ack: None,
+            ephemeral: true,
+            graph: true,
+            related: Some(RelatedStamp {
+                covers_rev: 0,
+                covers_id: Uuid::nil(),
+            }),
+        };
+        assert!(serde_json::to_string(&req).unwrap().ends_with(concat!(
+            r#""graph":true,"related":{"coversRev":0,"#,
+            r#""coversId":"00000000-0000-0000-0000-000000000000"}}"#
+        )));
+        let old = concat!(
+            r#"{"workspaceId":"00000000-0000-0000-0000-000000000001","clientId":"c","#,
+            r#""cursor":{"rev":0,"id":"00000000-0000-0000-0000-000000000000"},"epoch":1,"#,
+            r#""ephemeral":true,"graph":true}"#
+        );
+        let req: PullRequest = serde_json::from_str(old).unwrap();
+        assert!(req.related.is_none());
+    }
+
+    /// Two f32 sums agree only over the same bits (D2). The weights are written by the server
+    /// and read back by the CLI through JSON, so the round trip must be bit-identical for every
+    /// f32 a weight can take — including denormals, awkward mantissas and the largest finite.
+    #[test]
+    fn f32_weights_round_trip_through_json_bit_identical() {
+        let samples: Vec<f32> = vec![
+            0.1,
+            1.0 / 3.0,
+            2.0f32.sqrt(),
+            1e-40, // subnormal
+            f32::MIN_POSITIVE,
+            f32::MAX,
+            123_456.79,
+            0.000123456,
+            7.0,
+        ];
+        let v = RelatedVector {
+            wc: 1,
+            terms: samples
+                .iter()
+                .enumerate()
+                .map(|(i, w)| (i as u32, *w))
+                .collect(),
+        };
+        let back: RelatedVector =
+            serde_json::from_str(&serde_json::to_string(&v).unwrap()).unwrap();
+        for ((_, a), (_, b)) in v.terms.iter().zip(back.terms.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits(), "{a} came back as {b}");
+        }
     }
 }

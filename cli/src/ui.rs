@@ -152,7 +152,7 @@ fn width() -> usize {
 /// case it is the product and goes to stdout regardless.
 fn chatter(s: String) {
     if reporting() {
-        println!("{s}");
+        stdout_line(&s);
     } else if !quiet() {
         eprintln!("{s}");
     }
@@ -209,7 +209,7 @@ pub fn update_notice(text: &str) {
 pub fn warn(text: &str) {
     let s = format!("{} {text}", style("!").yellow().bold());
     if reporting() {
-        println!("{s}");
+        stdout_line(&s);
     } else {
         eprintln!("{s}");
     }
@@ -220,7 +220,7 @@ pub fn warn(text: &str) {
 pub fn refuse(text: &str) {
     let s = format!("{} {text}", style(refused()).red().bold());
     if reporting() {
-        println!("{s}");
+        stdout_line(&s);
     } else {
         eprintln!("{s}");
     }
@@ -229,22 +229,32 @@ pub fn refuse(text: &str) {
 /// The heading OF a result block (a listing's title). Stdout, like the rows beneath it: a
 /// heading on the other stream is lost by `> file` and only lines up on screen by luck.
 pub fn result_heading(text: &str) {
-    println!("\n{}", style(text).bold());
+    stdout_line(&format!("\n{}", style(text).bold()));
 }
 
 /// RESULT output — stdout, never suppressed. Search hits, status rows, listings.
 pub fn line(text: &str) {
-    println!("{text}");
+    stdout_line(text);
 }
 
 /// An aligned `label   value` result row. `pad` comes from [`label_width`] so a block lines up.
 pub fn field(label: &str, value: &str, pad: usize) {
-    println!(
+    stdout_line(&format!(
         "  {:<pad$}  {}",
         style(label).dim(),
         value,
         pad = pad.max(label.chars().count())
-    );
+    ));
+}
+
+/// One result line to stdout, without `println!`'s panic on a closed pipe (v0.29.9 Loop B): a
+/// listing piped into `head` is an ordinary way to read one, and the reader closing the pipe is
+/// its decision, not our failure. A failed write is dropped — there is nobody left to tell, and
+/// the command's exit code stays what its answer was.
+fn stdout_line(text: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{text}");
 }
 
 /// The label column width for a block of [`field`] rows — measured in CHARACTERS, so Cyrillic

@@ -150,8 +150,10 @@ fn server_tree(api: &Api, ws: Uuid) -> Result<BTreeMap<Uuid, WireNode>> {
         limit: Some(PAGE_LIMIT),
         ack: None,
         ephemeral: true,
-        // `doctor` reconciles the filesystem; it reads no graph, so it never pays for one.
+        // `doctor` reconciles the filesystem; it reads no graph and no `related` artifact, so it
+        // never pays for either.
         graph: false,
+        related: None,
     };
     let mut resp = match api.bootstrap(&req)? {
         Ok(r) => r,
