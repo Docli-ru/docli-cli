@@ -23,7 +23,19 @@ read.
   path, and `--json` no longer carries `local_path`. Pass a hit's `server_path` to `docli read`,
   or its `id` to `docli read --id`.
 - **Attachments are metadata here.** `docli read` on a file prints its ID, MIME type, size,
-  SHA-256 digest and wikilink; the bytes remain on the server and are fetched over MCP.
+  SHA-256 digest and wikilink; the bytes remain on the server. `docli read <file> --out <path>`
+  fetches them to a path outside every mirror (never overwriting without `--force`), as does
+  `read_attachment` over MCP.
+- **`docli related` ranks the notes and files related to a note or file — offline.** The server
+  builds the artifact (link-graph neighbours, shared tags, and a lexical arm over per-note term
+  vectors) beside its search index; `docli sync` fetches it; the CLI holds and evaluates it, and
+  never derives one of its own. It says on stderr (and under `--json`'s `disclosures`) when the
+  server's live answer could differ — the note changed after the artifact was built, or the
+  workspace has changed since. `related: null` plus a named reason in `absent` means it cannot
+  answer; the MCP tool `related_notes` always can.
+- **`docli ls`, `tree`, `tags`, `tagged`** list the workspace from the same held graph — complete
+  even under a folder-scoped mount, with the rows this mirror does not hold marked. None of them
+  settles absence; only `docli search` does.
 - **`docli doctor`** — a three-way reconciliation (server / disk / state) with typed discrepancies.
 
 ## Install
@@ -55,6 +67,10 @@ docli init --workspace <id> --dir .docli/mirror/notes --gitignore
 docli sync                               # one-shot sync of every mount
 docli search "what you need"             # server search across mounts
 docli read "Notes/plan.md"               # print a mirrored note (--lines, --id, --json)
+docli read "Notes/a.md" "Notes/b.md"     # several at once
+docli read "Files/spec.pdf" --out ./spec.pdf   # fetch a file's bytes outside the mirror
+docli related "Notes/plan.md"            # related notes and files, offline, from the held artifact
+docli ls Notes                           # a folder's contents from the held graph (tree, tags, tagged too)
 docli status                             # sign-in, mounts, mirror freshness, wired agents
 docli doctor                             # server / disk / state reconciliation
 docli logout                             # disconnect this device and drop the credential
@@ -135,7 +151,7 @@ names the flag that replaces it (`docli uninstall --yes`).
 | `--no-input` | Never ask anything (scripts, CI) |
 | `-q`, `--quiet` | Drop the narration; results and warnings stay |
 | `--no-color` | No colour; so do `NO_COLOR`, `TERM=dumb`, and a non-TTY stdout |
-| `--json` | Machine-readable output for `list`, `status`, `search`, `read`, `doctor` |
+| `--json` | Machine-readable output for `list`, `status`, `search`, `read`, `related`, `ls`, `tree`, `tags`, `tagged`, `doctor` |
 
 Streams are split: results go to stdout, progress to stderr — so `docli read … | head`,
 `docli status --json | jq` and `docli sync 2>/dev/null` all behave. Where a command's whole
@@ -146,7 +162,11 @@ and every caveat goes to stderr. Under `--json` nothing but the JSON reaches std
 
 `docli read` exits **3** when no selected mount holds what was asked for — its own code, so a
 script can tell "not in this local mirror" from a failure. It says nothing about the server: only
-a `docli search` that does not report an incomplete index settles whether a note exists.
+a `docli search` that does not report an incomplete index settles whether a note exists. `docli read` exits
+**4** when the server has listed that note as changed since it was last updated in this mirror — run
+`docli sync` and read again. `docli related` uses the same 3 for a subject this mirror does not
+hold, and exits **1** when it cannot answer (never asked, server serves none, stale stamp), with
+the reason named in `absent`.
 
 ## Uninstalling
 
