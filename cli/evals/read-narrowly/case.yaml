@@ -1,0 +1,15 @@
+name: read-narrowly
+description: >
+  A why-question whose answer is one section of a large note (~21 KB). The agent should locate
+  the section and read only it — `docli read … | grep`, then `--lines A-B` — instead of pulling
+  the whole note into context. Measured 2026-09-08: with the orientation naming only the read
+  path, 0 of 5 fresh sessions narrowed a read; with the READ NARROWLY clause (which states WHY:
+  everything `docli read` prints lands in context, and an MCP result cannot be trimmed), 5 of 5
+  did, and read bytes reaching context fell 23.3 KB → 9.0 KB mean.
+runs: 5
+max_turns: 12
+timeout_seconds: 240
+tags: [orientation, read-narrowly]
+prompt: prompt.md
+graders:
+  - graders/read-narrowly.md

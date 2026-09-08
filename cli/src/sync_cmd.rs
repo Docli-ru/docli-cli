@@ -1200,8 +1200,19 @@ pub fn hook_check(cwd: &Path, agent: crate::hooks::HookAgent) -> i32 {
 //     exactly that gap; the clause now names the CATEGORY («cannot answer») and says plainly that a
 //     broken CLI is not a reason to stop.
 //
+//   * READ NARROWLY (2026-09-08). The text named the read path but never said HOW MUCH to read, so
+//     agents read whole notes: measured across five fresh sessions on one why-question, 0 of 5
+//     narrowed a read and each pulled a 21.5 KB note whole. Adding one clause that states the
+//     reason (everything `docli read` prints lands in context; an MCP result cannot be trimmed, CLI
+//     output can) flipped it: 5 of 5 narrowed (`| grep …` to locate, then `--lines A-B`), and the
+//     bytes of read output reaching context fell 23.3 KB → 9.0 KB mean (3.7× at the median; one
+//     run's wide `grep -B4 -A10` window on a common word returned the note's worth anyway, so the
+//     clause buys a mechanism, not a guarantee). Same lever as 2026-09-04: the WHY, not the verb. The «never grep the mirror» sentence now says FILES, so it cannot be read as banning a
+//     pipe over the CLI's own output, which has already passed the freshness gate.
+//
 // Kept to roughly the previous length on purpose: this is injected into EVERY session (~334 tokens
-// measured at v0.28.6), so it is restructured, never extended.
+// measured at v0.28.6), so it is restructured, never extended — the read-narrowly clause was paid
+// for by dropping rule 2's second justification sentence (+9% chars net).
 const ORIENTATION: &str = "This directory has docli workspaces mirrored into it: the notes behind \
 the work here - decisions, background, research, plans. They answer WHY; the files answer WHAT. \
 TWO RULES, and both fire on an event rather than on your judgement. (1) BEFORE you answer a «why \
@@ -1210,14 +1221,17 @@ run `docli search` FIRST. Not «when you feel you need context» - you will not 
 files always answer something; they just answer a different question. (2) WHEN a decision or \
 finding lands, write it back BEFORE you carry on - `edit_note` over the docli MCP connection, then \
 `docli sync`. Not at the end of the session: batching it to a checkpoint is exactly how it gets \
-lost, and a decision is not less true for being recorded before the work around it is finished. Reading: `docli search \"...\"` then `docli read <path>` answer \
-from the local mirror; `search_notes`/`read_note` reach the server every time. Fall back to the MCP \
-tools whenever the CLI cannot answer: it exits 3 (this mirror does not hold that note), it reports \
-the mirror stale, OR it fails outright - a bad docli.toml, no mount here, not installed. A broken \
-CLI is not a reason to stop; the notes are still reachable, and an unanswered question is worse \
-than a slower answer. Always use the MCP tools to WRITE. Never grep the mirror or open its files directly, and never edit them: \
-it can be stale or scoped, and an edit there is never synced. Only a `docli search` that does not \
-report an incomplete index shows that a note does not exist.";
+lost. Reading: `docli search \"...\"` then `docli read <path>` answer from the local mirror; \
+`search_notes`/`read_note` reach the server every time. READ NARROWLY: everything `docli read` \
+prints lands in your context, so pass `--lines A-B` or pipe its output through grep/sed/head, and \
+read a whole note only when you need the whole note - an MCP result cannot be trimmed, CLI output \
+can. Fall back to the MCP tools whenever the CLI cannot answer: it exits 3 (this mirror does not \
+hold that note), it reports the mirror stale, OR it fails outright - a bad docli.toml, no mount \
+here, not installed. A broken CLI is not a reason to stop; the notes are still reachable, and an \
+unanswered question is worse than a slower answer. Always use the MCP tools to WRITE. Never open \
+or grep the mirror's FILES directly, and never edit them: it can be stale or scoped, and an edit \
+there is never synced. Only a `docli search` that does not report an incomplete index shows that \
+a note does not exist.";
 
 /// The freshness half, as plain sentences. Separated from the emission so the branches can be
 /// tested without a terminal, a hook, or a schema.
