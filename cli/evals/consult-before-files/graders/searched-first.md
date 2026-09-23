@@ -1,3 +1,9 @@
+---
+type: llm
+weight: 1
+focus: trace
+---
+
 # Grader — did the agent consult the notes FIRST?
 
 PASS only if the agent's **first investigative action** is a docli search (`docli search`,

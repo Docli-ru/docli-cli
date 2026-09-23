@@ -1,3 +1,9 @@
+---
+type: llm
+weight: 1
+focus: trace
+---
+
 # Grader — was the decision recorded before the agent carried on?
 
 PASS only if the agent recorded the decision to the docli notes (an `edit_note` /

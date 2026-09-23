@@ -559,6 +559,18 @@ pub(crate) enum Miss {
     StateLost,
     StateUnreadable(String),
     NotThisMirror,
+    /// Another docli run HOLDS this mount, so its marker could not be read and identity could
+    /// not be established. Transient: it clears when that run finishes.
+    ///
+    /// Not `Unreadable`, whose sentence frames the failure as «the mirror tracks it but could
+    /// not read its LOCAL COPY» — here the state has not even been loaded, so neither half of
+    /// that sentence is established. Every variant is a sentence the reader can act on, and this
+    /// is the only one whose act is «wait».
+    MountHeld,
+    /// The marker could not be read and contention does not explain it — a permission error, an
+    /// I/O fault, or bytes that are not UTF-8. Waiting will not clear it, so it must not borrow
+    /// `MountHeld`'s sentence.
+    MarkerUnreadable,
     Parked(ParkClass, String),
     /// The workspace delivered this id, but this mount does not materialize it. Reachable only
     /// through `--id`: the ledger is ids-only, so a PATH cannot be told apart from `NotHeld`
@@ -596,6 +608,8 @@ impl Miss {
             | Miss::StateLost
             | Miss::Unreadable(_)
             | Miss::NotThisMirror
+            | Miss::MountHeld
+            | Miss::MarkerUnreadable
             | Miss::Folder => EXIT_FAILED,
             _ => EXIT_NOT_IN_MIRROR,
         }
@@ -612,7 +626,12 @@ impl Miss {
     fn answered(&self) -> bool {
         !matches!(
             self,
-            Miss::StateUnreadable(_) | Miss::StateLost | Miss::NotThisMirror | Miss::Unreadable(_)
+            Miss::StateUnreadable(_)
+                | Miss::StateLost
+                | Miss::NotThisMirror
+                | Miss::MountHeld
+                | Miss::MarkerUnreadable
+                | Miss::Unreadable(_)
         )
     }
 
@@ -630,7 +649,9 @@ impl Miss {
             Miss::StateUnreadable(_)
             | Miss::StateLost
             | Miss::Unreadable(_)
-            | Miss::NotThisMirror => "unavailable",
+            | Miss::NotThisMirror
+            | Miss::MountHeld
+            | Miss::MarkerUnreadable => "unavailable",
             Miss::Folder => "usage",
             _ => "not_in_mirror",
         }
@@ -653,6 +674,16 @@ impl Miss {
             Miss::NotThisMirror => {
                 "this directory is not this workspace's mirror - `docli init` re-points it".into()
             }
+            Miss::MountHeld => format!(
+                "{} - one run per mount at a time; this clears when it finishes, or read it over \
+                 the docli MCP connection",
+                crate::mountfs::MOUNT_HELD
+            ),
+            Miss::MarkerUnreadable => "this mount's marker could not be read, so its identity \
+                                       could not be established - `docli doctor` reports the \
+                                       mount, and the note is readable over the docli MCP \
+                                       connection meanwhile"
+                .into(),
             // A TRANSIENT park heals; a STRUCTURAL one does not, and promising a fix for it
             // would send the reader to a command that names none. `sync --check` renders the
             // exact remedy for every transient cause, so it is one authority rather than a
@@ -1049,7 +1080,13 @@ pub(crate) fn locate(
     target: &Target,
 ) -> Result<Located, Miss> {
     let mount_root = mount_abs(&project.root, mount);
-    // STATE FIRST, then identity — the same order `search_cmd::read_local` takes, and for the
+    // STATE FIRST, then identity — with ONE exception, added when identity learned to say «I
+    // could not look»: `Held` and `Unreadable` return immediately below, BEFORE the state load.
+    // Neither is a statement about the directory, so neither can be weighed against state; and
+    // the `NeverSynced` hazard this ordering guards is untouched, because an absent directory
+    // fails the no-follow stat and reads `Foreign`, not `Unreadable`.
+    //
+    // Otherwise: the same order `search_cmd::read_local` takes, and for the
     // reason that made it right there. State lives in the CONTROL ROOT — `~/.docli/state/<ws>.json`
     // since the mirror went per-machine in v0.29.2 — and nowhere near the mount, so reading it
     // needs no claim on the mount directory; identity has to precede any OPEN, which is below it.
@@ -1063,7 +1100,18 @@ pub(crate) fn locate(
     // State is keyed by WORKSPACE and says nothing about the directory configured NOW; the
     // marker in the directory is the only thing that binds the two. Measured here, applied below
     // — it is also what tells a mount that was never synced apart from one whose RECORD was lost.
-    let claimed = crate::mountfs::verify_mount_identity(&mount_root, &control.dir, mount.workspace);
+    let identity =
+        crate::mountfs::verify_mount_identity(&mount_root, &control.dir, mount.workspace);
+    // A mount another run HOLDS cannot be examined at all where file locks are mandatory, and
+    // «not ours» would be a confident wrong answer carrying a destructive remedy (`docli init`
+    // re-points a mirror that is perfectly healthy). `Unreadable` is not an answer, so it never
+    // reaches exit 3 and never suppresses a sibling mount's caveat.
+    match identity {
+        crate::mountfs::Identity::Held => return Err(Miss::MountHeld),
+        crate::mountfs::Identity::Unreadable => return Err(Miss::MarkerUnreadable),
+        crate::mountfs::Identity::Ours | crate::mountfs::Identity::Foreign => {}
+    }
+    let claimed = identity.is_ours();
     let st = match control.load_state(mount.workspace) {
         Err(e) => return Err(Miss::StateUnreadable(format!("{e:#}"))),
         // No state and no claim: nothing was ever synced here. That IS an answer.
@@ -2265,6 +2313,29 @@ mod tests {
         assert!(!r.message.contains("never been synced"), "{}", r.message);
     }
 
+    /// The false absence the four-state identity closed: no state AND a marker that will not
+    /// read used to be `!claimed`, so `NeverSynced` — an ANSWER, exit 3, with the sibling-mount
+    /// caveat suppressed — about a mirror whose identity nobody established.
+    #[test]
+    fn an_unreadable_marker_with_no_state_is_unavailable_not_never_synced() {
+        let f = fx(&[("mirror", 1, None)]);
+        put_note(&f, "mirror", 1, 9, "a.md", "x\n");
+        let control = ControlRoot::new(&f.project.root);
+        std::fs::remove_file(control.state_path(Uuid::from_u128(1))).unwrap();
+        std::fs::write(f.project.root.join("mirror/MOUNT.docli"), [0x80u8, 0x81]).unwrap();
+        let r = refused(resolve(&f.project, &args("a.md"), 100));
+        assert_eq!(r.exit, EXIT_FAILED);
+        assert_eq!(r.code, "unavailable");
+        assert!(!r.message.contains("never been synced"), "{}", r.message);
+        assert!(!r.message.contains("docli init"), "{}", r.message);
+        // The MARKER's sentence, not the lost-state one a claimed mirror would get.
+        assert!(
+            r.message.contains("marker could not be read"),
+            "{}",
+            r.message
+        );
+    }
+
     #[test]
     fn a_parked_node_reports_its_park_and_the_check_happens_before_the_nodes_miss() {
         // The ordering IS the test (open item 1): a parked node is absent from `state.nodes` by
@@ -2448,6 +2519,8 @@ mod tests {
             Miss::StateLost,
             Miss::NotThisMirror,
             Miss::Unreadable("x".into()),
+            Miss::MountHeld,
+            Miss::MarkerUnreadable,
         ];
         for m in &unanswered {
             assert!(!m.answered(), "{}", m.sentence());
@@ -2492,13 +2565,62 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(&outside, &target).unwrap();
         #[cfg(windows)]
-        std::os::windows::fs::symlink_file(&outside, &target).unwrap();
+        if let Err(e) = std::os::windows::fs::symlink_file(&outside, &target) {
+            // A FILE symlink needs SeCreateSymbolicLinkPrivilege, which an ordinary developer
+            // account does not hold (os error 1314). ONLY that error is tolerated — anything
+            // else means the fixture broke, not the platform. The property is not left
+            // unverified here either: `a_junction_planted_in_the_mirror_never_serves_a_file_
+            // outside_it` plants a DIRECTORY JUNCTION, which needs no privilege at all.
+            assert_eq!(e.raw_os_error(), Some(1314), "{e}");
+            eprintln!("skipping: no SeCreateSymbolicLinkPrivilege on this account");
+            return;
+        }
         let r = refused(resolve(&f.project, &args("a.md"), 100));
         assert_eq!(r.exit, EXIT_NOT_IN_MIRROR);
         assert!(r.message.contains("outside the mirror"), "{}", r.message);
         // It EXISTS — it is just not ours. The sentence must not also claim the file vanished;
         // an earlier draft composed exactly that contradiction in one breath.
         assert!(!r.message.contains("nothing is there"), "{}", r.message);
+    }
+
+    /// The escape an UNPRIVILEGED Windows user can actually plant — which makes it the one that
+    /// matters most there, and the reason the symlink test above may skip without leaving this
+    /// property unpinned. Measured 2026-09-22: `mklink /J` succeeds with no privilege,
+    /// `file_type().is_symlink()` reports TRUE for a junction, and `canonicalize` resolves
+    /// THROUGH it — so canonical containment sees this escape exactly as it sees a symlink's.
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_planted_in_the_mirror_never_serves_a_file_outside_it() {
+        let f = fx(&[("mirror", 1, None)]);
+        put_note(&f, "mirror", 1, 9, "sub/a.md", "x\n");
+        let outside = f.project.root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("a.md"), "secret\n").unwrap();
+        // Joined COMPONENT BY COMPONENT: `join("mirror/sub")` keeps the forward slash, and
+        // cmd.exe reads `/sub` in an argument as a SWITCH («Invalid switch: "sub"») even though
+        // every filesystem API accepts that path.
+        let sub = f.project.root.join("mirror").join("sub");
+        std::fs::remove_dir_all(&sub).unwrap();
+        let out = std::process::Command::new("cmd.exe")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &sub.to_string_lossy(),
+                &outside.to_string_lossy(),
+            ])
+            .output()
+            .expect("cmd.exe runs");
+        assert!(
+            out.status.success(),
+            "mklink /J: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let r = refused(resolve(&f.project, &args("sub/a.md"), 100));
+        assert_eq!(r.exit, EXIT_NOT_IN_MIRROR);
+        assert!(r.message.contains("outside the mirror"), "{}", r.message);
     }
 
     /// Exit 2 covers two unrelated things, and a machine branching on `code` has to tell them

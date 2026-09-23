@@ -6,7 +6,7 @@
 //! the `CACHE_INCOMPLETE.docli` marker.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -171,6 +171,13 @@ fn claim_mount_eventually(mount: &Path, owner: &Path, ws: Uuid) -> Result<MountH
     }
 }
 
+/// The sentence for a held mount, in ONE place.
+///
+/// Four surfaces say it — `read`, `search`, `status`, `uninstall` — and `MountBusy` says the same
+/// thing on the write path. They were five hand copies in two registers; a reader who meets it
+/// twice should meet the same words.
+pub const MOUNT_HELD: &str = "another docli run holds this mount";
+
 /// Typed marker for «somebody else holds this mount's lock» (v0.28.6 D3). `try_lock` fails fast
 /// by design, so this is a routine outcome, not a fault: it joins the partial-success class on
 /// the `--check` path, and the `SessionStart` hook reports it as its own branch rather than as
@@ -180,7 +187,7 @@ pub struct MountBusy;
 
 impl std::fmt::Display for MountBusy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "another docli run holds this mount")
+        write!(f, "{MOUNT_HELD}")
     }
 }
 impl std::error::Error for MountBusy {}
@@ -262,7 +269,12 @@ pub fn claim_mount(mount: &Path, owner_docli_dir: &Path, ws: Uuid) -> Result<Mou
             root.display()
         )));
     }
-    let raw = fs::read_to_string(&marker_path)?;
+    // Read through the handle we already hold: on Windows `try_lock` is LockFileEx, which is
+    // MANDATORY over the whole range, so a SECOND handle opening this file fails with
+    // ERROR_LOCK_VIOLATION (os error 33). On Unix flock is advisory and either spelling works.
+    let mut raw = String::new();
+    (&f).read_to_string(&mut raw)
+        .with_context(|| format!("reading {}", marker_path.display()))?;
     let marker: MountMarker = serde_json::from_str(&raw)
         .with_context(|| format!("{} is not a docli mount marker", marker_path.display()))?;
     if marker.owner != owner || marker.workspace != ws {
@@ -277,17 +289,88 @@ pub fn claim_mount(mount: &Path, owner_docli_dir: &Path, ws: Uuid) -> Result<Mou
     Ok(MountHandle { root, _lock: f })
 }
 
+/// What a mount directory says about its identity — FOUR answers, not two.
+///
+/// `Held` exists for the same primitive behind the `os error 33` defect in `claim_mount`:
+/// `File::try_lock` is `LockFileEx` over the whole range and Windows file locks are MANDATORY, so
+/// while ANY docli run holds a mount its marker cannot be read by anybody — a `docli read` in
+/// another terminal included. Folding that into «not ours» made a healthy mirror answer «this
+/// directory is not this workspace's mirror - `docli init` re-points it»: a destructive remedy
+/// for the state `v0.28.6` D3 itself calls an ordinary session-start condition. This is the
+/// read-side twin of the distinction `MountBusy` already draws on the write side.
+///
+/// The general form, worth keeping: fixing the call site that failed is not the same as fixing
+/// the primitive that made it fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Identity {
+    /// Our marker: this control plane, this workspace.
+    Ours,
+    /// A fact about the DIRECTORY — no marker, a symlinked or unparseable one, or one naming
+    /// another owner or workspace.
+    Foreign,
+    /// A fact about the MOMENT — another docli run HOLDS this mount, so the marker cannot be
+    /// read. Transient by construction: it clears when that run finishes.
+    ///
+    /// Windows only, and that is not an accident of testing: `flock` is advisory, so on Unix the
+    /// read simply succeeds and contention never reaches this state at all.
+    Held,
+    /// We could not read the marker and contention does NOT explain it — a permission error, an
+    /// I/O fault, or bytes that are not UTF-8.
+    ///
+    /// Separate from [`Identity::Held`] because the two prescribe opposite things: «try again
+    /// when it finishes» is a remedy that cannot work for a marker that will never be readable,
+    /// and on Linux and macOS EVERY unreadable marker is this one. Naming a transient cause for
+    /// a permanent fault is how `docli status` came to paint a broken mirror green for good.
+    Unreadable,
+}
+
+impl Identity {
+    /// The two-state question most callers ask. Neither `Held` nor `Unreadable` is `Ours`: nothing may act on
+    /// a mirror it could not verify, which is why `uninstall --purge` reads through this method
+    /// and keeps its «left untouched» direction unchanged.
+    pub fn is_ours(self) -> bool {
+        matches!(self, Identity::Ours)
+    }
+}
+
+/// Is this read error somebody else's LOCK, rather than a fault?
+///
+/// Windows reports a read denied by a byte-range lock as `ERROR_LOCK_VIOLATION` (33) and one
+/// denied by the open's share mode as `ERROR_SHARING_VIOLATION` (32); `File::try_lock` is
+/// `LockFileEx`, so 33 is what a held mount produces and 32 is its near neighbour. Neither has a
+/// stable `ErrorKind`, so they are matched by raw code — the same shape `is_write_refusal` in
+/// `creds.rs` uses for EROFS, and for the same reason.
+///
+/// Always FALSE on Unix: `flock` is advisory there, so a read is never refused by a lock and any
+/// error is a genuine fault. That asymmetry is the whole point of the distinction.
+fn is_lock_contention(e: &std::io::Error) -> bool {
+    cfg!(windows) && matches!(e.raw_os_error(), Some(32) | Some(33))
+}
+
+/// Does this stat error say the path is simply NOT THERE? `NotADirectory` counts: on Unix a
+/// plain file at the mount path fails the marker stat with `ENOTDIR`, and Windows reports the
+/// same input as path-not-found — the answer is «no mirror here» on both, never «could not look».
+fn is_absent(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
 /// Lock-free mount-identity check for READ-ONLY consumers (search — Codex round 17): the
 /// root must not itself be a symlink (no-follow stat) and must carry OUR `MOUNT.docli`
 /// (owner + workspace match). A swapped root is either a symlink (refused here) or a foreign
 /// directory whose marker cannot match. No lock is taken and no file is created — a running
 /// sync is not disturbed and an unsynced mount simply fails the check.
-pub fn verify_mount_identity(mount: &Path, owner_docli_dir: &Path, ws: Uuid) -> bool {
-    if fs::symlink_metadata(mount)
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(true)
-    {
-        return false;
+pub fn verify_mount_identity(mount: &Path, owner_docli_dir: &Path, ws: Uuid) -> Identity {
+    // A stat that fails for any reason but ABSENCE is «could not look», never «not ours»: on
+    // Unix a directory we may not traverse would otherwise read as a mirror that was never
+    // synced — an ANSWER (exit 3) about a mirror nobody consulted.
+    match fs::symlink_metadata(mount) {
+        Ok(m) if m.file_type().is_symlink() => return Identity::Foreign,
+        Ok(_) => {}
+        Err(e) if is_absent(&e) => return Identity::Foreign,
+        Err(_) => return Identity::Unreadable,
     }
     let owner = fs::canonicalize(owner_docli_dir)
         .unwrap_or_else(|_| owner_docli_dir.to_path_buf())
@@ -297,18 +380,32 @@ pub fn verify_mount_identity(mount: &Path, owner_docli_dir: &Path, ws: Uuid) -> 
     // `src/MOUNT.docli -> ../real-mirror/MOUNT.docli` would let any directory borrow another
     // mirror's identity — and this check is what `uninstall --purge` deletes on.
     let marker_path = mount.join(MOUNT_MARKER);
-    if !fs::symlink_metadata(&marker_path)
-        .map(|m| m.file_type().is_file())
-        .unwrap_or(false)
-    {
-        return false;
+    match fs::symlink_metadata(&marker_path) {
+        Ok(m) if m.file_type().is_file() => {}
+        Ok(_) => return Identity::Foreign,
+        Err(e) if is_absent(&e) => return Identity::Foreign,
+        Err(e) if is_lock_contention(&e) => return Identity::Held,
+        Err(_) => return Identity::Unreadable,
     }
-    let Ok(raw) = fs::read_to_string(&marker_path) else {
-        return false;
+    let raw = match fs::read_to_string(&marker_path) {
+        Ok(raw) => raw,
+        // COULD NOT LOOK — never «not ours». WHICH of the two, though, is a question the error
+        // answers and the caller cannot: the stat above established that a regular file is
+        // there, so what remains is contention or a fault, and they prescribe opposite remedies.
+        Err(e) if is_lock_contention(&e) => return Identity::Held,
+        Err(_) => return Identity::Unreadable,
     };
+    // An UNPARSEABLE marker stays `Foreign`: that is a fact about the file's contents, which we
+    // read successfully, and `uninstall` is right to leave such a directory alone.
     serde_json::from_str::<MountMarker>(&raw)
-        .map(|m| m.owner == owner && m.workspace == ws)
-        .unwrap_or(false)
+        .map(|m| {
+            if m.owner == owner && m.workspace == ws {
+                Identity::Ours
+            } else {
+                Identity::Foreign
+            }
+        })
+        .unwrap_or(Identity::Foreign)
 }
 
 /// Set/clear the FS read-only attribute. Advisory (editors unlink-and-recreate — D3's honest
@@ -468,13 +565,13 @@ mod tests {
             format!("{{\"owner\":\"{owner}\",\"workspace\":\"{ws}\"}}"),
         )
         .unwrap();
-        assert!(verify_mount_identity(&real, &control, ws));
+        assert!(verify_mount_identity(&real, &control, ws).is_ours());
 
         let borrowed = root.join("src");
         fs::create_dir_all(&borrowed).unwrap();
         std::os::unix::fs::symlink(real.join(MOUNT_MARKER), borrowed.join(MOUNT_MARKER)).unwrap();
         assert!(
-            !verify_mount_identity(&borrowed, &control, ws),
+            !verify_mount_identity(&borrowed, &control, ws).is_ours(),
             "a symlinked marker must not confer ownership"
         );
     }
@@ -666,5 +763,130 @@ mod tests {
         assert_eq!(removed, 1);
         assert!(!stray.exists());
         assert!(tmp.path().join("keep.md").exists());
+    }
+
+    /// The read side of the `os error 33` defect, and the reason [`Identity`] has a `Held` state.
+    ///
+    /// `claim_mount` holds an exclusive lock on `MOUNT.docli` for the life of a sync. On Windows
+    /// that lock is MANDATORY (`LockFileEx`), so a concurrent `docli read` cannot read the marker
+    /// at all — and answering «not this workspace's mirror - `docli init` re-points it» to that
+    /// is a destructive remedy for a healthy mirror. On Unix `flock` is advisory and the read
+    /// simply succeeds, which is why this test asserts per platform rather than skipping: the
+    /// DIFFERENCE is the thing worth pinning, and a skip would hide it.
+    #[test]
+    fn a_mount_another_run_holds_reads_as_held_where_locks_are_mandatory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let control = tmp.path().join(".docli");
+        fs::create_dir_all(&control).unwrap();
+        let ws = uuid::Uuid::from_u128(11);
+        let mount = tmp.path().join("mirror");
+
+        // Unheld: ours, on every platform.
+        let held = claim_mount(&mount, &control, ws).unwrap();
+        drop(held);
+        assert_eq!(verify_mount_identity(&mount, &control, ws), Identity::Ours);
+
+        // Held by «another run» — the same lock, still open.
+        let _held = claim_mount(&mount, &control, ws).unwrap();
+        let seen = verify_mount_identity(&mount, &control, ws);
+        if cfg!(windows) {
+            assert_eq!(
+                seen,
+                Identity::Held,
+                "a held mount must read as «somebody holds it», never as «not ours»"
+            );
+        } else {
+            assert_eq!(
+                seen,
+                Identity::Ours,
+                "advisory locks: the read succeeds and the answer is unchanged"
+            );
+        }
+        // Whatever the platform, the one thing that must never happen is a FOREIGN verdict —
+        // that is the one carrying `docli init` as its remedy.
+        assert_ne!(seen, Identity::Foreign);
+    }
+
+    /// The OTHER half of «could not look», and the one that exists on every platform.
+    ///
+    /// `read_to_string` returns `InvalidData` for bytes that are not UTF-8, so a torn or binary
+    /// marker lands in the same arm a Windows lock does. It must NOT: waiting clears a lock and
+    /// never clears this, and three surfaces print the remedy that follows from the answer. On
+    /// Unix this is the only reachable `Unreadable`, which is why the pin lives here rather than
+    /// behind a `cfg`.
+    #[test]
+    fn a_marker_that_is_not_utf8_is_unreadable_and_never_held_or_foreign() {
+        let tmp = tempfile::tempdir().unwrap();
+        let control = tmp.path().join(".docli");
+        fs::create_dir_all(&control).unwrap();
+        let ws = uuid::Uuid::from_u128(12);
+        let mount = tmp.path().join("mirror");
+        drop(claim_mount(&mount, &control, ws).unwrap());
+
+        // A lone 0x80 is not valid UTF-8 in any position.
+        fs::write(mount.join(MOUNT_MARKER), [0x80u8, 0x81, 0x82]).unwrap();
+        let seen = verify_mount_identity(&mount, &control, ws);
+        assert_eq!(
+            seen,
+            Identity::Unreadable,
+            "unreadable bytes are not a verdict"
+        );
+        assert_ne!(
+            seen,
+            Identity::Held,
+            "nothing holds this file - promising it clears by waiting is a remedy that cannot work"
+        );
+
+        // …and an unparseable marker we CAN read stays a fact about the file: `Foreign`.
+        fs::write(mount.join(MOUNT_MARKER), "{ not json").unwrap();
+        assert_eq!(
+            verify_mount_identity(&mount, &control, ws),
+            Identity::Foreign
+        );
+    }
+
+    /// A stat that fails for a reason other than absence is «could not look» too — at BOTH
+    /// stats. On Unix an untraversable directory used to read `Foreign`, which `locate` turns into
+    /// «never been synced», an ANSWER, exit 3, about a mirror nobody consulted.
+    #[cfg(unix)]
+    #[test]
+    fn a_mount_we_cannot_look_into_is_unreadable_and_an_absent_one_is_foreign() {
+        use std::os::unix::fs::PermissionsExt;
+        let lock = |p: &Path, mode| fs::set_permissions(p, fs::Permissions::from_mode(mode));
+        let tmp = tempfile::tempdir().unwrap();
+        let control = tmp.path().join(".docli");
+        fs::create_dir_all(&control).unwrap();
+        let ws = uuid::Uuid::from_u128(13);
+        let parent = tmp.path().join("locked");
+        let mount = parent.join("mirror");
+        drop(claim_mount(&mount, &control, ws).unwrap());
+
+        // The MARKER stat: the mount itself untraversable.
+        lock(&mount, 0o000).unwrap();
+        let marker_arm = verify_mount_identity(&mount, &control, ws);
+        lock(&mount, 0o755).unwrap();
+        // The MOUNT stat: its parent untraversable.
+        lock(&parent, 0o000).unwrap();
+        let mount_arm = verify_mount_identity(&mount, &control, ws);
+        lock(&parent, 0o755).unwrap();
+        if marker_arm == Identity::Ours {
+            // Root reads through any mode — nothing to pin on this account.
+            return;
+        }
+        assert_eq!(marker_arm, Identity::Unreadable, "the marker stat");
+        assert_eq!(mount_arm, Identity::Unreadable, "the mount stat");
+
+        // ABSENT stays `Foreign` — the never-synced answer keeps its exit 3 — and so does a
+        // plain FILE where the mount should be (`ENOTDIR` at the marker stat).
+        assert_eq!(
+            verify_mount_identity(&tmp.path().join("absent"), &control, ws),
+            Identity::Foreign
+        );
+        let file = tmp.path().join("a-file");
+        fs::write(&file, "x").unwrap();
+        assert_eq!(
+            verify_mount_identity(&file, &control, ws),
+            Identity::Foreign
+        );
     }
 }

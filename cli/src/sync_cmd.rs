@@ -1496,6 +1496,67 @@ fn is_home_write_refusal(e: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The agent-behaviour evals under `apps/cli/evals/` measure THIS text — the SessionStart
+    /// hook's `additionalContext` — but `claude plugin eval` loads no hooks, so each case carries
+    /// a copy in `execution.append_system_prompt`. A copy that drifts from the const measures a
+    /// string the product does not ship, and the gate then fails by PASSING (the v0.38.0 lesson,
+    /// carried over). YAML's `>` folds single newlines to spaces, which is reversed here; the
+    /// cases never contain a blank line inside the block, so the fold is exact.
+    #[test]
+    fn the_eval_cases_carry_the_shipped_orientation() {
+        for (name, yaml) in [
+            (
+                "consult-before-files",
+                include_str!("../evals/consult-before-files/case.yaml"),
+            ),
+            (
+                "consult-before-manuscript",
+                include_str!("../evals/consult-before-manuscript/case.yaml"),
+            ),
+            (
+                "read-narrowly",
+                include_str!("../evals/read-narrowly/case.yaml"),
+            ),
+            (
+                "write-back-before-next-step",
+                include_str!("../evals/write-back-before-next-step/case.yaml"),
+            ),
+        ] {
+            // The needle below ENDS in `\n`, so a CRLF copy of this file matches NOTHING and the
+            // pin fails for a reason that has nothing to do with drift. `.gitattributes` keeps
+            // these assets LF on every checkout; this is what notices if that stops being true.
+            assert!(
+                !yaml.contains('\r'),
+                "{name}: carries CR - cover it in .gitattributes"
+            );
+            let block = yaml
+                .split("append_system_prompt: >\n")
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name}: no append_system_prompt block"));
+            let unfolded: String = block
+                .lines()
+                .take_while(|l| l.starts_with("    "))
+                .map(str::trim)
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(
+                unfolded, ORIENTATION,
+                "{name}: the case's orientation copy has drifted from the shipped const"
+            );
+        }
+    }
+
+    /// The two consult arms — a code project and a manuscript — are ONE measurement only if they
+    /// are scored by one rubric; the harness discovers graders per case, so the rubric exists as
+    /// two files, and byte identity is the cheapest statement of «one».
+    #[test]
+    fn the_consult_cases_share_one_grader() {
+        assert_eq!(
+            include_str!("../evals/consult-before-files/graders/searched-first.md"),
+            include_str!("../evals/consult-before-manuscript/graders/searched-first.md"),
+        );
+    }
+
     #[test]
     fn the_post_write_hook_syncs_for_an_unrecognised_tool() {
         // The FAIL-SAFE direction, and the reason the read list is what is enumerated. A write

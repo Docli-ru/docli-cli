@@ -208,7 +208,12 @@ type Mirror = (PathBuf, String);
 fn project_mirrors(cwd: &Path) -> Option<(PathBuf, crate::config::DocliToml, Vec<Mirror>)> {
     let root = crate::config::find_project(cwd)?;
     let raw = std::fs::read_to_string(root.join(crate::config::CONFIG_NAME)).ok()?;
-    let config = crate::config::parse_config(&raw).ok()?;
+    let mut config = crate::config::parse_config(&raw).ok()?;
+    // A mount may OMIT `dir` - the documented normal case, and what every committed `docli.toml`
+    // looks like. Without this the mount keeps `dir = ""`, `mount_abs` joins "" onto the project
+    // root, and the guard covers the ROOT under an empty name while the real mirror under
+    // `~/.docli/mirror/<ws>` falls outside it and is silently allowed.
+    crate::config::resolve_mount_dirs(&mut config).ok()?;
     let mirrors = config
         .mounts
         .iter()
@@ -596,5 +601,45 @@ mod tests {
         let reason = mirror_write_refusal("mirror/n.md", "notes");
         assert!(reason.contains(MIRROR_RULE));
         assert!(crate::apply::hand_edit_overwritten("n.md").contains(MIRROR_RULE));
+    }
+
+    /// The documented NORMAL config OMITS `dir` — and every other fixture in this module writes
+    /// it explicitly, which is how the guard shipped as a no-op for the one configuration the
+    /// product tells people to write (measured on Windows, 2026-09-22). Without
+    /// `resolve_mount_dirs` the mount keeps `dir = ""`, `mount_abs` joins `""` onto the project
+    /// root, and the derived mirror under `~/.docli/mirror/<ws>` falls OUTSIDE every guarded
+    /// path — so a real mirror write was allowed while `docli status` reported it refused.
+    #[test]
+    fn a_mount_with_no_dir_is_still_guarded() {
+        const WS: &str = "00000000-0000-0000-0000-000000000001";
+        let _home = crate::creds::home_env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("docli.toml"),
+            format!("server = \"https://docli.ru\"\n\n[[mount]]\nworkspace = \"{WS}\"\n"),
+        )
+        .unwrap();
+        let mirror = home.path().join("mirror").join(WS);
+        std::fs::create_dir_all(mirror.join("sub")).unwrap();
+
+        std::env::set_var("DOCLI_HOME", home.path());
+        let inside = decide(
+            tmp.path(),
+            &edit(&mirror.join("sub").join("note.md").to_string_lossy()),
+        );
+        let outside = decide(
+            tmp.path(),
+            &edit(&tmp.path().join("src.rs").to_string_lossy()),
+        );
+        std::env::remove_var("DOCLI_HOME");
+
+        let Decision::Deny(reason) = inside else {
+            panic!("must deny: {inside:?}");
+        };
+        // The derived mount has no `name`, so the refusal names the workspace — never an empty
+        // ``, which is what the project-root fallback rendered.
+        assert!(reason.contains(WS), "{reason}");
+        assert_eq!(outside, Decision::Allow);
     }
 }

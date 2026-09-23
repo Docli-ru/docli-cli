@@ -1,3 +1,9 @@
+---
+type: llm
+weight: 1
+focus: trace
+---
+
 # Grader — did the agent read narrowly?
 
 PASS if every `docli read` of a NOTE in the run was narrowed: a `--lines A-B` range, or the

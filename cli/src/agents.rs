@@ -1709,12 +1709,18 @@ mod tests {
         let before = std::fs::read_to_string(proj.path().join(".codex/config.toml")).unwrap();
 
         let _lock = crate::creds::home_env_lock();
+        // `home_dir()` reads USERPROFILE on Windows and IGNORES HOME (measured, rustc 1.98), so
+        // setting HOME - the obvious spelling - overrode nothing there: this test wrote its
+        // tempdir grant into the developer's REAL ~/.codex/config.toml, creating that file, and
+        // then failed reading it back out of the tempdir. It also never restored the variable.
+        // One seam sets what this platform actually reads, and restores it on drop.
+        let _os_home = crate::creds::TestOsHome::set(home.path());
         // SAFETY: single-threaded under the guard.
         unsafe {
-            std::env::set_var("HOME", home.path());
             std::env::set_var("DOCLI_HOME", home.path().join(".docli"));
         }
         let wrote = allow_codex_refresh(proj.path()).unwrap();
+        let granted = crate::creds::auth_dir().unwrap();
         unsafe {
             std::env::remove_var("DOCLI_HOME");
         }
@@ -1727,7 +1733,18 @@ mod tests {
         );
         let user = std::fs::read_to_string(home.path().join(".codex/config.toml")).unwrap();
         assert!(user.contains("writable_roots"), "{user}");
-        assert!(user.contains(".docli/auth"), "{user}");
+        // Read the VALUE, not a POSIX-shaped substring: `toml_edit` escapes a Windows path, so
+        // `.docli/auth` never appears in the file there. Build the expectation the way the
+        // product builds the path.
+        let doc: toml_edit::DocumentMut = user.parse().unwrap();
+        let roots = doc["sandbox_workspace_write"]["writable_roots"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{user}"));
+        let granted = granted.to_string_lossy().into_owned();
+        assert!(
+            roots.iter().any(|v| v.as_str() == Some(granted.as_str())),
+            "{user}"
+        );
     }
 
     /// The sandbox grant APPENDS. Every other root is somebody's own decision about their own
@@ -2034,7 +2051,15 @@ mod tests {
         // `docli init --dir <custom>` means `docli-mirror/**` is not a safe guess — it would be
         // silently inert for exactly the users who customised.
         use crate::config::Mount;
-        let root = Path::new("/proj");
+        // ABSOLUTE, spelled the platform's way. `Path::new("/proj")` carries no drive letter, so
+        // Windows reads it as RELATIVE: the absolute-mount branch below was never taken there and
+        // the glob came out `/proj/inside/**` — which `skill_globs` is right to produce. A Unix
+        // literal in the fixture, not a defect in the product.
+        let (root, inside, outside) = if cfg!(windows) {
+            (Path::new(r"C:\proj"), r"C:\proj\inside", r"D:\tmp\outside")
+        } else {
+            (Path::new("/proj"), "/proj/inside", "/var/tmp/outside")
+        };
         let m = |dir: &str| Mount {
             workspace: uuid::Uuid::from_u128(1),
             dir: dir.into(),
@@ -2050,8 +2075,8 @@ mod tests {
         // An ABSOLUTE mount inside the project resolves; one outside contributes nothing,
         // because a project-relative glob cannot express it and a silently wrong pattern is
         // worse than an absent one (the same limit the guard states).
-        assert_eq!(skill_globs(root, &[m("/proj/inside")]), vec!["inside/**"]);
-        assert!(skill_globs(root, &[m("/var/tmp/outside")]).is_empty());
+        assert_eq!(skill_globs(root, &[m(inside)]), vec!["inside/**"]);
+        assert!(skill_globs(root, &[m(outside)]).is_empty());
         // …and so does a name carrying glob metacharacters: `mirror[prod]/**` reads `[prod]` as
         // a character class, which would miss the real directory and could match others. A
         // silently wrong pattern is worse than an absent one, and no escape syntax is

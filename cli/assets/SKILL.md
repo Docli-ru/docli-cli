@@ -154,12 +154,22 @@ normal case) no `docli init` is needed; when a project keeps it local, `docli in
   file is never "fixed" in place, and no file is ever created inside a mirror directory.
 - Changing a note means writing through the docli MCP connection; the next `docli sync` brings
   the change back down. When writing over MCP, **prefer `edit_note`** (exact-string replacement)
-  to `write_note`, which replaces the entire body — `write_note` called with content derived
-  from a stale or partial copy silently removes everything omitted from that copy. When
-  `write_note` is unavoidable, the current body is read first and the full body sent based on
-  it, and `conflictSiblingId` is checked after every write: a non-null value means the base was
-  stale, so the current note is re-read, the full-body update redone, and the conflict sibling
-  deleted only once its content is confirmed no longer needed.
+  to `write_note`, which takes the entire body. Without `base`, `write_note` replaces whatever
+  the note holds, so a stale or partial copy can silently remove text omitted from that copy.
+  When `write_note` is unavoidable, the current body is read first, the full updated body is
+  sent, and the body that was read is passed as `base`. The submitted and current bodies are
+  compared with that common base, and the resulting changes are merged word by word.
+  Three fields are checked after every write. `mergedWithLiveEdits` is true when the note had
+  changed since `base` and the submitted body was merged with those changes without creating
+  a conflict sibling. `overlappingEdits` counts the submitted changes that touched text also
+  changed since `base`; at those locations, the note holds text from both sides. If the count
+  is above 0, the note is re-read and those overlaps are resolved with `edit_note`.
+  A non-null `conflictSiblingId` means the merge could not run and a rare fallback kept both
+  versions separately in the original note and a conflict sibling. Both notes are read and
+  reconciled; the sibling is deleted only once its content is confirmed no longer needed.
+  The body just sent may be reused as `base` for the next whole-body write only when
+  `mergedWithLiveEdits` was false and `conflictSiblingId` was null; otherwise the note is
+  re-read and its full body is used as `base`.
 - `docli doctor` detects hand edits (digest mismatch) and every other divergence; `docli sync
   --full` is the repair.
 

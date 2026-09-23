@@ -88,6 +88,44 @@ pub(crate) fn home_env_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Override the home directory `std::env::home_dir()` ACTUALLY reads on this platform, restoring
+/// the previous value on drop. TESTS ONLY.
+///
+/// `home_dir()` reads `USERPROFILE` on Windows and IGNORES `HOME` (measured, rustc 1.98), so a
+/// test that sets `HOME` — the obvious spelling — overrides nothing there. The one that did wrote
+/// its tempdir `writable_roots` entries into the developer's REAL `~/.codex/config.toml`,
+/// creating that file and its directory, and then failed reading them back out of its tempdir; it
+/// also never restored the variable, leaking it into every later test in the binary. Both halves
+/// of that — the right variable, and the restore — live here so no test has to remember either.
+///
+/// Hold [`home_env_lock`] around one of these: the variable is process-global.
+#[cfg(test)]
+pub(crate) struct TestOsHome {
+    previous: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl TestOsHome {
+    /// The variable `std::env::home_dir()` reads on this platform.
+    pub(crate) const VAR: &'static str = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+
+    pub(crate) fn set(path: &Path) -> Self {
+        let previous = std::env::var_os(Self::VAR);
+        std::env::set_var(Self::VAR, path);
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestOsHome {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(v) => std::env::set_var(Self::VAR, v),
+            None => std::env::remove_var(Self::VAR),
+        }
+    }
+}
+
 /// `~/.docli` (override: `DOCLI_HOME` — tests and odd setups) — the CLI's per-MACHINE home.
 ///
 /// One definition, because more than one thing lives here now: the credentials, and since the
@@ -300,12 +338,7 @@ impl CredsStore {
         if let Err(e) = restrict_dir(&store.dir) {
             return store.finish_unwritable(e);
         }
-        let lock = match OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(store.lock_path())
-        {
+        let lock = match open_lock(&store.lock_path()) {
             Ok(l) => l,
             Err(e) if is_write_refusal(&e) => {
                 return store.finish_unwritable(anyhow::Error::new(e))
@@ -490,12 +523,7 @@ impl CredsStore {
     /// burns the stored one and locks the user out of a credential only a browser round-trip
     /// restores — which is exactly what an agent cannot do.
     fn lock_for_write(&self) -> Result<std::fs::File> {
-        match OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(self.lock_path())
-        {
+        match open_lock(&self.lock_path()) {
             Ok(l) => Ok(l),
             Err(e) if is_write_refusal(&e) => bail!(
                 "{} is not writable, so the sign-in cannot be updated here - run the command \
@@ -916,6 +944,81 @@ fn is_write_refusal(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(30)
 }
 
+/// Open — creating when needed — the credentials lock, and repair a lock an earlier version
+/// left unopenable.
+///
+/// **The defect this exists for (measured on Windows, 2026-09-22).** `restrict_dir` leaves
+/// `~/.docli/auth` as `D:PAI(A;;FA;;;OW)`: one ACE, Full to OWNER RIGHTS, with NO `(OI)(CI)`
+/// inheritance flags. Nothing is inherited by children, so a file BORN in `auth` lands with an
+/// EMPTY DACL (`D:AI`). Windows grants the CREATOR the access it asked for at creation time, so
+/// such a file works for exactly the run that made it and is then unopenable by anyone,
+/// `ACCESS_DENIED`, permanently. `credentials.json` and `install_id` escape this because
+/// `restrict_file` names them; `creds.lock` never was — so every run after the first failed
+/// `lock_for_write` and reported «the home directory is not writable … (outside an agent
+/// sandbox)» about a home that was perfectly writable. A wrong diagnosis of a real breakage, on
+/// the path that stores and REFRESHES tokens.
+///
+/// So: `create_new` FIRST, so a lock this run makes gets an ACE of its own — one `icacls` spawn,
+/// on the creating run only — then repair-then-retry for a lock an earlier version already broke.
+///
+/// **The repair must be driven by the failing OPEN, never by a probe.** Guarding it on
+/// `lock_path().exists()` never runs: an empty-DACL file is invisible to `exists()` too, because
+/// reading its ATTRIBUTES is denied as well. The OWNER keeps `WRITE_DAC` whatever the DACL says,
+/// which is what makes an existing install repairable in place rather than only reinstallable.
+///
+/// On Unix this is the same sequence with `chmod`, and the `create_new` arm is what gives a new
+/// lock its 0600 instead of whatever the umask says.
+fn open_lock(p: &Path) -> std::io::Result<std::fs::File> {
+    match OpenOptions::new().create_new(true).write(true).open(p) {
+        Ok(f) => {
+            // Best-effort: the lock holds no secret, and a hardening failure must not stop THIS
+            // run from taking it. What the call buys is the ACE the parent cannot give.
+            //
+            // The honest limit, since a truthful message is the whole point of this function: if
+            // `icacls` is absent or refused, the NEXT run meets an empty-DACL lock, the repair
+            // below calls the same failing helper, and `lock_for_write` reports «the home
+            // directory is not writable». Wrong in its words, right in its effect — a machine
+            // that cannot set an owner-only DACL is one this module already refuses to store
+            // credentials on (`restrict_windows`). The degradation is one run deep, not silent.
+            let _ = restrict_file(p);
+            return Ok(f);
+        }
+        // Somebody else's lock, or our own from an earlier run — fall through and open it.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    let reopen = || {
+        OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(p)
+    };
+    match reopen() {
+        Ok(f) => Ok(f),
+        // WINDOWS ONLY. The defect this repairs — a lock born with an EMPTY DACL — cannot occur
+        // on Unix, where a lock the owner cannot open means a read-only home or a sandbox, and
+        // that refusal must reach `finish_unwritable` untouched: chmod-ing it back to 0600
+        // healed exactly the state `a_write_refusal_on_the_lock_explains_itself_and_keeps_the_
+        // sign_in` pins, and would widen a lock someone made read-only on purpose. (Unix is
+        // also where a planted symlink would have made the chmod follow it to its target.)
+        #[cfg(not(windows))]
+        Err(first) => Err(first),
+        #[cfg(windows)]
+        Err(first) => {
+            // Driven by the failing OPEN, never a probe: an empty-DACL file denies reads of its
+            // ATTRIBUTES too, so `symlink_metadata` fails on exactly the file this exists to fix.
+            // If the repair itself fails we cannot tell a broken DACL from a genuinely
+            // unwritable home, so the ORIGINAL error stands — that is the one the
+            // read-only-sandbox arm is written against.
+            if restrict_file(p).is_err() {
+                return Err(first);
+            }
+            reopen()
+        }
+    }
+}
+
 /// Owner-only DACL via `icacls` with the OWNER_RIGHTS SID (`*S-1-3-4`) — locale-independent
 /// (no `%USERNAME%` parsing), the same effect as gh's config-file fallback hardened: strip
 /// inheritance, grant only the object owner.
@@ -941,6 +1044,14 @@ fn restrict_windows(p: &Path) -> Result<()> {
             "/grant:r",
             "*S-1-3-4:F",
         ])
+        // SILENT, both streams. `icacls` narrates every file it touches ("обработанный файл: …",
+        // in the console's OEM codepage), and an inherited stdout puts that narration AHEAD of
+        // the command's own output: `docli search --json` on Windows emitted six lines of
+        // chatter and then the JSON, which is not JSON — and `search` is the one command the
+        // contract says can establish that a note does not exist. Nothing is lost by dropping
+        // it: a failure is caught by `status.success()` below and reported in our own words.
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .context("running icacls to restrict the credentials file")?;
     if !status.success() {
@@ -1546,5 +1657,55 @@ mod tests {
         seed(&s, "srv", 0);
         s.remove("srv").unwrap();
         assert_eq!(s.install_id("srv").unwrap(), a, "survives a logout");
+    }
+
+    /// This one exists because the defect it pins was silent exactly for want of it: an override
+    /// that sets a variable the platform does not read changes nothing, and the test that relied
+    /// on it went on to write into the developer's real home while reporting a tempdir failure.
+    #[test]
+    fn the_test_home_override_is_the_variable_this_platform_reads() {
+        let _lock = home_env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let before = std::env::var_os(TestOsHome::VAR);
+        {
+            let _home = TestOsHome::set(tmp.path());
+            assert_eq!(
+                std::env::home_dir(),
+                Some(tmp.path().to_path_buf()),
+                "TestOsHome must set the variable std::env::home_dir() actually reads here"
+            );
+        }
+        assert_eq!(
+            std::env::var_os(TestOsHome::VAR),
+            before,
+            "the override must be restored on drop, or it leaks into every later test"
+        );
+    }
+
+    /// Codex's `writable_roots` is RECURSIVE, so a grant of `~/.docli` instead of `~/.docli/auth`
+    /// would hand shell commands the MIRROR — the one gap the guard hook cannot cover, and the
+    /// reason [`auth_dir`] is named apart from [`cli_home`] at all.
+    ///
+    /// It lives here rather than in the grant's own test because that test necessarily builds its
+    /// expectation from `auth_dir()`, and an assertion that reads a value back out of the
+    /// function that produced it pins nothing about the value's SHAPE. This one is constructed
+    /// independently.
+    #[test]
+    fn the_credentials_dir_is_exactly_one_level_below_the_home() {
+        let _lock = home_env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join(".docli");
+        std::env::set_var("DOCLI_HOME", &home);
+        let auth = auth_dir().unwrap();
+        let cli = cli_home().unwrap();
+        std::env::remove_var("DOCLI_HOME");
+
+        assert_eq!(auth, home.join("auth"));
+        assert_eq!(
+            auth.parent(),
+            Some(cli.as_path()),
+            "the sandbox grant is recursive: one level higher and it reaches the mirror"
+        );
+        assert_eq!(auth.file_name().and_then(|n| n.to_str()), Some("auth"));
     }
 }

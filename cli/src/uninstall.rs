@@ -74,7 +74,7 @@ fn project_paths(cwd: &Path) -> Result<Vec<PathBuf>> {
     let project = crate::config::load_project(&root)?;
     let root_phys = crate::config::physicalize(&root);
     let mut out = vec![root.join(".docli")];
-    let mut skipped: Vec<String> = Vec::new();
+    let mut skipped: Vec<(String, crate::mountfs::Identity)> = Vec::new();
     // A mount directory is only OURS if THAT DIRECTORY carries our marker: `MOUNT.docli` naming
     // this control plane as owner and this workspace. Workspace STATE is not proof — it is keyed
     // by workspace id, so re-pointing an already-synced workspace at an existing `src/` made
@@ -105,19 +105,33 @@ fn project_paths(cwd: &Path) -> Result<Vec<PathBuf>> {
         // OWNERSHIP is the marker, not location. A mount may legitimately live outside the
         // project (`/var/tmp/docli-mirror`); requiring a descendant path silently skipped it
         // while `--purge` still reported success and left the mirror on disk.
-        if !crate::mountfs::verify_mount_identity(&abs, &control_dir, m.workspace) {
+        // `is_ours()` keeps the direction exactly as it was: anything we could not verify is
+        // left alone. What changes is only what we SAY about it below.
+        let identity = crate::mountfs::verify_mount_identity(&abs, &control_dir, m.workspace);
+        if !identity.is_ours() {
             if abs.exists() {
-                skipped.push(shown(&abs));
+                skipped.push((shown(&abs), identity));
             }
             continue;
         }
         out.push(abs);
     }
     out.retain(|p| p.exists());
-    for s in skipped {
+    for (s, identity) in skipped {
         // `warn`, not `detail`: `--quiet` drops narration, and «I did not delete what you asked
         // me to delete» is not narration.
-        ui::warn(&format!("{s}: not this project's mirror - left untouched"));
+        //
+        // The REASON matters here more than anywhere: «not this project's mirror» invites the
+        // operator to go and delete the directory by hand. A mount another run merely holds is
+        // this project's mirror, and the answer is to run this again afterwards.
+        let why = match identity {
+            crate::mountfs::Identity::Held => crate::mountfs::MOUNT_HELD,
+            // NOT the same sentence: re-running clears the first and never clears this one, and
+            // an operator who is told to wait for a marker that will never read waits forever.
+            crate::mountfs::Identity::Unreadable => "its marker could not be read",
+            _ => "not this project's mirror",
+        };
+        ui::warn(&format!("{s}: {why} - left untouched"));
     }
     Ok(out)
 }
@@ -140,6 +154,7 @@ fn still_ours(cwd: &Path, dir: &Path) -> bool {
         crate::config::physicalize(&crate::config::mount_abs(&root, m))
             == crate::config::physicalize(dir)
             && crate::mountfs::verify_mount_identity(dir, &project.control_root().dir, m.workspace)
+                .is_ours()
     })
 }
 
@@ -679,7 +694,12 @@ mod tests {
         std::fs::create_dir_all(root.join(dir)).unwrap();
         std::fs::write(
             root.join(dir).join("MOUNT.docli"),
-            format!("{{\"owner\":\"{owner}\",\"workspace\":\"{ws}\"}}"),
+            // SERIALIZE, never `format!`. On Windows `canonicalize` returns the extended-length
+            // prefix, and such a path pasted between quotes emits invalid JSON escapes, so the
+            // marker was unparseable and `verify_mount_identity` correctly answered «not this
+            // project's mirror». That read as an owner-comparison bug in the product and is not
+            // one — both sides canonicalize. Hand-rolled JSON holding a path is the defect.
+            serde_json::json!({ "owner": owner, "workspace": ws }).to_string(),
         )
         .unwrap();
     }

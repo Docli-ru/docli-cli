@@ -1032,6 +1032,38 @@ fn doctor_reports_a_materialized_but_untracked_note() {
     assert_eq!(run_doctor(&mut f, &server).unwrap(), 1);
 }
 
+/// A mirror doctor cannot LOOK into is not a mirror that was never synced. `status` and `read`
+/// send the reader here for an unreadable marker; `is_file()` used to turn that into
+/// «never been synced - run `docli sync`», a false absence with a remedy that fails.
+#[cfg(unix)]
+#[test]
+fn doctor_reports_an_untraversable_mirror_as_uninspectable_not_never_synced() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut f = fx();
+    let tree: Arc<Mutex<BTreeMap<u128, Value>>> = Arc::new(Mutex::new(BTreeMap::from([(
+        1,
+        wire_node(1, "file", "a.md", 1, Some("body")),
+    )])));
+    let server = spawn_stub(tree_server(tree.clone()));
+    assert_eq!(sync(&mut f, &server), 0);
+    f.project.config.server = server.clone();
+    let api = api_for(&f.project.root, &server);
+
+    let mode = |m| std::fs::set_permissions(&f.mirror, std::fs::Permissions::from_mode(m));
+    mode(0o000).unwrap();
+    let got = docli_cli::doctor::collect(&f.project, &api);
+    mode(0o755).unwrap();
+    if got.as_ref().is_ok_and(|all| all[0].1.is_empty()) {
+        return; // root reads through any mode - a clean report, nothing to pin on this account
+    }
+    let err = match got {
+        Ok(all) => panic!("an uninspectable mirror must not produce a report: {all:?}"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(err.contains("could not inspect"), "{err}");
+    assert!(!err.contains("never been synced"), "{err}");
+}
+
 #[test]
 fn an_orphan_relocated_marker_is_reported_and_swept() {
     // State loss + a remote hard delete strands `.docli/markers/<id>.docli`: no replay can

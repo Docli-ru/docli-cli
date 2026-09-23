@@ -178,6 +178,17 @@ impl AskDecision {
 /// Named because the notice must not offer a remedy that cannot work (Codex round 2).
 const NOT_THIS_MIRROR: &str = "this directory is not this workspace's mirror";
 
+/// Its own reason, separate from [`NOT_THIS_MIRROR`] on purpose: the renderer appends «- `docli
+/// init` re-points it» to that one, and a mount another run merely HOLDS needs no re-pointing.
+/// Where file locks are mandatory (Windows), a concurrent `docli sync` makes the marker
+/// unreadable, and «not this mirror» would be a confident wrong answer about a healthy mirror.
+const MOUNT_BUSY: &str = crate::mountfs::MOUNT_HELD;
+
+/// Its own reason again, for the OTHER half of «could not look»: a marker that will not read for
+/// a reason contention does not explain. It must not borrow [`MOUNT_BUSY`]'s words — «another run
+/// holds it» prescribes waiting, and this one never clears by waiting.
+const MOUNT_UNREADABLE: &str = "this mount's marker could not be read";
+
 /// The four values THIS build understands (v0.29.0 D2b). The wire carries a plain string so an
 /// unknown value from a newer server survives the parse; the CLI's own contract — the `--json`
 /// projection and the printed line — is closed over these four, and anything else is folded into
@@ -210,7 +221,7 @@ fn read_local(project: &Project, control: &ControlRoot, mount: &Mount, now: i64)
     let mount_root = crate::config::mount_abs(&project.root, mount);
     // State is keyed by WORKSPACE, so it says nothing about the directory configured NOW; the
     // marker in the directory is the only thing that binds the two.
-    let identity_ok =
+    let identity =
         crate::mountfs::verify_mount_identity(&mount_root, &control.dir, mount.workspace);
     let loaded = match control.load_state(mount.workspace) {
         Ok(st) => st,
@@ -227,17 +238,21 @@ fn read_local(project: &Project, control: &ControlRoot, mount: &Mount, now: i64)
             notes: HashMap::new(),
         };
     };
-    let decision = if !identity_ok {
-        AskDecision::Unusable(NOT_THIS_MIRROR.into())
-    } else {
-        match st.unusable_reason(mount.folder.as_deref(), now) {
+    let decision = match identity {
+        // «Could not look», which is not «not ours» — and deliberately NOT the `NOT_THIS_MIRROR`
+        // string, because the renderer appends «- `docli init` re-points it» to that one and a
+        // busy mount needs no repointing. The search itself is unaffected: it asks the server.
+        crate::mountfs::Identity::Held => AskDecision::Unusable(MOUNT_BUSY.into()),
+        crate::mountfs::Identity::Unreadable => AskDecision::Unusable(MOUNT_UNREADABLE.into()),
+        crate::mountfs::Identity::Foreign => AskDecision::Unusable(NOT_THIS_MIRROR.into()),
+        crate::mountfs::Identity::Ours => match st.unusable_reason(mount.folder.as_deref(), now) {
             Some(reason) => AskDecision::Unusable(reason.into()),
             None => AskDecision::Ask(MirrorPosition {
                 cursor: st.cursor,
                 epoch: st.epoch,
                 ledger_count: st.ledger.len() as i64,
             }),
-        }
+        },
     };
     let notes = match decision {
         AskDecision::Ask(_) => st
@@ -458,12 +473,18 @@ fn mirror_sentence(r: &RenderedWorkspace) -> Option<String> {
         // v0.29.1's editorial pass replaced it with a sentence that says the same thing without
         // asking the reader to know what a projection is. Both constraints still bind.
         //
-        // …and the remedy REDIRECTS instead of naming a command, because the seven reasons do not
-        // share one (Codex round 3): a transient park needs the occupant removed and then
+        // …and the remedy REDIRECTS instead of naming a command, because the reasons do not share
+        // one (Codex round 3): a transient park needs the occupant removed and then
         // `docli sync --full` — plain `sync` never replays a parked delivery — and a blocked
         // removal needs the occupant gone first. `sync --check` already renders the exact fix for
-        // every one of them, so pointing at it is both true for all seven and one authority for
-        // the remedy rather than a second copy of it here.
+        // every STATE reason, so pointing at it is one authority for the remedy rather than a
+        // second copy of it here.
+        //
+        // The two IDENTITY reasons are the exception and are deliberately left to this arm's
+        // generic sentence: `sync --check` reports a held mount as «check skipped» (`sync_cmd`),
+        // which neither clears it nor names a fix, and it cannot repair a marker that will not
+        // read at all. What both need is the one thing this line already says — look elsewhere
+        // for now — so the redirect is honest for them even though the command is not their fix.
         //
         // «CLEARS IT or names the fix», not just the latter (Codex round 4): one reason —
         // `at_head = false` over a mirror that is actually caught up, the crash window between a
@@ -1385,5 +1406,30 @@ mod tests {
         o.delta = delta.map(str::to_string);
         let mut any = false;
         render_workspace(&f.mount, l, &o, &mut any)
+    }
+
+    /// `MOUNT_BUSY` and `MOUNT_UNREADABLE` exist ONLY so their lines do not inherit
+    /// `NOT_THIS_MIRROR`'s remedy — `mirror_sentence` appends «`docli init` re-points it» to that
+    /// one by exact-equality match, and re-pointing a mirror somebody is syncing, or one whose
+    /// marker will not read, fixes nothing and destroys the mount table entry that was correct.
+    ///
+    /// The sibling property is already pinned by
+    /// `the_unusable_line_never_offers_a_remedy_that_cannot_work`; this is the same rule for the
+    /// two reasons added when the identity check learned to say «I could not look».
+    #[test]
+    fn a_held_or_unreadable_mount_is_never_told_to_re_point_itself() {
+        let f = fx();
+        for reason in [MOUNT_BUSY, MOUNT_UNREADABLE] {
+            let l = MountLocal {
+                decision: AskDecision::Unusable(reason.into()),
+                notes: HashMap::new(),
+            };
+            let line = mirror_sentence(&rendered_with(&f, &l, None)).expect("a line");
+            assert!(line.contains(reason), "{line}");
+            assert!(
+                !line.contains("docli init"),
+                "{reason} must not carry the re-point remedy: {line}"
+            );
+        }
     }
 }

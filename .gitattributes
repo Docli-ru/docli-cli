@@ -1,0 +1,7 @@
+# Files the CLI embeds with `include_str!` ship as BYTES inside the binary, so their line endings
+# must not depend on the checkout: with `core.autocrlf=true` (the Windows default) they arrive
+# CRLF, and a CLI built from that checkout writes a skill with no description and no activation
+# globs. Mirrors the monorepo's `.gitattributes`.
+cli/assets/** text eol=lf
+cli/evals/**  text eol=lf
+cli/keys/**   text eol=lf

@@ -223,7 +223,29 @@ fn doctor_mount(
     let mount_path = mount_abs(&project.root, mount);
     // READ-ONLY honesty: a never-synced mount must not be CREATED by doctor (claim_mount mints
     // the dir + ownership marker on a first claim, which is a write). Report and move on.
-    if !mount_path.join(crate::mountfs::MOUNT_MARKER).is_file() {
+    // «Never synced» only when the marker is really ABSENT. `is_file()` turned every stat
+    // failure into absence, so an untraversable mirror — which `status` and `read` now report as
+    // «could not be read … docli doctor reports the mount» — came back here as never-synced,
+    // with `docli sync` as the remedy. A stat that fails for another reason is reported as such.
+    let marker = mount_path.join(crate::mountfs::MOUNT_MARKER);
+    let absent = match std::fs::metadata(&marker) {
+        Ok(_) => false,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            true
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!(
+                "could not inspect {} - check its permissions",
+                marker.display()
+            )))
+        }
+    };
+    if absent {
         return Ok(vec![Discrepancy {
             class: "missing-local",
             path: mount.dir.clone(),

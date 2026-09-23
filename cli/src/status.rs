@@ -46,6 +46,20 @@ pub struct MountStatus {
     /// The configured directory carries OUR `MOUNT.docli` (this control plane, this workspace).
     /// False after a re-point that has not been synced, or when someone replaced the directory.
     pub claimed: bool,
+    /// Another docli run HOLDS this mount, so its marker could not be read (where file locks are
+    /// mandatory, a running `sync` makes the marker unreadable to everyone else). Distinct from
+    /// `!claimed`, which is a statement about the directory: this one says we could not look, so
+    /// the row must not call a healthy mirror broken or send the reader to `docli sync`.
+    ///
+    /// Only CONTENTION sets it. A marker that will not read for any other reason leaves `busy`
+    /// false and `claimed` false, so it warns and counts as degraded — a permanent fault must
+    /// not inherit a transient one's silence.
+    pub busy: bool,
+    /// The marker is there but could not be read for a reason contention does NOT explain — a
+    /// permission error, an I/O fault, bytes that are not UTF-8. Its own field and its own row:
+    /// folded into `!claimed` it read «not this mirror - run docli sync», and `docli sync` then
+    /// fails on the very file it could not read.
+    pub unreadable: bool,
 }
 
 #[derive(Serialize)]
@@ -305,6 +319,9 @@ fn mount_status(root: &Path, control: &ControlRoot, m: &Mount) -> MountStatus {
         Err(e) => (None, Some(format!("{e:#}"))),
     };
     let dir = config::mount_abs(root, m);
+    // ONE identity read, two fields below: `claimed` is what the directory says, `busy` is
+    // whether we could look at all. Asking twice would be two readers of one question.
+    let identity = crate::mountfs::verify_mount_identity(&dir, &control.dir, m.workspace);
     MountStatus {
         name: m.display_name().to_string(),
         workspace: m.workspace.to_string(),
@@ -338,7 +355,9 @@ fn mount_status(root: &Path, control: &ControlRoot, m: &Mount) -> MountStatus {
         // Re-point a synced workspace at any other directory and the old clean state plus the
         // new directory's existence would have rendered a healthy row for a mirror that does
         // not exist. The marker in the directory itself is the only proof that binds the two.
-        claimed: crate::mountfs::verify_mount_identity(&dir, &control.dir, m.workspace),
+        claimed: identity.is_ours(),
+        busy: identity == crate::mountfs::Identity::Held,
+        unreadable: identity == crate::mountfs::Identity::Unreadable,
         // State says N nodes; the directory says nothing at all. Deleting a mirror and
         // recreating the empty directory left `exists_on_disk` true and every state predicate
         // clean, so the screen called a missing mirror healthy. This is a CHEAP check (one
@@ -366,9 +385,7 @@ pub fn run(cwd: &Path, server: &str, json: bool) -> Result<i32> {
     // for it (there is no state to be incomplete) while the screen says «не синхронизировано».
     let degraded = !status.signed_in
         || status.credential_error.is_some()
-        || status.mounts.iter().any(|m| {
-            m.incomplete || !m.exists_on_disk || m.nodes.is_none() || m.emptied || !m.claimed
-        })
+        || status.mounts.iter().any(mount_is_degraded)
         || !status.gitignore_missing.is_empty()
         || !status.gitignore_unknown.is_empty();
     if json {
@@ -377,6 +394,39 @@ pub fn run(cwd: &Path, server: &str, json: bool) -> Result<i32> {
     }
     render(&status);
     Ok(if degraded { 1 } else { 0 })
+}
+
+/// Is this mount's row a FAULT — the one question, asked in ONE place.
+///
+/// It has two readers that must never disagree: the exit code (`--json` is the form a health
+/// check actually uses) and the screen, which paints the head line green or yellow. They were two
+/// inlined copies, and the moment `busy` was added to one of them they answered differently: the
+/// screen said «in use by another docli run» in green while the exit code said 1, on the state
+/// `v0.28.6` D3 calls an ordinary session-start condition — so a health check flapped on every
+/// concurrent sync with nothing in the output to explain it. Two readers of one question is the
+/// rule this file already states at its identity read; this is the same rule, one level up.
+///
+/// `busy` is deliberately NOT a fault: it means the marker could not be read because another
+/// docli run holds it, which clears on its own. `claimed == false` for any other reason IS one.
+fn mount_is_degraded(m: &MountStatus) -> bool {
+    m.incomplete || !m.exists_on_disk || m.nodes.is_none() || m.emptied || (!m.claimed && !m.busy)
+}
+
+/// The `cache` row for one mount, or `None` when the cache has nothing to say. Only a BROKEN
+/// cache earns a row, and each names its own remedy.
+fn cache_row(m: &MountStatus) -> Option<&'static str> {
+    match (m.exists_on_disk, m.emptied) {
+        (false, _) => Some("not built yet - run docli sync"),
+        (true, true) => Some("empty - docli sync --full rebuilds it"),
+        // BUSY first: we could not read the marker, so «not this mirror» is not established
+        // and `docli sync` is not the remedy — the other run IS the sync.
+        (true, false) if m.busy => Some(crate::mountfs::MOUNT_HELD),
+        (true, false) if m.unreadable => {
+            Some("its MOUNT.docli could not be read - docli doctor reports the mount")
+        }
+        (true, false) if !m.claimed => Some("not this mirror - run docli sync"),
+        (true, false) => None,
+    }
 }
 
 fn render(s: &Status) {
@@ -467,13 +517,9 @@ fn render(s: &Status) {
                 ))
             ),
         };
-        if m.incomplete
-            || m.nodes.is_none()
-            || !m.exists_on_disk
-            || m.emptied
-            || !m.claimed
-            || m.state_error.is_some()
-        {
+        // ONE predicate, shared with the exit code — see `mount_is_degraded`. The screen adds
+        // `state_error`, which colours a row without making the whole run a fault.
+        if mount_is_degraded(m) || m.state_error.is_some() {
             ui::warn(&head);
         } else {
             ui::ok(&head);
@@ -490,12 +536,7 @@ fn render(s: &Status) {
         // reconciling the filesystem is its job.
         // Only a BROKEN cache earns a row, and each of those names its own remedy. A healthy
         // one had nothing to say that the green head line above had not already said.
-        let cache_state = match (m.exists_on_disk, m.emptied) {
-            (false, _) => Some("not built yet - run docli sync"),
-            (true, true) => Some("empty - docli sync --full rebuilds it"),
-            (true, false) if !m.claimed => Some("not this mirror - run docli sync"),
-            (true, false) => None,
-        };
+        let cache_state = cache_row(m);
         if let Some(cache_state) = cache_state {
             ui::field("cache", cache_state, mw);
         }
@@ -595,6 +636,63 @@ mod tests {
         assert!(offline
             .downcast_ref::<crate::http::CredentialRefused>()
             .is_none());
+    }
+
+    fn healthy_mount() -> MountStatus {
+        MountStatus {
+            name: "m".into(),
+            workspace: "w".into(),
+            dir: "d".into(),
+            folder: None,
+            nodes: Some(1),
+            at_head: true,
+            incomplete: false,
+            parks: 0,
+            head_age_secs: Some(0),
+            exists_on_disk: true,
+            emptied: false,
+            state_error: None,
+            claimed: true,
+            busy: false,
+            unreadable: false,
+        }
+    }
+
+    /// The exit code's predicate over the identity states: a HELD mount is ordinary (another
+    /// run clears it), an UNREADABLE or FOREIGN one is a fault. The held case is the flapping
+    /// health check the shared predicate exists to prevent.
+    #[test]
+    fn a_held_mount_is_not_degraded_and_an_unreadable_or_foreign_one_is() {
+        assert!(!mount_is_degraded(&healthy_mount()));
+        let held = MountStatus {
+            claimed: false,
+            busy: true,
+            ..healthy_mount()
+        };
+        assert!(!mount_is_degraded(&held), "contention clears on its own");
+        let unreadable = MountStatus {
+            claimed: false,
+            unreadable: true,
+            ..healthy_mount()
+        };
+        assert!(mount_is_degraded(&unreadable));
+        let foreign = MountStatus {
+            claimed: false,
+            ..healthy_mount()
+        };
+        assert!(mount_is_degraded(&foreign));
+
+        // …and the ROW each one gets: an unreadable marker is not «not this mirror», whose
+        // remedy (`docli sync`) fails on the very file that would not read.
+        assert_eq!(cache_row(&healthy_mount()), None);
+        assert_eq!(cache_row(&held), Some(crate::mountfs::MOUNT_HELD));
+        let row = cache_row(&unreadable).unwrap();
+        assert!(row.contains("could not be read"), "{row}");
+        assert!(!row.contains("docli sync"), "{row}");
+        assert_eq!(
+            cache_row(&foreign),
+            Some("not this mirror - run docli sync")
+        );
     }
 
     #[test]

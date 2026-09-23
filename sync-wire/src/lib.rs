@@ -94,10 +94,15 @@ pub struct PullRequest {
     pub related: Option<RelatedStamp>,
 }
 
-/// The identity of one search-index generation as the `related` artifact's stamp (v0.29.9 D6):
-/// the `(covers_rev, covers_id)` pair the generation key already carries. The CLI sends the pair
-/// it holds; the server compares it to its current generation and answers with the artifact
-/// only on a mismatch.
+/// The identity of the `related` artifact the client holds (v0.29.9 D6). The CLI sends the pair it
+/// read out of its artifact; the server compares it to the artifact's current published generation
+/// and answers with the artifact only on a mismatch.
+///
+/// **The field names are historical.** Since v0.36.0 (migration `0057`) the artifact is published
+/// independently of the search-index generation, so this pair names the VECTORS generation
+/// (`vectors_rev`/`vectors_id`), not the `.tar`'s — and the two routinely differ. The
+/// SERIALIZATION is unchanged (`coversRev`/`coversId`), so no client moves; only what the numbers
+/// refer to on the server did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RelatedStamp {

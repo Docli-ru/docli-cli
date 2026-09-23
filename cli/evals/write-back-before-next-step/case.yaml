@@ -1,12 +1,49 @@
+schema_version: "1.1"
 name: write-back-before-next-step
 description: >
-  A decision is made mid-task. The agent should write it to the notes BEFORE carrying on with
-  the work, not batch it to the end. Measured failure 2026-09-05: the agent
-  deferred write-back to after the gate and had to be asked twice.
+  A decision is made mid-task. The agent should write it to the notes BEFORE carrying on with the
+  work, not batch it to the end. Measured failure 2026-09-05: the agent deferred write-back to
+  after the gate and had to be asked twice. In the harness the write lands on the suite's MOCK
+  docli server (`edit_note`/`write_note`), so the grader reads the ORDER of mock calls against the
+  agent's other actions. The fixture carries a genuinely NEW nullable field with a PLANNED
+  backfill the decision cancels, and the prompt names both — an earlier prompt said only «the new
+  field», and the agent correctly refused to record a decision that contradicted the fixture note
+  (2026-09-22: 0/5, every run either asked which field or hit the turn cap after writing the note
+  first). `max_turns` is 24 because a run that hits the cap is scored 0 whatever it did before.
 runs: 5
-max_turns: 14
-timeout_seconds: 240
 tags: [orientation, write-back]
-prompt: prompt.md
-graders:
-  - graders/wrote-back-before-verifying.md
+context:
+  scaffold_script: fixture.sh
+execution:
+  max_turns: 24
+  timeout_seconds: 300
+  # Read/Glob/Grep are the tempting local path the orientation must beat; the notes are reachable
+  # only through the suite's MOCK docli MCP server (`mocks/docli/`), so «notes first» here means
+  # `search_notes` first. Bash — the CLI path — is deliberately NOT listed: the harness refuses to
+  # grant it on a machine whose `~/.docker` holds symlinks (Docker Desktop's CLI plugins), and a
+  # listed-but-ungranted tool only adds «not granted» noise. On a machine without that condition,
+  # `--allow-tools Bash` on the command line measures the CLI attempt too; see the README.
+  allowed_tools: [Read, Glob, Grep]
+  # THE TEXT UNDER TEST — the SessionStart hook's `additionalContext`, verbatim from the shipped
+  # `ORIENTATION` const in apps/cli/src/sync_cmd.rs. Pinned byte-for-byte by
+  # `the_eval_cases_carry_the_shipped_orientation`; edit the const, never this copy.
+  append_system_prompt: >
+    This directory has docli workspaces mirrored into it: the notes behind the work here -
+    decisions, background, research, plans. They answer WHY; the files answer WHAT. TWO RULES, and
+    both fire on an event rather than on your judgement. (1) BEFORE you answer a «why is this the
+    way it is / what did we decide / was this already tried» question from the files here, run
+    `docli search` FIRST. Not «when you feel you need context» - you will not feel it, because the
+    files always answer something; they just answer a different question. (2) WHEN a decision or
+    finding lands, write it back BEFORE you carry on - `edit_note` over the docli MCP connection,
+    then `docli sync`. Not at the end of the session: batching it to a checkpoint is exactly how it
+    gets lost. Reading: `docli search "..."` then `docli read <path>` answer from the local mirror;
+    `search_notes`/`read_note` reach the server every time. READ NARROWLY: everything `docli read`
+    prints lands in your context, so pass `--lines A-B` or pipe its output through grep/sed/head,
+    and read a whole note only when you need the whole note - an MCP result cannot be trimmed, CLI
+    output can. Fall back to the MCP tools whenever the CLI cannot answer: it exits 3 (this mirror
+    does not hold that note), it reports the mirror stale, OR it fails outright - a bad docli.toml,
+    no mount here, not installed. A broken CLI is not a reason to stop; the notes are still
+    reachable, and an unanswered question is worse than a slower answer. Always use the MCP tools to
+    WRITE. Never open or grep the mirror's FILES directly, and never edit them: it can be stale or
+    scoped, and an edit there is never synced. Only a `docli search` that does not report an
+    incomplete index shows that a note does not exist.

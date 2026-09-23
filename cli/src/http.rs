@@ -416,3 +416,34 @@ pub struct WorkspaceInfo {
     pub handle: String,
     pub name: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// v0.35.0 D4, the CLI half of the contract — pinned HERE because the api cannot pin it.
+    ///
+    /// The api gained a `503 SERVER_BUSY` refusal, and every `docli-cli` already in the wild meets
+    /// it with THIS code: signed binaries ship on their own train, so the wire answer has to degrade
+    /// sanely against a parser nobody can update. It does, and for a structural reason — the busy
+    /// refusal reuses the `{code, message}` envelope every other sync-plane refusal has carried
+    /// since v0.28.0 — so the failure mode to guard against is not a new branch but a change to
+    /// this shape. An unknown code is not an error here; it is data.
+    #[test]
+    fn an_unknown_refusal_code_parses_and_renders_instead_of_breaking() {
+        let body = br#"{"code":"SERVER_BUSY","message":"the server is busy right now; retry in a moment"}"#;
+        let e: ErrBody = serde_json::from_slice(body).expect("the envelope must still parse");
+        assert_eq!(e.code, "SERVER_BUSY");
+        assert!(e.epoch.is_none());
+
+        let rendered = ApiFailure::Refused {
+            status: 503,
+            code: e.code,
+            message: e.message,
+        }
+        .to_string();
+        assert!(rendered.contains("SERVER_BUSY"));
+        assert!(rendered.contains("503"));
+        assert!(rendered.contains("retry"), "{rendered}");
+    }
+}

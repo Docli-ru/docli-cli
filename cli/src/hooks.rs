@@ -966,6 +966,41 @@ mod tests {
         assert!(!m.contains("Bash"), "{m}");
     }
 
+    /// A POSIX shell to run the rendered command with, or `None`. A Windows developer machine
+    /// has no `/bin/sh` — Claude Code's own docs describe that machine — and a test that simply
+    /// assumed one failed there for a reason that has nothing to do with what it pins.
+    fn posix_sh() -> Option<&'static str> {
+        std::path::Path::new("/bin/sh")
+            .exists()
+            .then_some("/bin/sh")
+    }
+
+    /// «docli is not installed», spelled honestly for cmd.exe: a PATH holding System32 ALONE.
+    ///
+    /// An EMPTY PATH is the honest spelling only on Unix, where `command -v` is a shell BUILTIN.
+    /// `where` is `where.exe`, so an empty PATH fails for want of `where` itself and every
+    /// assertion below would pass while proving nothing.
+    #[cfg(windows)]
+    fn system32_only() -> String {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+        format!(r"{root}\System32")
+    }
+
+    /// Run a rendered `commandWindows` line through cmd.exe exactly as Codex would.
+    ///
+    /// `raw_arg`, not `arg`: the line carries `&&`, `||` and redirections, and Rust's own
+    /// quoting would hand cmd.exe a differently-parsed string than the one that ships.
+    #[cfg(windows)]
+    fn run_cmd_exe(line: &str) -> std::process::Output {
+        use std::os::windows::process::CommandExt as _;
+        std::process::Command::new("cmd.exe")
+            .arg("/C")
+            .raw_arg(line)
+            .env("PATH", system32_only())
+            .output()
+            .expect("cmd.exe runs")
+    }
+
     #[test]
     fn the_rendered_command_is_inert_without_the_binary() {
         // D2's pin, run for real: `docli uninstall` leaves agent configs in place and a
@@ -973,26 +1008,48 @@ mod tests {
         // broken tool call on every edit.
         for agent in HookAgent::all() {
             for event in EVENTS {
-                let cmd = command_for(agent, event);
-                // `/bin/sh` by absolute path: the child's PATH is emptied below, and resolving
-                // the SHELL itself through it would fail before the line under test ran.
-                let out = std::process::Command::new("/bin/sh")
-                    .arg("-c")
-                    .arg(&cmd)
-                    // An EMPTY PATH is the honest spelling of «docli is not installed».
-                    .env("PATH", "")
-                    .output()
-                    .expect("sh runs");
-                assert_eq!(
-                    out.status.code(),
-                    Some(0),
-                    "{cmd:?} must exit 0 with docli off PATH: {out:?}"
-                );
-                assert!(
-                    out.stdout.is_empty(),
-                    "{cmd:?} must print NOTHING when inert: {:?}",
-                    String::from_utf8_lossy(&out.stdout)
-                );
+                if let Some(sh) = posix_sh() {
+                    let cmd = command_for(agent, event);
+                    // The shell by ABSOLUTE path: the child's PATH is emptied below, and
+                    // resolving the SHELL itself through it would fail before the line under
+                    // test ran.
+                    let out = std::process::Command::new(sh)
+                        .arg("-c")
+                        .arg(&cmd)
+                        // An EMPTY PATH is the honest spelling of «docli is not installed».
+                        .env("PATH", "")
+                        .output()
+                        .expect("sh runs");
+                    assert_eq!(
+                        out.status.code(),
+                        Some(0),
+                        "{cmd:?} must exit 0 with docli off PATH: {out:?}"
+                    );
+                    assert!(
+                        out.stdout.is_empty(),
+                        "{cmd:?} must print NOTHING when inert: {:?}",
+                        String::from_utf8_lossy(&out.stdout)
+                    );
+                }
+                // The cmd.exe form — what actually ships in Codex's `commandWindows`, and what
+                // `hooks.rs` documented as unverified «because this project has no Windows
+                // runner». It is verified here now. Its documented RESIDUAL is unchanged and is
+                // not what this pins: it still swallows a FAILED docli as well as a missing one.
+                #[cfg(windows)]
+                {
+                    let cmd = command_windows_for(agent, event);
+                    let out = run_cmd_exe(&cmd);
+                    assert_eq!(
+                        out.status.code(),
+                        Some(0),
+                        "{cmd:?} must exit 0 with docli off PATH: {out:?}"
+                    );
+                    assert!(
+                        out.stdout.is_empty(),
+                        "{cmd:?} must print NOTHING when inert: {:?}",
+                        String::from_utf8_lossy(&out.stdout)
+                    );
+                }
             }
         }
     }
@@ -1431,16 +1488,28 @@ mod tests {
         // `0700` binary this user cannot execute. Both reported a working gate over a hook that
         // exits silently. `command -v` needs no uid, gid or group list, because it IS the
         // check — so what is pinned here is that we ask it with an EMPTY PATH and get «no».
-        let out = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg("command -v docli >/dev/null 2>&1")
-            .env("PATH", "")
-            .status()
-            .expect("sh runs");
-        assert!(
-            !out.success(),
-            "an empty PATH is the honest spelling of «docli is not installed»"
-        );
+        if let Some(sh) = posix_sh() {
+            let out = std::process::Command::new(sh)
+                .arg("-c")
+                .arg("command -v docli >/dev/null 2>&1")
+                .env("PATH", "")
+                .status()
+                .expect("sh runs");
+            assert!(
+                !out.success(),
+                "an empty PATH is the honest spelling of «docli is not installed»"
+            );
+        }
+        // The same question asked the way cmd.exe asks it — and NOT with an empty PATH, which
+        // would fail for want of `where.exe` rather than for want of docli.
+        #[cfg(windows)]
+        {
+            let out = run_cmd_exe("where docli >nul 2>nul");
+            assert!(
+                !out.status.success(),
+                "a PATH holding System32 alone is the honest spelling of «docli is not installed»"
+            );
+        }
     }
 
     #[test]

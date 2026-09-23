@@ -971,6 +971,9 @@ mod tests {
         // D12.3 — the write-discipline paragraph ships in the contract.
         assert!(SKILL_MD.contains("prefer `edit_note`"));
         assert!(SKILL_MD.contains("conflictSiblingId"));
+        // v0.38.4 — a stale base MERGES now, so the sibling is rare; what says «look again» is
+        // the overlap count, and a contract that never reads it under-instructs.
+        assert!(SKILL_MD.contains("overlappingEdits"));
         // 2026-09-01 — a skill fires on its `description` (and, on Claude Code, on the `paths`
         // globs injected at copy time — D4, which is why the description is now the FALLBACK
         // rather than the only door). Two things still have to be IN the description.
@@ -1476,5 +1479,33 @@ mod tests {
         };
         let err = run(tmp.path(), None, &args).unwrap_err().to_string();
         assert!(err.contains("docli.toml or .docli/ directory"), "{err}");
+    }
+
+    /// The ONE cross-platform pin on the `.gitattributes` EOL rule — and running where the
+    /// canonical gate runs is the whole point of it.
+    ///
+    /// These assets are embedded with `include_str!`, so their bytes are whatever the CHECKOUT
+    /// produced: under `core.autocrlf=true` and without a pin they arrive CRLF, and the parsers
+    /// that read them take `---\n` as a literal needle. The frontmatter then reads as ABSENT, and
+    /// a CLI built on that machine writes a skill with no description and no activation globs —
+    /// a skill that never fires, silently, on one platform.
+    ///
+    /// If this fails, the answer is a line in `.gitattributes`, NOT a tolerant parser: tolerance
+    /// fixes the one parser that happens to be read today and leaves the next `include_str!`
+    /// target exposed exactly as before.
+    #[test]
+    fn the_embedded_assets_are_pinned_to_lf() {
+        for (name, text) in [
+            ("apps/cli/assets/SKILL.md", SKILL_MD),
+            (
+                "apps/cli/assets/AGENTS-fragment.md",
+                crate::instructions::AGENTS_FRAGMENT,
+            ),
+        ] {
+            assert!(
+                !text.contains('\r'),
+                "{name} carries CR - cover it in .gitattributes"
+            );
+        }
     }
 }

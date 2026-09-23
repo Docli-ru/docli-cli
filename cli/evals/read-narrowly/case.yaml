@@ -1,15 +1,49 @@
+schema_version: "1.1"
 name: read-narrowly
 description: >
-  A why-question whose answer is one section of a large note (~21 KB). The agent should locate
-  the section and read only it — `docli read … | grep`, then `--lines A-B` — instead of pulling
-  the whole note into context. Measured 2026-09-08: with the orientation naming only the read
-  path, 0 of 5 fresh sessions narrowed a read; with the READ NARROWLY clause (which states WHY:
-  everything `docli read` prints lands in context, and an MCP result cannot be trimmed), 5 of 5
-  did, and read bytes reaching context fell 23.3 KB → 9.0 KB mean.
+  A why-question whose answer is one section of a large note (~21 KB). The agent should locate the
+  section and read only it — `docli read … | grep`, then `--lines A-B` — instead of pulling the
+  whole note into context. Measured 2026-09-08 with the READ NARROWLY clause: 0 of 5 → 5 of 5
+  narrowed, read bytes 23.3 KB → 9.0 KB mean. HARNESS LIMIT, stated: narrowing needs a REAL mirror
+  to `docli read` from, and the harness's throwaway HOME has no sign-in and no mirror, so inside
+  `claude plugin eval` the CLI path is unavailable and the only reachable read is the untrimmable
+  MCP one — which the grader must not count against the run. Run this case with a real mount (the
+  2026-09-08 method) until the harness can carry a mirror; it is kept loadable and tagged `needs-
+  real-mount`.
 runs: 5
-max_turns: 12
-timeout_seconds: 240
-tags: [orientation, read-narrowly]
-prompt: prompt.md
-graders:
-  - graders/read-narrowly.md
+tags: [orientation, read-narrowly, needs-real-mount]
+context:
+  scaffold_script: fixture.sh
+execution:
+  max_turns: 12
+  timeout_seconds: 300
+  # Read/Glob/Grep are the tempting local path the orientation must beat; the notes are reachable
+  # only through the suite's MOCK docli MCP server (`mocks/docli/`), so «notes first» here means
+  # `search_notes` first. Bash — the CLI path — is deliberately NOT listed: the harness refuses to
+  # grant it on a machine whose `~/.docker` holds symlinks (Docker Desktop's CLI plugins), and a
+  # listed-but-ungranted tool only adds «not granted» noise. On a machine without that condition,
+  # `--allow-tools Bash` on the command line measures the CLI attempt too; see the README.
+  allowed_tools: [Read, Glob, Grep]
+  # THE TEXT UNDER TEST — the SessionStart hook's `additionalContext`, verbatim from the shipped
+  # `ORIENTATION` const in apps/cli/src/sync_cmd.rs. Pinned byte-for-byte by
+  # `the_eval_cases_carry_the_shipped_orientation`; edit the const, never this copy.
+  append_system_prompt: >
+    This directory has docli workspaces mirrored into it: the notes behind the work here -
+    decisions, background, research, plans. They answer WHY; the files answer WHAT. TWO RULES, and
+    both fire on an event rather than on your judgement. (1) BEFORE you answer a «why is this the
+    way it is / what did we decide / was this already tried» question from the files here, run
+    `docli search` FIRST. Not «when you feel you need context» - you will not feel it, because the
+    files always answer something; they just answer a different question. (2) WHEN a decision or
+    finding lands, write it back BEFORE you carry on - `edit_note` over the docli MCP connection,
+    then `docli sync`. Not at the end of the session: batching it to a checkpoint is exactly how it
+    gets lost. Reading: `docli search "..."` then `docli read <path>` answer from the local mirror;
+    `search_notes`/`read_note` reach the server every time. READ NARROWLY: everything `docli read`
+    prints lands in your context, so pass `--lines A-B` or pipe its output through grep/sed/head,
+    and read a whole note only when you need the whole note - an MCP result cannot be trimmed, CLI
+    output can. Fall back to the MCP tools whenever the CLI cannot answer: it exits 3 (this mirror
+    does not hold that note), it reports the mirror stale, OR it fails outright - a bad docli.toml,
+    no mount here, not installed. A broken CLI is not a reason to stop; the notes are still
+    reachable, and an unanswered question is worse than a slower answer. Always use the MCP tools to
+    WRITE. Never open or grep the mirror's FILES directly, and never edit them: it can be stale or
+    scoped, and an edit there is never synced. Only a `docli search` that does not report an
+    incomplete index shows that a note does not exist.
