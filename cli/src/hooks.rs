@@ -117,11 +117,23 @@ impl HookAgent {
 
 /// The two hook events this slice installs. Ordered as they are written.
 /// docli-cli 0.1.20 — `PostToolUse` joins the two. Ordered as the session experiences them.
-/// The `mcp_label` a project uses when it does not say otherwise. The matcher for `PostToolUse`
-/// is built from the PROJECT's label, never this constant directly — a project that renamed its
-/// MCP server would otherwise get a matcher that silently never fires, which is the stale-mirror
-/// failure this hook exists to prevent.
+/// The `mcp_label` a project uses when it does not say otherwise — and the key `docli init`
+/// gives the MCP server in every agent config, whatever the label.
 pub const DEFAULT_MCP_LABEL: &str = "docli";
+
+/// Every docli MCP tool, under either name the server can carry: `docli`, the key `docli init`
+/// writes (the label only names the connection URL), and the project's label, which Desktop's
+/// gateway takes as its server name. Agents name a tool `mcp__<config key>__<tool>`, so a matcher
+/// built from the label alone never fired in a CLI-wired project — a mirror silently stale after
+/// every write, the failure this hook exists to prevent. Labels are `[a-z0-9-]`, so they need no
+/// regex escaping.
+fn post_tool_use_matcher(label: &str) -> String {
+    if label == DEFAULT_MCP_LABEL {
+        format!("mcp__{DEFAULT_MCP_LABEL}__.*")
+    } else {
+        format!("mcp__({DEFAULT_MCP_LABEL}|{label})__.*")
+    }
+}
 
 const EVENTS: [&str; 3] = ["PreToolUse", "PostToolUse", "SessionStart"];
 
@@ -202,7 +214,7 @@ fn entry_for(agent: HookAgent, event: &str, label: &str) -> Value {
         // invisible until it misleads someone; a read tool that fires it costs one round trip.
         // `hook_post_write` does the read/write split in Rust, where it is testable and where
         // an unrecognised tool falls on the safe side.
-        "PostToolUse" => format!("mcp__{}__.*", label),
+        "PostToolUse" => post_tool_use_matcher(label),
         "SessionStart" => "startup|resume".to_string(),
         other => unreachable!("unknown hook event {other}"),
     };
@@ -899,23 +911,51 @@ pub fn consent_summary(agents: &[HookAgent]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn the_post_tool_use_matcher_follows_the_projects_mcp_label() {
-        // A project that renamed its MCP server gets a matcher built from ITS label. Hardcoding
-        // «docli» here would emit a matcher that never fires on such a project, and the mirror
-        // would silently stop being synced after writes — the exact failure this hook exists to
-        // prevent, reintroduced by the hook itself.
-        let v = merge(HookAgent::Claude, None, "notes");
-        let HookOutcome::Write(out) = v else {
+    fn the_post_tool_use_matcher_fires_for_the_server_init_writes_and_for_the_label() {
+        // `docli init` keys the MCP server `docli` in every agent config; the label names only
+        // the connection URL. Claude and Codex name a tool after the config key, so the CLI's own
+        // wiring yields `mcp__docli__edit_note` whatever the label is. The label-named server
+        // exists too: Desktop's gateway takes the label as its name. A matcher built from the
+        // label alone never fired in a CLI-wired project (berkut, 2026-10-02).
+        // Claude Code and Codex read the matcher as a regex over the whole tool name.
+        assert_eq!(post_tool_use_matcher("berkut"), "mcp__(docli|berkut)__.*");
+        assert_eq!(post_tool_use_matcher(DEFAULT_MCP_LABEL), "mcp__docli__.*");
+
+        let HookOutcome::Write(out) = merge(HookAgent::Claude, None, "berkut") else {
             panic!("a fresh config writes")
         };
-        assert!(
-            out.contains("mcp__notes__"),
-            "matcher must carry the project's label: {out}"
-        );
+        assert!(out.contains("mcp__(docli|berkut)__.*"), "{out}");
         assert!(
             out.contains("docli sync --post-write --agent claude"),
             "the post-write command must be wired: {out}"
         );
+    }
+
+    #[test]
+    fn a_rerun_rewrites_a_label_only_matcher_in_place() {
+        // What every project initialised before this fix carries.
+        let HookOutcome::Write(fresh) = merge(HookAgent::Claude, None, "berkut") else {
+            panic!("a fresh config writes")
+        };
+        let old = fresh.replace("mcp__(docli|berkut)__.*", "mcp__berkut__.*");
+        assert!(old.contains("\"mcp__berkut__.*\""), "{old}");
+        let stale: Value = serde_json::from_str(&old).unwrap();
+        assert!(
+            !effectively_ours(
+                &stale["hooks"]["PostToolUse"][0],
+                HookAgent::Claude,
+                "PostToolUse",
+                "berkut"
+            ),
+            "`docli status` must report a label-only matcher as not installed"
+        );
+        let HookOutcome::Write(out) = merge(HookAgent::Claude, Some(&old), "berkut") else {
+            panic!("a stale matcher is rewritten")
+        };
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let post = v["hooks"]["PostToolUse"].as_array().unwrap();
+        assert_eq!(post.len(), 1, "replaced, not duplicated: {out}");
+        assert_eq!(post[0]["matcher"], "mcp__(docli|berkut)__.*");
     }
 
     #[test]

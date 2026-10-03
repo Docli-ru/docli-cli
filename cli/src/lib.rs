@@ -10,6 +10,7 @@ pub mod agents;
 pub mod apply;
 pub mod config;
 pub mod creds;
+pub mod desktop_presence;
 pub mod doctor;
 pub mod graph;
 pub mod graph_cmd;

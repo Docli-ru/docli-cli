@@ -1029,7 +1029,12 @@ fn emit_report(agent: crate::hooks::HookAgent, lines: &[String]) {
 /// tool defaults to syncing — the cost is one redundant round trip, never a stale mirror. Same
 /// lesson as the fallback clause measured on 2026-09-05: name the category you can be sure of,
 /// and let the unknown fall on the safe side.
+///
+/// The doc-level twin of the server's `readOnlyHint` annotations (`apps/api/src/mcp.rs`, v0.42.5)
+/// — change both together. `get_current_context` is the Desktop gateway's local tool, served under
+/// the same connection name the project's hook matches.
 const MCP_READ_ONLY_TOOLS: &[&str] = &[
+    "get_current_context",
     "read_note",
     "read_notes",
     "read_vault",
@@ -1575,6 +1580,8 @@ mod tests {
             "mcp__docli__search_notes",
             "mcp__docli__list_notes",
             "read_vault",
+            // Docli Desktop's gateway serves its local tool under the project's own label.
+            "mcp__notes__get_current_context",
         ] {
             assert!(!tool_warrants_sync(t), "{t} is a read and must not sync");
         }

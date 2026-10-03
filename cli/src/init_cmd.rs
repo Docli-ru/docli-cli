@@ -522,9 +522,8 @@ pub fn run(cwd: &Path, api: Option<&Api>, args: &InitArgs) -> Result<i32> {
         for line in crate::hooks::consent_summary(&hook_agents) {
             crate::ui::detail(&line);
         }
-        // The PostToolUse matcher is built from THIS project's MCP label, not a constant: a
-        // project that renamed its server would otherwise get a matcher that never fires, and a
-        // mirror that silently stops being synced after writes.
+        // The PostToolUse matcher covers the `docli` key the wiring above writes AND this
+        // project's label (Desktop's gateway name) — see `hooks::post_tool_use_matcher`.
         let hook_label = config
             .mcp_label
             .clone()

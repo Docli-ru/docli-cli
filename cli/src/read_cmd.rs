@@ -196,14 +196,15 @@ pub fn run(project: &Project, req: &ReadRequest, api: Option<&crate::http::Api>)
         );
     }
     if req.paths.len() <= 1 {
-        return Ok(render(
-            resolve(
-                project,
-                &one(req.paths.first().cloned()),
-                crate::sync_cmd::now_unix(),
-            ),
-            req.json,
-        ));
+        let outcome = resolve(
+            project,
+            &one(req.paths.first().cloned()),
+            crate::sync_cmd::now_unix(),
+        );
+        let read = served_note(&outcome);
+        let code = render(outcome, req.json);
+        crate::desktop_presence::report(&Vec::from_iter(read));
+        return Ok(code);
     }
     // The batch: every address resolved on its own, the worst exit code kept — «worst» in THIS
     // verb's own order, not integer order: a failure to look (2) outranks a stale refusal (4)
@@ -223,8 +224,10 @@ pub fn run(project: &Project, req: &ReadRequest, api: Option<&crate::http::Api>)
     let now = crate::sync_cmd::now_unix();
     let mut worst = 0;
     let mut values: Vec<serde_json::Value> = Vec::new();
+    let mut read = Vec::new();
     for path in &req.paths {
         let outcome = resolve(project, &one(Some(path.clone())), now);
+        read.extend(served_note(&outcome));
         if req.json {
             values.push(match &outcome {
                 Outcome::Served(s) => {
@@ -253,10 +256,24 @@ pub fn run(project: &Project, req: &ReadRequest, api: Option<&crate::http::Api>)
             worst = worse(worst, render(outcome, false));
         }
     }
-    if req.json {
-        return Ok(write_json(&values, worst));
+    let code = if req.json {
+        write_json(&values, worst)
+    } else {
+        worst
+    };
+    crate::desktop_presence::report(&read);
+    Ok(code)
+}
+
+/// The note an outcome served, for Desktop presence: notes only — a file read is metadata.
+fn served_note(outcome: &Outcome) -> Option<crate::desktop_presence::NoteRead> {
+    match outcome {
+        Outcome::Served(served) => match &served.envelope {
+            Envelope::Note(note) => Some((note.id, note.workspace)),
+            Envelope::File(_) => None,
+        },
+        Outcome::Refused(_) => None,
     }
-    Ok(worst)
 }
 
 /// `docli read <file> --out <path>` (Part B): the attachment's bytes, fetched over
