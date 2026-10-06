@@ -15,12 +15,11 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-/// The artifacts host. The default binds to step 0's recorded infrastructure (the public
-/// `docli-artifacts` bucket); `/release-cli` verifies the LIVE value against the applied
-/// bucket's `full_name` (timeweb prefixes bucket names randomly) before the first publish —
-/// this constant is corrected there if the prefix differs. `DOCLI_ARTIFACTS_BASE` overrides
-/// for testing.
-pub const ARTIFACTS_BASE: &str = "https://s3.twcstorage.ru/docli-artifacts";
+/// The artifacts address (v0.44.0): docli.ru's `/artifacts/*` route, which 302s to the store, so
+/// a provider move never strands an install — the store is site config, not a constant baked into
+/// shipped binaries. reqwest's default policy follows the redirect; authenticity is the signed
+/// manifest's job, never the host's. `DOCLI_ARTIFACTS_BASE` overrides for testing.
+pub const ARTIFACTS_BASE: &str = "https://docli.ru/artifacts";
 
 /// The pinned minisign PUBLIC key (base64 body of the `.pub` file). EMPTY until the operator
 /// mints the release keypair (offline, escrowed) — and an empty pin REFUSES self-update rather
