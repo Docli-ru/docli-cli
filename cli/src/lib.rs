@@ -6,6 +6,7 @@
 //! A library target exists so the integration tests can drive the sync orchestrator against a
 //! scripted stub server; the shipped artifact is the `docli` bin.
 
+pub mod agent_setup;
 pub mod agents;
 pub mod apply;
 pub mod config;

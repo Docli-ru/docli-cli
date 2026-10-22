@@ -193,27 +193,42 @@ opts out; `--skills claude,codex,…` names a list.
 
 The contract is a document, and a document only helps once an agent has read it. For the two
 agents with a hook mechanism — **Claude Code and Codex** — `docli init --hooks auto` installs
-two hooks:
+three hooks:
 
 - a `PreToolUse` hook that **refuses** writes into the mirror, with a reason that names the
-  correct alternative; and
+  correct alternative;
+- a `PostToolUse` hook that syncs the mirror after the agent changes the workspace over the docli
+  MCP connection; and
 - a `SessionStart` hook that reports mirror freshness into the session, unprompted.
 
-They are never installed unless you ask: the offer arrives unticked in the guided setup, and
-under `--no-input` only `--hooks` writes them. Both agents also ask you to trust the project
+They are never installed without your say: the guided setup lists them for you to confirm
+(untick to skip), and under `--no-input` only `--hooks` writes them. Both agents also ask you to trust the project
 before any project-local hook runs.
 
 Two limits, stated rather than left to inference. **Shell writes are not covered** — a `sed -i`
 or a `>` redirect into the mirror goes through on both agents, because deciding whether a
 command string targets a mirror means parsing shell. And **no other agent gets enforcement at
 all**: for them the mirror is marked read-only and the contract asks them not to edit it, which
-is advice, not a guarantee. `docli status` reports whether the hooks are installed here and
-whether the binary they name still resolves.
+is advice, not a guarantee. `docli status` reports whether the hooks are installed here, whether
+they are current or outdated, and — for a current install — whether the binary they name still
+resolves.
 
 `docli init --instructions` additionally writes a short docli section into `AGENTS.md` (read by
 Codex, Cursor, Gemini CLI, Zed, Copilot and about fifteen other tools) and, **only when there is
 no `CLAUDE.md` to damage**, creates one containing `@AGENTS.md`. An existing `CLAUDE.md` is never
 edited; the one line to add is printed for you to paste.
+
+### Keeping them up to date
+
+A new docli release can ship newer versions of the skill, the hooks and the `AGENTS.md`
+section. `docli status` lists each one installed here as current or outdated (informational —
+it never changes the exit code), and `docli agent-setup` brings them up to date without the rest
+of `init`; for a hook file it cannot edit safely, it prints the lines to add by hand instead. Run without flags in
+a terminal, it asks which hooks and instruction files to install, lists the files involved with the state of
+each — docli's own content that differs from the bundled version, hand edits included,
+is marked `will be replaced` — and asks once more before writing. Without a terminal it refreshes what is
+already installed and adds nothing new; with flags, it installs what `init` would with the same
+flags.
 
 In the guided setup, wiring agents is a step of its own: the configurations found here arrive
 pre-ticked, and only what stays ticked is written. It can also — **only if you ask** — add this

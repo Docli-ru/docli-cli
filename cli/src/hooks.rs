@@ -10,7 +10,8 @@
 //! trigger inside a skill at all. Both vendors say so themselves — *"To block an action
 //! regardless of what Claude decides, use a PreToolUse hook instead."*
 //!
-//! **This module is the ONLY writer of hooks**, and `docli init` is its only caller.
+//! **This module is the ONLY writer of hooks**, and `agent_setup::apply` — shared by `docli init`
+//! and `docli agent-setup` — is its only caller.
 //!
 //! # The vendor facts this file is built on (D10 — dated, from vendor documentation)
 //!
@@ -286,45 +287,6 @@ fn ours_commands(agent: HookAgent, event: &str) -> [String; 3] {
         command_for(agent, event),
         command_windows_for(agent, event),
     ]
-}
-
-/// Would this element actually FIRE, and run our command? The health question, as against the
-/// ownership question [`is_ours`] answers.
-fn effectively_ours(v: &Value, agent: HookAgent, event: &str, label: &str) -> bool {
-    let desired = entry_for(agent, event, label);
-    if v.get("matcher") != desired.get("matcher") {
-        return false;
-    }
-    let Some(handler) = v
-        .get("hooks")
-        .and_then(|h| h.as_array())
-        .and_then(|h| h.first())
-    else {
-        return false;
-    };
-    // EVERY field we write, except `timeout`. Enumerating them one at a time kept missing one
-    // — first `type` (a handler that is not a command cannot run one), then `shell` (a Claude
-    // entry switched to `powershell` cannot parse `if command -v …; then …; fi`, so neither
-    // hook runs) — and each miss was `status` reporting a gate that does not guard. So the rule
-    // is stated once, as a rule: what we set is what has to match.
-    //
-    // `timeout` is the single deliberate exception: an entry with `20` instead of `10` fires
-    // exactly as ours does, and calling it absent would send a reader to fix a working gate.
-    let (Some(want), Some(got)) = (desired["hooks"][0].as_object(), handler.as_object()) else {
-        return false;
-    };
-    // No EXTRA fields either, and that half matters as much as the matching half: `async: true`
-    // is a documented Claude Code option that runs the hook WITHOUT waiting, so its denial
-    // cannot block the write. A predicate that checked only OUR fields would call that gate
-    // healthy. We cannot know what a future field does, so the honest health answer for a
-    // handler carrying one we did not write is «I cannot vouch for this» — a false negative,
-    // which costs a nudge, rather than a false positive, which costs a note.
-    if got.keys().any(|k| k != "timeout" && !want.contains_key(k)) {
-        return false;
-    }
-    want.iter()
-        .filter(|(k, _)| k.as_str() != "timeout")
-        .all(|(k, v)| got.get(k) == Some(v))
 }
 
 /// Is this array element one of ours? See [`OURS`] for what the answer rests on and why.
@@ -718,47 +680,89 @@ pub fn remove(agent: HookAgent, existing: &str) -> RemoveOutcome {
     RemoveOutcome::Removed(out)
 }
 
-/// Are our entries present in this project for `agent`, and does the binary they name resolve?
+/// What this project carries for `agent`, and whether the binary the entries name resolves.
 ///
 /// D2's counterweight: choosing silence for a missing binary means the disabled gate has to be
 /// visible SOMEWHERE, and this is where. Reported by `docli status`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct HookStatus {
     pub agent: &'static str,
-    pub installed: bool,
-    /// False when the entries are present but `docli` is not on `PATH` — the silently-disabled
-    /// gate. `None` when nothing is installed, so there is nothing to resolve.
+    pub state: crate::agent_setup::State,
+    /// False when the entries are current but `docli` is not on `PATH` — the silently-disabled
+    /// gate. `None` unless the install is current: an outdated one is reported as outdated, and
+    /// one screen never says both «no hooks» and «outdated».
     pub binary_resolves: Option<bool>,
 }
 
-pub fn status(project_root: &Path, agent: HookAgent, label: &str) -> HookStatus {
-    let installed = std::fs::read_to_string(project_root.join(agent.config_path()))
+/// The ONE hooks rule (v0.46.0 D8), shared by `docli status` and `docli agent-setup`.
+///
+/// * **Installed** means any entry is docli's — [`is_ours`], the predicate `remove` uses. A
+///   health predicate would miss exactly the installs that need a refresh: the two-event ones
+///   from before 2026-09-05 and the label-only matchers from before 2026-10-02.
+/// * **Current** is entry equality on the PARSED file: every event holds the entry this binary
+///   would write. Decided before the text locator matters, so a file the locator cannot edit can
+///   still be current.
+/// * Otherwise **Outdated** — unless [`merge`] refuses to edit the file, which is its own state:
+///   it cannot be updated automatically, and calling it «outdated» would name a remedy that does
+///   not work.
+///
+/// Equality, not a health approximation: an entry somebody tuned (`timeout: 20`) or broke
+/// (`shell: "powershell"`, `async: true`) is not what we write, so it is not reported as a
+/// working gate — and a refresh puts back exactly ours.
+pub fn state(agent: HookAgent, existing: Option<&str>, label: &str) -> crate::agent_setup::State {
+    use crate::agent_setup::State;
+    let Some(text) = existing else {
+        return State::Absent;
+    };
+    let Some(hooks) = serde_json::from_str::<Value>(text)
         .ok()
-        .and_then(|body| serde_json::from_str::<Value>(&body).ok())
         .and_then(|v| v.get("hooks")?.as_object().cloned())
-        .is_some_and(|hooks| {
-            EVENTS.iter().all(|e| {
-                hooks
-                    .get(*e)
-                    .and_then(|a| a.as_array())
-                    // The LOAD-BEARING fields, not whole-entry equality. Identity and health
-                    // are different questions and this is the health one — «would this entry
-                    // actually fire, and run our command?» — which turns on exactly two things:
-                    // the matcher, and the command.
-                    //
-                    // Whole-entry equality answered it in both wrong directions. An entry of
-                    // ours whose matcher somebody changed to `Bash` is still OURS to rewrite
-                    // but guards no Write or Edit, so «file edits in the mirror are refused»
-                    // over it is the lie this report exists to prevent. And an entry with
-                    // `timeout: 20` instead of `10` works perfectly, so calling it absent
-                    // would send a reader to fix a gate that is not broken.
-                    .is_some_and(|a| a.iter().any(|v| effectively_ours(v, agent, e, label)))
-            })
-        });
+    else {
+        return State::Absent;
+    };
+    let entries = |e: &str| -> Vec<Value> {
+        hooks
+            .get(e)
+            .and_then(|a| a.as_array())
+            .cloned()
+            .unwrap_or_default()
+    };
+    if !EVENTS
+        .iter()
+        .any(|e| entries(e).iter().any(|v| is_ours(v, agent, e)))
+    {
+        return State::Absent;
+    }
+    if EVENTS.iter().all(|e| {
+        let want = entry_for(agent, e, label);
+        entries(e).contains(&want)
+    }) {
+        return State::Current;
+    }
+    match merge(agent, Some(text), label) {
+        HookOutcome::Occupied(_) => State::Occupied,
+        HookOutcome::AlreadyInstalled => State::Current,
+        HookOutcome::Write(_) => State::Outdated,
+    }
+}
+
+/// [`state`] of the agent's hook file ON DISK — the one reader `status`, `agent-setup`'s plan and
+/// its write all use. A file that exists but cannot be read is `Occupied` (edit by hand), never
+/// `Absent`: «no hooks» there would hide an install and skip its refresh.
+pub fn file_state(project_root: &Path, agent: HookAgent, label: &str) -> crate::agent_setup::State {
+    match std::fs::read_to_string(project_root.join(agent.config_path())) {
+        Ok(text) => state(agent, Some(&text), label),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => state(agent, None, label),
+        Err(_) => crate::agent_setup::State::Occupied,
+    }
+}
+
+pub fn status(project_root: &Path, agent: HookAgent, label: &str) -> HookStatus {
+    let state = file_state(project_root, agent, label);
     HookStatus {
         agent: agent.key(),
-        installed,
-        binary_resolves: installed.then(binary_on_path),
+        state,
+        binary_resolves: (state == crate::agent_setup::State::Current).then(binary_on_path),
     }
 }
 
@@ -897,9 +901,10 @@ pub fn consent_summary(agents: &[HookAgent]) -> Vec<String> {
         .iter()
         .map(|a| {
             format!(
-                "{}: {} - a PreToolUse hook that refuses writes into the mirror, and a \
-                 SessionStart hook that reports mirror freshness. Both run `docli`; neither \
-                 runs until you trust this project in {}.",
+                "{}: {} - a PreToolUse hook that refuses writes into the mirror, a PostToolUse \
+                 hook that syncs the mirror after a docli MCP write, and a SessionStart hook \
+                 that reports mirror freshness. All three run `docli`; none runs until you \
+                 trust this project in {}.",
                 a.display(),
                 a.config_path(),
                 a.display()
@@ -939,15 +944,10 @@ mod tests {
         };
         let old = fresh.replace("mcp__(docli|berkut)__.*", "mcp__berkut__.*");
         assert!(old.contains("\"mcp__berkut__.*\""), "{old}");
-        let stale: Value = serde_json::from_str(&old).unwrap();
-        assert!(
-            !effectively_ours(
-                &stale["hooks"]["PostToolUse"][0],
-                HookAgent::Claude,
-                "PostToolUse",
-                "berkut"
-            ),
-            "`docli status` must report a label-only matcher as not installed"
+        assert_eq!(
+            state(HookAgent::Claude, Some(&old), "berkut"),
+            crate::agent_setup::State::Outdated,
+            "`docli status` must report a label-only matcher as outdated, never as a working gate"
         );
         let HookOutcome::Write(out) = merge(HookAgent::Claude, Some(&old), "berkut") else {
             panic!("a stale matcher is rewritten")
@@ -1499,11 +1499,34 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_hook_file_is_occupied_never_absent() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+        let file = tmp.path().join(HookAgent::Claude.config_path());
+        std::fs::write(&file, "{}").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads anything; the case only exists for an ordinary user.
+        if std::fs::read_to_string(&file).is_err() {
+            assert_eq!(
+                file_state(tmp.path(), HookAgent::Claude, "docli"),
+                crate::agent_setup::State::Occupied
+            );
+        }
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            file_state(tmp.path(), HookAgent::Claude, "docli"),
+            crate::agent_setup::State::Absent
+        );
+    }
+
     #[test]
     fn status_reports_a_present_gate_and_notices_a_missing_binary() {
         let tmp = tempfile::tempdir().unwrap();
         let s = status(tmp.path(), HookAgent::Claude, DEFAULT_MCP_LABEL);
-        assert!(!s.installed);
+        assert_eq!(s.state, crate::agent_setup::State::Absent);
         assert_eq!(s.binary_resolves, None, "nothing to resolve");
 
         let HookOutcome::Write(out) = merge(HookAgent::Claude, None, DEFAULT_MCP_LABEL) else {
@@ -1512,8 +1535,8 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
         std::fs::write(tmp.path().join(".claude/settings.json"), out).unwrap();
         let s = status(tmp.path(), HookAgent::Claude, DEFAULT_MCP_LABEL);
-        assert!(s.installed);
-        // Installed ⇒ the question is asked. WHAT it answers depends on the machine running
+        assert_eq!(s.state, crate::agent_setup::State::Current);
+        // Current ⇒ the question is asked. WHAT it answers depends on the machine running
         // the test, so the answer itself is pinned on the pure half below.
         assert!(s.binary_resolves.is_some());
     }
@@ -1590,101 +1613,117 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_working_gate_is_not_reported_as_absent() {
-        // The other direction of the same question. `timeout` is a documented field somebody
-        // may well tune; an entry with `20` instead of `10` fires exactly as ours does, so
-        // calling it absent would send a reader to fix a gate that is not broken. Health turns
-        // on the matcher and the command, and nothing else.
-        let tmp = tempfile::tempdir().unwrap();
-        let HookOutcome::Write(good) = merge(HookAgent::Claude, None, DEFAULT_MCP_LABEL) else {
+    /// The D8 rule over a fresh entry, by field: what we write is what counts as current.
+    fn state_with(agent: HookAgent, edit: impl FnOnce(&mut Value)) -> crate::agent_setup::State {
+        let HookOutcome::Write(good) = merge(agent, None, DEFAULT_MCP_LABEL) else {
             panic!("write");
         };
         let mut v: Value = serde_json::from_str(&good).unwrap();
-        v["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"] = json!(20);
-        // …but `type` IS load-bearing: a handler that is not a command cannot run one.
-        let mut broken = v.clone();
-        broken["hooks"]["PreToolUse"][0]["hooks"][0]["type"] = json!("prompt");
-        assert!(!effectively_ours(
-            &broken["hooks"]["PreToolUse"][0],
-            HookAgent::Claude,
-            "PreToolUse",
-            DEFAULT_MCP_LABEL
-        ));
-        // …and so is `shell`: PowerShell cannot parse `if command -v …; then …; fi`, so a
-        // Claude entry switched to it runs neither hook. The rule is «every field we write
-        // except timeout», precisely because enumerating them by hand kept missing one.
-        let mut broken = v.clone();
-        broken["hooks"]["PreToolUse"][0]["hooks"][0]["shell"] = json!("powershell");
-        assert!(!effectively_ours(
-            &broken["hooks"]["PreToolUse"][0],
-            HookAgent::Claude,
-            "PreToolUse",
-            DEFAULT_MCP_LABEL
-        ));
-        // An EXTRA field can disable the gate just as thoroughly as a changed one: `async: true`
-        // is documented, and Claude Code runs an async hook without waiting, so its denial
-        // cannot block the write.
-        let mut broken = v.clone();
-        broken["hooks"]["PreToolUse"][0]["hooks"][0]["async"] = json!(true);
-        assert!(!effectively_ours(
-            &broken["hooks"]["PreToolUse"][0],
-            HookAgent::Claude,
-            "PreToolUse",
-            DEFAULT_MCP_LABEL
-        ));
-        // Codex's Windows override is ours to check too.
-        let HookOutcome::Write(cx) = merge(HookAgent::Codex, None, DEFAULT_MCP_LABEL) else {
-            panic!("write");
-        };
-        let mut cv: Value = serde_json::from_str(&cx).unwrap();
-        assert!(effectively_ours(
-            &cv["hooks"]["PreToolUse"][0],
-            HookAgent::Codex,
-            "PreToolUse",
-            DEFAULT_MCP_LABEL
-        ));
-        cv["hooks"]["PreToolUse"][0]["hooks"][0]["commandWindows"] = json!("echo nope");
-        assert!(!effectively_ours(
-            &cv["hooks"]["PreToolUse"][0],
-            HookAgent::Codex,
-            "PreToolUse",
-            DEFAULT_MCP_LABEL
-        ));
-        std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
-        std::fs::write(
-            tmp.path().join(".claude/settings.json"),
-            serde_json::to_string_pretty(&v).unwrap(),
-        )
-        .unwrap();
-        assert!(status(tmp.path(), HookAgent::Claude, DEFAULT_MCP_LABEL).installed);
+        edit(&mut v);
+        state(agent, Some(&v.to_string()), DEFAULT_MCP_LABEL)
     }
 
     #[test]
-    fn status_reports_health_not_merely_ownership() {
-        // Identity and health are different questions. An entry of ours whose matcher somebody
-        // changed to `Bash` is still OURS to rewrite — but it does not guard a single Write or
-        // Edit, and «file edits in the mirror are refused» over it would be exactly the lie this
-        // report exists to prevent.
-        let tmp = tempfile::tempdir().unwrap();
+    fn a_tuned_or_broken_entry_is_outdated_never_absent_and_never_a_working_gate() {
+        use crate::agent_setup::State;
+        // Ours as written: current.
+        assert_eq!(state_with(HookAgent::Claude, |_| {}), State::Current);
+        // A tuned `timeout` is still OURS (the command identifies it), so it is not «no hooks» —
+        // and not what we write, so a refresh puts back exactly ours.
+        assert_eq!(
+            state_with(HookAgent::Claude, |v| {
+                v["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"] = json!(20)
+            }),
+            State::Outdated
+        );
+        // A handler that cannot run our command — not a command, PowerShell parsing a POSIX
+        // line, an async hook whose denial cannot block — is never reported as a working gate.
+        for (field, value) in [
+            ("type", json!("prompt")),
+            ("shell", json!("powershell")),
+            ("async", json!(true)),
+        ] {
+            assert_eq!(
+                state_with(HookAgent::Claude, |v| {
+                    v["hooks"]["PreToolUse"][0]["hooks"][0][field] = value
+                }),
+                State::Outdated,
+                "{field}"
+            );
+        }
+        // Codex's Windows override counts too.
+        assert_eq!(
+            state_with(HookAgent::Codex, |v| {
+                v["hooks"]["PreToolUse"][0]["hooks"][0]["commandWindows"] = json!("echo nope")
+            }),
+            State::Outdated
+        );
+    }
+
+    #[test]
+    fn a_two_event_install_is_installed_and_outdated() {
+        // What every project initialised before 2026-09-05 carries: no PostToolUse. A health
+        // predicate called it «no hooks»; `is_ours` calls it installed, so a refresh finds it.
+        use crate::agent_setup::State;
+        assert_eq!(
+            state_with(HookAgent::Claude, |v| {
+                v["hooks"].as_object_mut().unwrap().remove("PostToolUse");
+            }),
+            State::Outdated
+        );
+        // …and an agent with no docli entry at all is absent, whatever else the file holds.
+        assert_eq!(
+            state(
+                HookAgent::Claude,
+                Some(r#"{"hooks": {"PreToolUse": []}}"#),
+                "docli"
+            ),
+            State::Absent
+        );
+        assert_eq!(state(HookAgent::Claude, None, "docli"), State::Absent);
+    }
+
+    #[test]
+    fn a_file_the_locator_refuses_is_occupied_not_outdated() {
+        // A Windows path at the top level is enough to make the locator refuse, and «outdated -
+        // run docli agent-setup» would name a remedy that cannot work.
+        use crate::agent_setup::State;
         let HookOutcome::Write(good) = merge(HookAgent::Claude, None, DEFAULT_MCP_LABEL) else {
             panic!("write");
         };
+        let windows_path =
+            |text: &str| text.replacen('{', r#"{"statusLine": "C:\\tools\\line.cmd","#, 1);
+        // Equality on the parsed file decides CURRENT before the locator matters.
+        let current = windows_path(&good);
+        assert_eq!(
+            state(HookAgent::Claude, Some(&current), DEFAULT_MCP_LABEL),
+            State::Current
+        );
         let mut v: Value = serde_json::from_str(&good).unwrap();
-        v["hooks"]["PreToolUse"][0]["matcher"] = json!("Bash");
-        std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
-        std::fs::write(
-            tmp.path().join(".claude/settings.json"),
-            serde_json::to_string_pretty(&v).unwrap(),
-        )
-        .unwrap();
-        // Still ours…
-        assert!(is_ours(
-            &v["hooks"]["PreToolUse"][0],
-            HookAgent::Claude,
-            "PreToolUse"
+        v["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"] = json!(20);
+        let stale = windows_path(&serde_json::to_string_pretty(&v).unwrap());
+        assert!(matches!(
+            merge(HookAgent::Claude, Some(&stale), DEFAULT_MCP_LABEL),
+            HookOutcome::Occupied(_)
         ));
-        // …and NOT reported as a working gate.
-        assert!(!status(tmp.path(), HookAgent::Claude, DEFAULT_MCP_LABEL).installed);
+        assert_eq!(
+            state(HookAgent::Claude, Some(&stale), DEFAULT_MCP_LABEL),
+            State::Occupied
+        );
+    }
+
+    #[test]
+    fn a_crlf_checkout_of_a_current_file_is_current() {
+        let HookOutcome::Write(good) = merge(HookAgent::Codex, None, DEFAULT_MCP_LABEL) else {
+            panic!("write");
+        };
+        assert_eq!(
+            state(
+                HookAgent::Codex,
+                Some(&good.replace('\n', "\r\n")),
+                DEFAULT_MCP_LABEL
+            ),
+            crate::agent_setup::State::Current
+        );
     }
 }

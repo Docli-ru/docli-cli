@@ -71,7 +71,9 @@ pub fn merged_agents_md(existing: Option<&str>) -> AgentsMd {
             // Keep whatever line ending followed the old block.
             let tail = &text[end..];
             let rebuilt = format!("{}{}{}", &text[..start], block.trim_end(), tail);
-            return if rebuilt == text {
+            // Line endings normalised: `AGENTS.md` is committed in a repository we cannot pin,
+            // and an autocrlf checkout of a current section must not read as a change forever.
+            return if crate::agent_setup::same_text(&rebuilt, text) {
                 AgentsMd::Current
             } else {
                 AgentsMd::Write(rebuilt)
@@ -95,9 +97,25 @@ pub fn merged_agents_md(existing: Option<&str>) -> AgentsMd {
     AgentsMd::Write(out)
 }
 
+/// The section's state for `docli status` and `docli agent-setup` (v0.46.0 D9) — by content, and
+/// only OURS: a hand-written description is not an install of ours, so it is `Occupied` (left
+/// alone), and a file without the section is `Absent`.
+pub fn section_state(existing: Option<&str>) -> crate::agent_setup::State {
+    use crate::agent_setup::State;
+    match merged_agents_md(existing) {
+        AgentsMd::Current => State::Current,
+        AgentsMd::HandWritten => State::Occupied,
+        AgentsMd::Write(_) if existing.is_some_and(|t| t.contains(BEGIN)) => State::Outdated,
+        AgentsMd::Write(_) => State::Absent,
+    }
+}
+
 /// Write the instruction files, reporting through `ui`. Best-effort per file, like every other
 /// write `init` performs: one unwritable file names itself and the rest proceed.
-pub fn install(project_root: &Path) -> Result<()> {
+///
+/// `create_claude_md` is false on a bare `docli agent-setup` refresh: the `CLAUDE.md` bridge is a
+/// file nothing had there, and a refresh installs nothing new (v0.46.0 D8).
+pub fn install(project_root: &Path, create_claude_md: bool) -> Result<()> {
     let agents = project_root.join("AGENTS.md");
     let existing = match std::fs::read_to_string(&agents) {
         Ok(s) => Some(s),
@@ -154,12 +172,17 @@ pub fn install(project_root: &Path) -> Result<()> {
     // `symlink_metadata`, not `exists()`: a DANGLING `CLAUDE.md` symlink makes `exists()` false
     // (it follows the link), and the create below would then write through it — silently
     // producing the referent, in whatever directory the link points at.
-    if claude.symlink_metadata().is_ok() {
+    if claude_imports_agents_md(project_root) {
+        // Already bridged — telling an agent to add the line again invites a duplicate edit.
+        crate::ui::ok("CLAUDE.md imports AGENTS.md");
+    } else if claude.symlink_metadata().is_ok() {
         crate::ui::warn(
             "CLAUDE.md already exists and docli will not edit it - Claude Code does not read \
              AGENTS.md, so add this line at the top yourself:",
         );
         crate::ui::detail(CLAUDE_IMPORT);
+    } else if !create_claude_md {
+        // A refresh: the bridge was never installed here, so it is not ours to add.
     } else if !have_section {
         // A bridge to a file that may carry no contract is worse than no bridge: it looks like
         // the job is done. Say what is missing instead of writing the import over a gap.
@@ -240,24 +263,31 @@ pub fn consent_summary(project_root: &Path) -> Vec<String> {
     // The SAME test `install` uses (`symlink_metadata`, not `exists()`), or the screen promises
     // to create a file the write then correctly refuses to touch — the dangling-symlink case.
     // A consent summary that disagrees with the action is worse than none.
-    out.push(
-        if project_root.join("CLAUDE.md").symlink_metadata().is_ok() {
-            "CLAUDE.md: NOT touched - it already exists, so the one line to add is printed for \
+    out.push(if claude_imports_agents_md(project_root) {
+        "CLAUDE.md: NOT touched - it already imports AGENTS.md".to_string()
+    } else if project_root.join("CLAUDE.md").symlink_metadata().is_ok() {
+        "CLAUDE.md: NOT touched - it already exists, so the one line to add is printed for \
              you to paste"
-                .to_string()
-        } else if matches!(agents_state, AgentsMd::HandWritten) {
-            // The OTHER reason `install` withholds the bridge: importing an AGENTS.md that
-            // carries no docli section would look like the job is done.
-            "CLAUDE.md: NOT created - it would import an AGENTS.md that carries no docli section"
-                .to_string()
-        } else {
-            format!(
-                "CLAUDE.md: created, containing `{CLAUDE_IMPORT}` (Claude Code does not read \
+            .to_string()
+    } else if matches!(agents_state, AgentsMd::HandWritten) {
+        // The OTHER reason `install` withholds the bridge: importing an AGENTS.md that
+        // carries no docli section would look like the job is done.
+        "CLAUDE.md: NOT created - it would import an AGENTS.md that carries no docli section"
+            .to_string()
+    } else {
+        format!(
+            "CLAUDE.md: created, containing `{CLAUDE_IMPORT}` (Claude Code does not read \
                  AGENTS.md)"
-            )
-        },
-    );
+        )
+    });
     out
+}
+
+/// Does an existing `CLAUDE.md` already carry the import line? One answer for the consent
+/// screen and for `install`, so the screen never promises a line the write then does not print.
+fn claude_imports_agents_md(project_root: &Path) -> bool {
+    std::fs::read_to_string(project_root.join("CLAUDE.md"))
+        .is_ok_and(|t| t.lines().any(|l| l.trim() == CLAUDE_IMPORT))
 }
 
 #[cfg(test)]
@@ -265,9 +295,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_claude_md_that_already_imports_is_reported_as_bridged() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("CLAUDE.md"), "# Notes\n@AGENTS.md\n").unwrap();
+        let summary = consent_summary(tmp.path());
+        assert!(
+            summary
+                .iter()
+                .any(|l| l.contains("already imports AGENTS.md")),
+            "{summary:?}"
+        );
+        install(tmp.path(), true).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap(),
+            "# Notes\n@AGENTS.md\n"
+        );
+    }
+
+    #[test]
     fn a_fresh_project_gets_both_files() {
         let tmp = tempfile::tempdir().unwrap();
-        install(tmp.path()).unwrap();
+        install(tmp.path(), true).unwrap();
         let agents = std::fs::read_to_string(tmp.path().join("AGENTS.md")).unwrap();
         assert!(agents.contains(BEGIN) && agents.contains(END), "{agents}");
         assert!(agents.contains("docli sync"), "{agents}");
@@ -284,7 +332,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mine = "# My project\n\nCarefully tuned instructions.\n";
         std::fs::write(tmp.path().join("CLAUDE.md"), mine).unwrap();
-        install(tmp.path()).unwrap();
+        install(tmp.path(), true).unwrap();
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap(),
             mine,
@@ -323,6 +371,33 @@ mod tests {
     }
 
     #[test]
+    fn a_crlf_checkout_of_the_current_section_is_current() {
+        // `init`'s blind spot, closed by the shared comparator: committed under autocrlf, the
+        // section came back CRLF and read as a change on every run.
+        let first = written(merged_agents_md(Some("# Agents\n")));
+        let crlf = first.replace('\n', "\r\n");
+        assert_eq!(merged_agents_md(Some(&crlf)), AgentsMd::Current);
+        assert_eq!(
+            section_state(Some(&crlf)),
+            crate::agent_setup::State::Current
+        );
+        let stale = format!("{BEGIN}\r\nold text\r\n{END}\r\n");
+        assert_eq!(
+            section_state(Some(&stale)),
+            crate::agent_setup::State::Outdated
+        );
+        assert_eq!(
+            section_state(Some("# Agents\n")),
+            crate::agent_setup::State::Absent
+        );
+        assert_eq!(section_state(None), crate::agent_setup::State::Absent);
+        assert_eq!(
+            section_state(Some("The docli mirror is read-only.\n")),
+            crate::agent_setup::State::Occupied
+        );
+    }
+
+    #[test]
     fn a_hand_written_docli_section_is_left_alone() {
         // No markers and the file already talks about docli: appending a second section would
         // hand the reader two descriptions to reconcile.
@@ -340,7 +415,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp.path().join("elsewhere/REAL.md");
         std::os::unix::fs::symlink(&target, tmp.path().join("CLAUDE.md")).unwrap();
-        install(tmp.path()).unwrap();
+        install(tmp.path(), true).unwrap();
         assert!(!target.exists(), "the referent must not be conjured up");
         assert!(
             tmp.path().join("CLAUDE.md").symlink_metadata().is_ok(),
@@ -356,9 +431,9 @@ mod tests {
         // withheld when the section is missing — no CLAUDE.md at all for a project that
         // deserved one.
         let tmp = tempfile::tempdir().unwrap();
-        install(tmp.path()).unwrap();
+        install(tmp.path(), true).unwrap();
         std::fs::remove_file(tmp.path().join("CLAUDE.md")).unwrap();
-        install(tmp.path()).unwrap();
+        install(tmp.path(), true).unwrap();
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap(),
             "@AGENTS.md\n",

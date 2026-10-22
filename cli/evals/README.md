@@ -36,10 +36,11 @@ orientation instructs. So a run measures both halves — «the CLI first» (as a
 «the notes before the local files» (as an outcome) — and the grader reads the ORDER from the trace.
 
 **The mock needs the real tool schema.** `mocks/docli/_tools.json` is the live server's
-`tools/list` (saved 2026-09-22 from `v0.38.0`); without it the harness serves the mocked tools
-with a permissive schema and no description, the model invents argument names, and a mock's
-`expect:` guard ABORTS the run — which is what the first n=5 produced for the manuscript and
-write-back cases (0/5 each, `aborted: … path = (missing)`), and why those guards are now minimal.
+`tools/list` (saved 2026-09-22 from `v0.38.0`, re-saved 2026-10-22 from `v0.46.0`); without it
+the harness serves the mocked tools with a permissive schema and no description, the model
+invents argument names, and a mock's `expect:` guard ABORTS the run — which is what the first n=5
+produced for the manuscript and write-back cases (0/5 each, `aborted: … path = (missing)`), and
+why those guards are now minimal.
 Re-save the file when the catalog changes.
 
 `read-narrowly` cannot be honestly measured this way at all — narrowing is a CLI property (an MCP

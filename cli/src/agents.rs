@@ -1287,8 +1287,8 @@ pub fn sweep_cfg_temps(project_root: &Path, selected: &[&AgentDef]) {
     }
 }
 
-/// Write the shared contract into one agent's skills directory, injecting the frontmatter keys
-/// that agent's schema admits (v0.28.6 D4).
+/// The shared contract as one agent's skills directory receives it, with the frontmatter keys
+/// that agent's schema admits injected (v0.28.6 D4).
 ///
 /// **One body, never a fork.** `apps/cli/assets/SKILL.md` is a single compile-time constant with
 /// a single set of pins, and it is written to the Agent Skills open-standard path
@@ -1322,17 +1322,27 @@ pub fn sweep_cfg_temps(project_root: &Path, selected: &[&AgentDef]) {
 /// The contract's delivery moved down the ranking v0.28.6 D1 already established: the CLI's own
 /// output first (every invocation, no trigger problem), then the hooks, then this. The globs stay
 /// because the data-loss case still needs them.
-pub fn copy_skill(project_root: &Path, dir: &str, skill_md: &str, globs: &[String]) -> Result<()> {
-    let d = project_root.join(dir);
-    fs::create_dir_all(&d)?;
-    let body = if globs.is_empty() {
-        skill_md.to_string()
-    } else {
+pub fn skill_copy_body(def: &AgentDef, skill_md: &str, globs: &[String]) -> String {
+    // Only agents whose frontmatter schema admits the key get it (D4).
+    if def.accepts_claude_frontmatter && !globs.is_empty() {
         inject_frontmatter(skill_md, "paths", globs)
-    };
-    fs::write(d.join("SKILL.md"), body)
-        .with_context(|| format!("writing {}/SKILL.md", d.display()))?;
-    Ok(())
+    } else {
+        skill_md.to_string()
+    }
+}
+
+/// Write `body` as `<dir>/SKILL.md`, unless the file already says exactly that — compared with
+/// line endings normalised, so a CRLF checkout of a current copy is not rewritten. `Ok(false)`
+/// means it was already current.
+pub fn copy_skill(project_root: &Path, dir: &str, body: &str) -> Result<bool> {
+    let d = project_root.join(dir);
+    let file = d.join("SKILL.md");
+    if fs::read_to_string(&file).is_ok_and(|t| crate::agent_setup::same_text(&t, body)) {
+        return Ok(false);
+    }
+    fs::create_dir_all(&d)?;
+    fs::write(&file, body).with_context(|| format!("writing {}", file.display()))?;
+    Ok(true)
 }
 
 /// Add `key: [values]` to a YAML frontmatter block, leaving the body untouched.
@@ -1432,17 +1442,12 @@ pub fn install_skills(
         let Some(dir) = def.skill_copy_dir else {
             continue;
         };
-        // Only agents whose frontmatter schema admits the key get it (D4).
-        let g: &[String] = if def.accepts_claude_frontmatter {
-            globs
-        } else {
-            &[]
-        };
-        match copy_skill(project_root, dir, skill_md, g) {
-            Ok(()) => crate::ui::detail(&format!("wrote {dir}/SKILL.md")),
+        match copy_skill(project_root, dir, &skill_copy_body(def, skill_md, globs)) {
+            Ok(true) => crate::ui::detail(&format!("wrote {dir}/SKILL.md")),
+            Ok(false) => crate::ui::detail(&format!("{dir}/SKILL.md is up to date")),
             Err(e) => crate::ui::refuse(&format!(
                 "{}: could not write {dir}/SKILL.md ({e:#}) - the mirror contract is not \
-                 installed for it; copy the file by hand or re-run `docli init`",
+                 installed for it; copy the file by hand or re-run `docli agent-setup`",
                 def.display
             )),
         }

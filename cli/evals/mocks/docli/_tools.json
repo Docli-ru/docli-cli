@@ -1,6 +1,9 @@
 {
   "tools": [
     {
+      "annotations": {
+        "readOnlyHint": true
+      },
       "description": "Full-text search the workspace's notes (Russian + English) — use this when you don't know where something lives. Returns ranked hits with highlighted snippets and each hit's `contentChangedAt` (an unchanged-since bound on that note's text — check it before choosing what to read), plus `attachments`: FILES whose name or path matches (filenames only — file contents aren't indexed yet). `degraded: true` means the NOTE index was incomplete for this call — the attachment arm is never degraded, but it IS capped, so check `attachmentsTruncated`.",
       "inputSchema": {
         "properties": {
@@ -25,7 +28,10 @@
       "name": "search_notes"
     },
     {
-      "description": "Read a note: markdown source, frontmatter, backlinks, outgoing links (`links` = resolved NOTE targets, `unresolved` = dangling refs), `embeds` (the FILES this note shows — read those with read_attachment before concluding you have read the note), tags, `relatedHint` (a few neighbours worth checking), and `contentChangedAt` — an unchanged-since bound on the body's text, `null` on the few notes no writer has stamped — plus, when it is non-null, a plain-language `notice` about how far to trust the BODY's current-state claims. Identify it by `path` or `id`. For a file, use attachment_info / read_attachment instead.",
+      "annotations": {
+        "readOnlyHint": true
+      },
+      "description": "Read a note: markdown source, frontmatter, backlinks, outgoing links (`links` = resolved NOTE targets, `unresolved` = dangling refs), `embeds` (the FILES this note shows — read those with read_attachment before concluding you have read the note), tags, `relatedHint` (a few neighbours worth checking), and `contentChangedAt` — an unchanged-since bound on the body's text, `null` on the few notes no writer has stamped — plus, when it is non-null, a plain-language `notice` about how far to trust the BODY's current-state claims. Identify it by `path` or `id`. For a file, use attachment_info / read_attachment instead. `url` opens the note in the docli app for workspace members — it is not a public link (share_note makes one).",
       "inputSchema": {
         "properties": {
           "id": {
@@ -47,6 +53,9 @@
       "name": "read_note"
     },
     {
+      "annotations": {
+        "readOnlyHint": true
+      },
       "description": "Read several notes in one call, by `paths` and/or `ids` (max 100) — use it after search_notes rather than reading hits one at a time. Each note carries `contentChangedAt`, an unchanged-since bound on its text. Returns them in request order; unknown refs land in `missing`; refs past the server byte cap land in `skipped` (follow up with another call); refs that name a FILE land in `attachments` (read those with read_attachment).",
       "inputSchema": {
         "properties": {
@@ -75,6 +84,9 @@
       "name": "read_notes"
     },
     {
+      "annotations": {
+        "readOnlyHint": true
+      },
       "description": "Read the WHOLE vault (every live note's path + content + `contentChangedAt`, an unchanged-since bound on its text; stable path order) if it fits your byte budget — ideal for small workspaces instead of many searches. Pass `max_bytes` = what you can afford to load (~4 bytes ≈ 1 token). Files are listed (`attachments`: path, mime, size) but never inlined, so they don't consume the budget. If it doesn't fit, you get `fits: false` with the sizes plus a vault map (per-folder note and file totals + top notes by backlinks/recency, each with its `contentChangedAt`) to guide `read_vault` on a `folder`, `read_notes`, or `search_notes`.",
       "inputSchema": {
         "properties": {
@@ -99,6 +111,9 @@
       "name": "read_vault"
     },
     {
+      "annotations": {
+        "readOnlyHint": true
+      },
       "description": "List the workspace's notes AND files (id, path, kind, size in bytes, updatedAt; `mime` on files), optionally under a folder — the way to see what exists. `kind` is \"file\" for a note and \"attachment\" for a file. Set include_folders to also list folders (incl. empty ones); set include_attachments:false to list notes only. Pass `since` (RFC 3339) to get only rows changed after it — use the response's `cursor` as your next `since`. Best-effort feed: a write concurrent with your poll can rarely be missed until its next edit; trashed rows just disappear (deletions aren't reported).",
       "inputSchema": {
         "properties": {
@@ -129,6 +144,9 @@
       "name": "list_notes"
     },
     {
+      "annotations": {
+        "readOnlyHint": true
+      },
       "description": "List the notes that link to a given note — or, given a FILE, the notes that embed it (identified by `path` or `id`).",
       "inputSchema": {
         "properties": {
@@ -149,6 +167,9 @@
       "name": "get_backlinks"
     },
     {
+      "annotations": {
+        "readOnlyHint": true
+      },
       "description": "Suggest notes and files related to a given note or file (identified by `path` or `id`) — ranked by shared link-graph neighbors, lexical similarity, and shared tags. Call it before concluding you have found everything on a topic. Already-linked notes and directly-embedded files are excluded (use read_note/get_backlinks/attachment_info for those). `why` explains each hit: sharedNeighbors (count), terms (matched word STEMS, not surface forms), tags. File subjects are ranked on the link graph and tags only — file contents aren't indexed yet.",
       "inputSchema": {
         "properties": {
@@ -175,6 +196,9 @@
       "name": "related_notes"
     },
     {
+      "annotations": {
+        "readOnlyHint": true
+      },
       "description": "List all tags in the workspace with note counts.",
       "inputSchema": {
         "properties": {
@@ -189,6 +213,9 @@
       "name": "list_tags"
     },
     {
+      "annotations": {
+        "readOnlyHint": true
+      },
       "description": "List the notes carrying a given tag.",
       "inputSchema": {
         "properties": {
@@ -209,6 +236,9 @@
       "name": "notes_by_tag"
     },
     {
+      "annotations": {
+        "readOnlyHint": false
+      },
       "description": "Create a folder at `path`, creating any missing parent folders (mkdir -p). Then create notes under it with write_note.",
       "inputSchema": {
         "properties": {
@@ -229,7 +259,10 @@
       "name": "create_folder"
     },
     {
-      "description": "Create a note or update its ENTIRE markdown body (like a file `write`). By `path`: creates the note if it doesn't exist (the parent folder must already exist — use create_folder first), otherwise updates the existing note. By `id`: updates an existing note (you can't create by id). There is no fragment/patch mode — `content` must be the FULL body; for a TARGETED change use edit_note instead, and to add to the end use append_to_note. On an update, pass `base` (the full body you last read): your body and the current note are compared with that common base, and the resulting changes are merged word by word. Without `base`, your body replaces whatever the note holds now (last writer wins). Returns `created` (true if a new note was made), `mergedWithLiveEdits` (true if the note had changed since `base` and your body was merged with those changes without creating a conflict sibling), `overlappingEdits` (how many of your changes touched text also changed since `base` — at those locations, the note holds text from both sides; if the count is above 0, re-read the note and resolve those overlaps with edit_note) and `conflictSiblingId` (non-null only in a rare fallback when the merge could not run and both versions were kept separately in the original note and a conflict sibling — reconcile them before trashing the sibling). For your next whole-body write, you may reuse the body you just sent as `base` only if `mergedWithLiveEdits` was false and `conflictSiblingId` was null; otherwise re-read the note and use its full body as `base`. Never reuse an older base.",
+      "annotations": {
+        "readOnlyHint": false
+      },
+      "description": "Create a note or update its ENTIRE markdown body (like a file `write`). By `path`: creates the note if it doesn't exist (the parent folder must already exist — use create_folder first), otherwise updates the existing note. By `id`: updates an existing note (you can't create by id). There is no fragment/patch mode — `content` must be the FULL body; for a TARGETED change use edit_note instead, and to add to the end use append_to_note. On an update, pass `base` (the full body you last read): your body and the current note are compared with that common base, and the resulting changes are merged word by word. Without `base`, your body replaces whatever the note holds now (last writer wins). Returns `url` (opens the note in the docli app for workspace members — not a public link; give it when you hand the note to someone), `created` (true if a new note was made), `mergedWithLiveEdits` (true if the note had changed since `base` and your body was merged with those changes without creating a conflict sibling), `overlappingEdits` (how many of your changes touched text also changed since `base` — at those locations, the note holds text from both sides; if the count is above 0, re-read the note and resolve those overlaps with edit_note) and `conflictSiblingId` (non-null only in a rare fallback when the merge could not run and both versions were kept separately in the original note and a conflict sibling — reconcile them before trashing the sibling). For your next whole-body write, you may reuse the body you just sent as `base` only if `mergedWithLiveEdits` was false and `conflictSiblingId` was null; otherwise re-read the note and use its full body as `base`. Never reuse an older base.",
       "inputSchema": {
         "properties": {
           "base": {
@@ -238,6 +271,11 @@
           },
           "content": {
             "description": "The FULL markdown body (whole-note write — never a fragment).",
+            "type": "string"
+          },
+          "desktop_follow_round_id": {
+            "description": "Optional short-lived Desktop presentation round. It grants no authority and never changes whether this write commits.",
+            "format": "uuid",
             "type": "string"
           },
           "id": {
@@ -261,9 +299,17 @@
       "name": "write_note"
     },
     {
+      "annotations": {
+        "readOnlyHint": false
+      },
       "description": "Replace an exact string in a note (identified by `path` or `id`) — for targeted edits without resending the body. `old_string` must match the note text EXACTLY, whitespace and newlines included, and must be unique unless replace_all is true. `new_string` may be empty (deletion). Whole-note rewrites should use write_note instead.",
       "inputSchema": {
         "properties": {
+          "desktop_follow_round_id": {
+            "description": "Optional short-lived Desktop presentation round. It grants no authority and never changes whether this write commits.",
+            "format": "uuid",
+            "type": "string"
+          },
           "id": {
             "type": "string"
           },
@@ -296,9 +342,17 @@
       "name": "edit_note"
     },
     {
+      "annotations": {
+        "readOnlyHint": false
+      },
       "description": "Append text to the end of a note (conflict-safe; identify it by `path` or `id`).",
       "inputSchema": {
         "properties": {
+          "desktop_follow_round_id": {
+            "description": "Optional short-lived Desktop presentation round. It grants no authority and never changes whether this write commits.",
+            "format": "uuid",
+            "type": "string"
+          },
           "id": {
             "type": "string"
           },
@@ -322,6 +376,9 @@
       "name": "append_to_note"
     },
     {
+      "annotations": {
+        "readOnlyHint": false
+      },
       "description": "Rename a note, file, or folder (the extension is preserved). Identify it by `path` or `id`.",
       "inputSchema": {
         "properties": {
@@ -348,6 +405,9 @@
       "name": "rename_note"
     },
     {
+      "annotations": {
+        "readOnlyHint": false
+      },
       "description": "Move a note, file, or folder subtree to the trash. Recoverable. Identify it by `path` or `id`. Trashing a FILE returns `embeddedIn` — the notes whose embeds it just broke.",
       "inputSchema": {
         "properties": {
@@ -368,9 +428,20 @@
       "name": "trash_note"
     },
     {
-      "description": "Move a note, file, or folder into `dest_folder` (a folder path or id; omit for the workspace root).",
+      "annotations": {
+        "readOnlyHint": false
+      },
+      "description": "Move a note, file, or folder into `dest_folder` (a folder path or id; omit for the workspace root). To place it among its new siblings in the same step, pass `before` or `after` (a sibling in the destination folder, by path or id) — the result then carries the folder's `order`. Without them, a move to another folder drops the item's custom position and it sorts among the unpositioned items by name.",
       "inputSchema": {
         "properties": {
+          "after": {
+            "description": "Optional: the sibling (path or id, in the destination folder) it should come AFTER.",
+            "type": "string"
+          },
+          "before": {
+            "description": "Optional: the sibling (path or id, in the destination folder) it should come BEFORE.",
+            "type": "string"
+          },
           "dest_folder": {
             "description": "Destination folder path or id; omit for root.",
             "type": "string"
@@ -392,6 +463,48 @@
       "name": "move_note"
     },
     {
+      "annotations": {
+        "readOnlyHint": false
+      },
+      "description": "Change where a note, file, or folder sits among its siblings — the custom order the app and the public reader show (list_notes returns path order, not this). Identify it by `path` or `id`, then pass ONE of `before` (the sibling it should come before), `after` (the sibling it should come after) — each a path or id in the SAME folder — or `position`: \"start\" or \"end\"; nothing means the end. Returns the folder's resulting `order` (names). A placement that already holds changes nothing. Pages of a book the public reader already shows keep their old order until the owner's next release.",
+      "inputSchema": {
+        "properties": {
+          "after": {
+            "description": "The sibling (path or id) it should come AFTER.",
+            "type": "string"
+          },
+          "before": {
+            "description": "The sibling (path or id) it should come BEFORE.",
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "position": {
+            "description": "First or last in its folder (instead of before/after).",
+            "enum": [
+              "start",
+              "end"
+            ],
+            "type": "string"
+          },
+          "workspace": {
+            "description": "Workspace @handle or id. Omit if the token is pinned to a single workspace or your account is a member of exactly one workspace (a personal workspace counts); required otherwise — a member of several workspaces must name one.",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "reorder_note"
+    },
+    {
+      "annotations": {
+        "readOnlyHint": true
+      },
       "description": "Stat a FILE in the vault (identified by `path` or `id`): name, path, mime, size, and `embeddedIn` — the notes that show it. Use it when a note's `embeds` names a file you need to know about, or before trashing/renaming one. Returns no content; read_attachment does that.",
       "inputSchema": {
         "properties": {
@@ -414,6 +527,9 @@
       "name": "attachment_info"
     },
     {
+      "annotations": {
+        "readOnlyHint": true
+      },
       "description": "Get a FILE's content (identified by `path` or `id`). Small PNG/JPEG/GIF/WebP images come back INLINE and you can see them directly. Everything else — PDFs, documents, big images, SVG/HEIC — comes back as `download.href`: a short-lived URL you fetch with curl — no Authorization header needed, because the URL ITSELF is the credential, so don't paste it anywhere shared (docli.ru must be reachable from where you run it). File CONTENTS are not searchable yet, so this is the way to look inside one.",
       "inputSchema": {
         "properties": {
@@ -436,6 +552,9 @@
       "name": "read_attachment"
     },
     {
+      "annotations": {
+        "readOnlyHint": false
+      },
       "description": "Put a FILE into the vault at `path`. Tiny files (≤64 KiB): pass `content_base64`. Anything bigger: pass `total_bytes` and NO content — you get back an upload URL, a chunk size, and a completion URL to drive with curl; re-call with the same `upload_id` to resume or check progress. The parent folder must already exist (create_folder first). Re-uploading identical bytes to the same path returns the existing file instead of a duplicate. The response's `wikilink` is ready to paste into a note with edit_note.",
       "inputSchema": {
         "properties": {
@@ -472,6 +591,9 @@
       "name": "upload_attachment"
     },
     {
+      "annotations": {
+        "readOnlyHint": false
+      },
       "description": "Flag a note as ready for review — it appears in the owner's review queue («На ревью») until they act on it. Identify it by `path` or `id`.",
       "inputSchema": {
         "properties": {
@@ -490,6 +612,58 @@
         "type": "object"
       },
       "name": "request_review"
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false
+      },
+      "description": "Make a note or folder readable by anyone who holds a link, and get that link back as `shareUrl`. Ask the user before calling this, and never call it unasked: `shareUrl` is a credential — anyone holding it can read the note (for a folder, everything in it) until the link is revoked or expires — so give it only to the people the user named. If the note has no access set, this sets it to «По ссылке» (by link) — `changedAccess: true`, which the owner sees in the app. Without `expires_at`, a link this note already has is reused (`createdLink: false`). A note that everyone can already read (`reach: \"public\"`) gets no link: `publicUrl` is its public page, or null with a `reason`. Refused when a parent folder is private, or when the change would affect a book the public reader already shows — the owner changes those in the app. Needs the admin role. Revoke with revoke_share_link and the returned `linkId`.",
+      "inputSchema": {
+        "properties": {
+          "expires_at": {
+            "description": "Optional RFC 3339 expiry; a new link is created when you pass one.",
+            "type": "string"
+          },
+          "id": {
+            "description": "Note or folder id (alternative to path).",
+            "type": "string"
+          },
+          "path": {
+            "description": "Note or folder path.",
+            "type": "string"
+          },
+          "workspace": {
+            "description": "Workspace @handle or id. Omit if the token is pinned to a single workspace or your account is a member of exactly one workspace (a personal workspace counts); required otherwise — a member of several workspaces must name one.",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "share_note"
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false
+      },
+      "description": "Revoke a share link by `link_id` (from share_note). It stops working for EVERYONE who holds it — a reused link may already have been handed to someone — while any other link covering the note keeps working. The note's access setting is left as it is. Needs the admin role.",
+      "inputSchema": {
+        "properties": {
+          "link_id": {
+            "description": "The `linkId` share_note returned.",
+            "type": "string"
+          },
+          "workspace": {
+            "description": "Workspace @handle or id. Omit if the token is pinned to a single workspace or your account is a member of exactly one workspace (a personal workspace counts); required otherwise — a member of several workspaces must name one.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "link_id"
+        ],
+        "type": "object"
+      },
+      "name": "revoke_share_link"
     }
   ]
 }

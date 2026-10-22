@@ -106,6 +106,11 @@ pub struct Status {
     /// that trade — *"a mistyped path in `settings.json` leaves the gate silently disabled"*.
     /// A disabled gate has to be noticeable somewhere, and this is the somewhere.
     pub hooks: Vec<crate::hooks::HookStatus>,
+    /// The skill copies and the `AGENTS.md` section installed here, each current or outdated
+    /// against what this binary writes (v0.46.0 D9). INFORMATIONAL — never part of the exit code:
+    /// every release that changes a bundled asset makes every project «outdated», and a health
+    /// check must not flap on that.
+    pub agent_files: Vec<crate::agent_setup::FileState>,
     /// «docli-cli 0.1.2 -> 0.1.3 - update: docli self-update», when the signed manifest advertises
     /// a newer version (D11). A field, not just a line: machine consumers should be able to see
     /// a stale binary, and hiding it from `--json` would be the same silent-omission mistake
@@ -245,6 +250,7 @@ pub fn gather(cwd: &Path, server: &str) -> Result<Status> {
         gitignore_missing: Vec::new(),
         gitignore_unknown: Vec::new(),
         hooks: Vec::new(),
+        agent_files: Vec::new(),
         // Cached, so this costs the network at most once a day and never fails the command.
         update_available: crate::selfupdate::notice(),
     };
@@ -308,6 +314,7 @@ pub fn gather(cwd: &Path, server: &str) -> Result<Status> {
             )
         })
         .collect();
+    status.agent_files = crate::agent_setup::installed_files(&root, &project.config);
     Ok(status)
 }
 
@@ -383,17 +390,22 @@ pub fn run(cwd: &Path, server: &str, json: bool) -> Result<i32> {
     // check actually uses, so returning 0 there regardless made the code useless exactly where
     // it matters. A mount that has NEVER synced counts as degraded too: `incomplete` is false
     // for it (there is no state to be incomplete) while the screen says «не синхронизировано».
-    let degraded = !status.signed_in
-        || status.credential_error.is_some()
-        || status.mounts.iter().any(mount_is_degraded)
-        || !status.gitignore_missing.is_empty()
-        || !status.gitignore_unknown.is_empty();
+    let degraded = is_degraded(&status);
     if json {
         println!("{}", serde_json::to_string_pretty(&status)?);
         return Ok(if degraded { 1 } else { 0 });
     }
     render(&status);
     Ok(if degraded { 1 } else { 0 })
+}
+
+/// The exit code's question. Hooks and agent files are deliberately absent (v0.46.0 D9).
+fn is_degraded(status: &Status) -> bool {
+    !status.signed_in
+        || status.credential_error.is_some()
+        || status.mounts.iter().any(mount_is_degraded)
+        || !status.gitignore_missing.is_empty()
+        || !status.gitignore_unknown.is_empty()
 }
 
 /// Is this mount's row a FAULT — the one question, asked in ONE place.
@@ -566,34 +578,7 @@ fn render(s: &Status) {
             ui::ok(a);
         }
     }
-    let installed: Vec<&crate::hooks::HookStatus> =
-        s.hooks.iter().filter(|h| h.installed).collect();
-    if installed.is_empty() {
-        ui::detail(&format!(
-            "no docli hooks here - the mirror is marked read-only and the contract asks agents \
-             not to edit it, but nothing refuses a write. Add enforcement: {}",
-            ui::cmd("docli init --hooks auto")
-        ));
-    } else {
-        for h in installed {
-            // The KEY is what `--json` carries (a stable identifier a script can match); the
-            // screen gets the name a person would say.
-            let name = crate::hooks::HookAgent::parse(h.agent)
-                .map(|a| a.display())
-                .unwrap_or(h.agent);
-            // A gate that cannot run is worse than no gate, because it looks like one.
-            if h.binary_resolves == Some(false) {
-                ui::warn(&format!(
-                    "{name}: hooks are installed but `docli` is not on PATH - they do nothing. \
-                     Reinstall the CLI, or run `docli uninstall` to take the entries back out."
-                ));
-            } else {
-                ui::ok(&format!(
-                    "{name}: hooks installed - file edits in the mirror are refused"
-                ));
-            }
-        }
-    }
+    render_agent_setup(s);
 
     if !s.gitignore_missing.is_empty() || !s.gitignore_unknown.is_empty() {
         ui::heading("Git");
@@ -605,6 +590,51 @@ fn render(s: &Status) {
         }
         for e in &s.gitignore_unknown {
             ui::warn(e);
+        }
+    }
+}
+
+/// The hook and agent-file rows. ONE hooks rule (`hooks::state`, v0.46.0 D8): «no docli hooks»
+/// means no entry is docli's, and the health line — does the gate run — is shown only for a
+/// CURRENT install, so one screen never says both «no hooks» and «outdated».
+fn render_agent_setup(s: &Status) {
+    use crate::agent_setup::State;
+    let setup = ui::cmd("docli agent-setup");
+    if s.hooks.iter().all(|h| h.state == State::Absent) {
+        ui::detail(&format!(
+            "no docli hooks here - the mirror is marked read-only and the contract asks agents \
+             not to edit it, but nothing refuses a write. Add enforcement: {}",
+            ui::cmd("docli agent-setup --hooks auto")
+        ));
+    }
+    for h in &s.hooks {
+        // The KEY is what `--json` carries (a stable identifier a script can match); the screen
+        // gets the name a person would say.
+        let agent = crate::hooks::HookAgent::parse(h.agent).ok();
+        let name = agent.map(|a| a.display()).unwrap_or(h.agent);
+        match h.state {
+            State::Absent => {}
+            // A gate that cannot run is worse than no gate, because it looks like one.
+            State::Current if h.binary_resolves == Some(false) => ui::warn(&format!(
+                "{name}: hooks are installed but `docli` is not on PATH - they do nothing. \
+                 Reinstall the CLI, or run `docli uninstall` to take the entries back out."
+            )),
+            State::Current => ui::ok(&format!(
+                "{name}: hooks installed - file edits in the mirror are refused"
+            )),
+            State::Outdated => ui::warn(&format!("{name}: hooks are outdated - {setup}")),
+            State::Occupied => ui::warn(&format!(
+                "{name}: hooks in {} cannot be updated automatically - edit them by hand ({setup} \
+                 prints the entries)",
+                agent.map(|a| a.config_path()).unwrap_or_default()
+            )),
+        }
+    }
+    for f in &s.agent_files {
+        if f.state == State::Current {
+            ui::ok(&format!("{}: current", f.path));
+        } else {
+            ui::warn(&format!("{}: outdated - {setup}", f.path));
         }
     }
 }
@@ -751,5 +781,75 @@ mod tests {
         assert!(s.mounts.is_empty());
         assert!(!s.signed_in);
         assert_eq!(s.version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn an_outdated_agent_setup_is_reported_and_never_moves_the_exit_code() {
+        use crate::agent_setup::State;
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::creds::home_env_lock();
+        std::env::set_var("DOCLI_HOME", tmp.path().join("home"));
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        std::fs::write(
+            root.join("docli.toml"),
+            "server = \"https://example.invalid\"\n",
+        )
+        .unwrap();
+        let config = crate::config::load_project(&root).unwrap().config;
+        let sel = crate::agent_setup::resolve(&root, Some("claude"), Some("claude"), true).unwrap();
+        crate::agent_setup::apply(&root, &config, &sel).unwrap();
+        // An older bundled skill and an older two-event hook install.
+        std::fs::write(root.join(".claude/skills/docli-mirror/SKILL.md"), "older\n").unwrap();
+        let settings = root.join(".claude/settings.json");
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        v["hooks"].as_object_mut().unwrap().remove("PostToolUse");
+        std::fs::write(&settings, v.to_string()).unwrap();
+
+        let before = gather(&root, "https://example.invalid").unwrap();
+        assert!(before.agent_files.iter().any(|f| f.path
+            == ".claude/skills/docli-mirror/SKILL.md"
+            && f.state == State::Outdated));
+        let claude = |s: &Status| {
+            s.hooks
+                .iter()
+                .find(|h| h.agent == "claude")
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(claude(&before).state, State::Outdated);
+        assert_eq!(
+            claude(&before).binary_resolves,
+            None,
+            "health only for a current install"
+        );
+
+        // What `docli agent-setup` does without a terminal — called directly, since `run` asks
+        // when the test itself runs at one.
+        let refresh = crate::agent_setup::installed_selection(&root, &config);
+        crate::agent_setup::apply(&root, &config, &refresh).unwrap();
+        let after = gather(&root, "https://example.invalid").unwrap();
+        std::env::remove_var("DOCLI_HOME");
+        assert!(
+            after.agent_files.iter().all(|f| f.state == State::Current),
+            "{:?}",
+            after.agent_files
+        );
+        assert_eq!(claude(&after).state, State::Current);
+        // Informational only: with everything else healthy, outdated rows leave the exit code at
+        // 0. (The fixture never signs in, so comparing `before` with `after` as they stand would
+        // pass whatever `is_degraded` read.)
+        let mut healthy = before;
+        healthy.signed_in = true;
+        healthy.credential_error = None;
+        healthy.mounts.clear();
+        healthy.gitignore_missing.clear();
+        healthy.gitignore_unknown.clear();
+        assert_eq!(claude(&healthy).state, State::Outdated);
+        assert!(
+            !is_degraded(&healthy),
+            "an outdated install must not move the exit code"
+        );
     }
 }

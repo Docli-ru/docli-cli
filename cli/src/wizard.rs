@@ -444,7 +444,9 @@ pub fn pick_agents(detected: &[&'static str], wired: &[&'static str]) -> Result<
     Ok(chosen.into_iter().map(|i| all[i].key).collect())
 }
 
-/// Step 6 — the two heavier writes, offered UNTICKED (v0.28.6 D6).
+/// Step 6 — the two heavier writes, offered for confirmation (v0.28.6 D6; pre-ticked since the
+/// 2026-09-03 ruling). Also `docli agent-setup`'s
+/// consent step (v0.46.0 D8): one consent UI for these artifacts, not two.
 ///
 /// Both agents refuse to run project-local hooks until the user accepts a trust dialog, so
 /// `docli init` writing one cannot smuggle execution onto a machine: the platform holds the
@@ -455,7 +457,7 @@ pub fn pick_agents(detected: &[&'static str], wired: &[&'static str]) -> Result<
 /// Only the two agents that HAVE a hook mechanism appear here. D9's asymmetry is stated rather
 /// than left to inference: a user who wired Cursor and read «the mirror is protected» would be
 /// wrong in exactly the way that costs a note.
-fn pick_enforcement(
+pub(crate) fn pick_enforcement(
     cwd: &Path,
     detected: &[&'static str],
 ) -> Result<(Vec<crate::hooks::HookAgent>, bool)> {
@@ -509,7 +511,7 @@ fn pick_enforcement(
     if !skill_dirs.is_empty() {
         ui::detail(&format!(
             "The mirror contract will also be copied into {} (a document, nothing executable). \
-             Skip it with `docli init --skills none`.",
+             Skip it with `--skills none`.",
             skill_dirs.join(", ")
         ));
     }

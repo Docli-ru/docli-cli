@@ -290,37 +290,15 @@ pub fn run(cwd: &Path, api: Option<&Api>, args: &InitArgs) -> Result<i32> {
         crate::ui::detail("--mcp-label/--mcp-bare do not apply: no agents were selected");
     }
     // Resolved here, with the rest of the intent, so a bad value refuses over an UNTOUCHED
-    // tree rather than a half-initialized one (the F9 pin, extended to the new flags).
-    let detected = || crate::agents::detect(cwd, std::env::home_dir().as_deref());
-    let skills_selection: Vec<&'static str> = match args.skills.as_deref().map(str::trim) {
-        Some("none") | Some("") => Vec::new(),
-        // Absent means AUTO — see `InitArgs::skills` for why this one default differs from the
-        // heavier writes beside it.
-        None | Some("auto") => detected(),
-        Some(list) => parse_agent_list(list, "--skills")?,
-    };
-    let hook_agents: Vec<crate::hooks::HookAgent> = match args.hooks.as_deref().map(str::trim) {
-        None | Some("none") | Some("") => Vec::new(),
-        Some("auto") => {
-            let d = detected();
-            crate::hooks::HookAgent::all()
-                .into_iter()
-                .filter(|a| d.contains(&a.key()))
-                .collect()
-        }
-        Some(list) => {
-            let mut out = Vec::new();
-            for k in list.split(',').map(str::trim).filter(|k| !k.is_empty()) {
-                let a = crate::hooks::HookAgent::parse(k).map_err(|e| {
-                    anyhow::anyhow!("--hooks: {e} (only these two agents have a hook mechanism)")
-                })?;
-                if !out.contains(&a) {
-                    out.push(a);
-                }
-            }
-            out
-        }
-    };
+    // tree rather than a half-initialized one (the F9 pin, extended to the new flags). The
+    // skill, hooks and AGENTS.md section are the `agent_setup` unit's — `docli agent-setup`
+    // writes them through the same two halves.
+    let agent_files = crate::agent_setup::resolve(
+        cwd,
+        args.skills.as_deref(),
+        args.hooks.as_deref(),
+        args.instructions,
+    )?;
     if !mcp_selection.is_empty() && config.server.chars().any(|c| c.is_control()) {
         // Codex round 1: the committed server value is printed raw in the wiring output — a
         // control character in it is terminal-escape injection (\u{1b}[2J + forged lines),
@@ -423,14 +401,6 @@ pub fn run(cwd: &Path, api: Option<&Api>, args: &InitArgs) -> Result<i32> {
     fs::write(&config_path, format!("{}{body}", config_header()))?;
     crate::ui::ok(&format!("wrote {}", config_path.display()));
 
-    // The agent contract, at the Agent Skills open-standard path (D12.2) — one drop, read
-    // lazily by every standard-following harness; off-standard agents get copies via the
-    // picker below.
-    let skill_dir = cwd.join(".agents/skills/docli-mirror");
-    fs::create_dir_all(&skill_dir)?;
-    fs::write(skill_dir.join("SKILL.md"), SKILL_MD)?;
-    crate::ui::ok(&format!("wrote {}", skill_dir.join("SKILL.md").display()));
-
     // Offer the ignore lines (never write .gitignore ourselves — it is the user's file).
     if config.mounts.is_empty() {
         crate::ui::next(&format!(
@@ -494,56 +464,10 @@ pub fn run(cwd: &Path, api: Option<&Api>, args: &InitArgs) -> Result<i32> {
         }
     }
 
-    // The contract into each selected agent's OWN skills directory — INDEPENDENT of whether any
-    // MCP config was written (D4). The activation globs come from the mount table, so this is a
-    // template rather than a copy.
-    let skill_agents: Vec<&crate::agents::AgentDef> = skills_selection
-        .iter()
-        .filter_map(|k| crate::agents::agent(k))
-        .collect();
-    if !skill_agents.is_empty() {
-        crate::agents::install_skills(
-            cwd,
-            &skill_agents,
-            SKILL_MD,
-            &crate::agents::skill_globs(cwd, &config.mounts),
-        );
-    }
-
-    // Hooks last, and only where they were explicitly asked for (D6).
-    if !hook_agents.is_empty() {
-        crate::ui::heading("Hooks");
-        // The hook files go through the SAME atomic writer as the MCP configs, so a crashed
-        // earlier run leaves the same `.docli-cfg-*.tmp` residue beside them. `wire`'s sweep
-        // covers it only when MCP wiring happened at all — `docli init --mcp none --hooks
-        // claude` writes into `.claude/` with nothing to clean it. An empty selection sweeps
-        // exactly the hook directories.
-        crate::agents::sweep_cfg_temps(cwd, &[]);
-        for line in crate::hooks::consent_summary(&hook_agents) {
-            crate::ui::detail(&line);
-        }
-        // The PostToolUse matcher covers the `docli` key the wiring above writes AND this
-        // project's label (Desktop's gateway name) — see `hooks::post_tool_use_matcher`.
-        let hook_label = config
-            .mcp_label
-            .clone()
-            .unwrap_or_else(|| crate::hooks::DEFAULT_MCP_LABEL.to_string());
-        for agent in &hook_agents {
-            crate::hooks::install(cwd, *agent, &hook_label)?;
-        }
-        // D9: enforcement language appears ONLY for agents that got a hook, and it states the
-        // limit in the same breath. Every other agent is advisory, and a user who wired Cursor
-        // and read «the mirror is protected» would be wrong in exactly the way that costs a note.
-        crate::ui::detail(
-            "docli will now refuse writes into the mirror from these agents' file-editing \
-             tools. Shell writes (`sed -i`, `>`) are NOT covered, on either agent, and no other \
-             agent gets enforcement at all - they get the contract as advice.",
-        );
-    }
-    if args.instructions {
-        crate::ui::heading("Instructions");
-        crate::instructions::install(cwd)?;
-    }
+    // The agent contract — the open-standard copy (D12.2, read lazily by every
+    // standard-following harness), the per-agent copies, then hooks (only where explicitly asked
+    // for, D6) and the instruction files.
+    crate::agent_setup::apply(cwd, &config, &agent_files)?;
     if args.codex_sandbox {
         crate::ui::heading("Codex sandbox");
         crate::agents::allow_codex_refresh(cwd)?;
@@ -615,29 +539,6 @@ fn plan_mcp(args: &InitArgs) -> Result<McpPlan> {
             }
         }
     }
-}
-
-/// A comma list of agent keys, refused (never silently dropped) on an unknown one.
-fn parse_agent_list(list: &str, flag: &str) -> Result<Vec<&'static str>> {
-    let mut keys = Vec::new();
-    for k in list.split(',').map(str::trim).filter(|k| !k.is_empty()) {
-        match crate::agents::agent(k) {
-            Some(def) => {
-                if !keys.contains(&def.key) {
-                    keys.push(def.key);
-                }
-            }
-            None => bail!(
-                "unknown agent {k:?} in {flag} - valid: {}",
-                crate::agents::AGENTS
-                    .iter()
-                    .map(|a| a.key)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        }
-    }
-    Ok(keys)
 }
 
 /// One TTY prompt: Enter = detected set, `n` = skip, else a comma list. Unknown keys are

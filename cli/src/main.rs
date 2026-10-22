@@ -6,8 +6,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use docli_cli::{
-    config, creds, doctor, graph_cmd, guard, hooks, http, init_cmd, list_cmd, login, logout,
-    read_cmd, related_cmd, search_cmd, selfupdate, status, sync_cmd, ui, uninstall, wizard,
+    agent_setup, config, creds, doctor, graph_cmd, guard, hooks, http, init_cmd, list_cmd, login,
+    logout, read_cmd, related_cmd, search_cmd, selfupdate, status, sync_cmd, ui, uninstall, wizard,
 };
 
 /// D12.5 - the identity block: name, version, site, copyright.
@@ -145,6 +145,23 @@ enum Command {
         /// --token: a minted key never needs renewing
         #[arg(long)]
         codex_sandbox: bool,
+    },
+    /// Install or update the agent skill, hooks and AGENTS.md section - at a terminal it asks
+    /// what to install and confirms before writing; without one, and without flags, it updates
+    /// what is installed and adds nothing
+    AgentSetup {
+        /// Copy the mirror contract into each agent's own skills directory: `auto` (detected
+        /// here - the default when another flag is given), `none`, or a comma-separated list of agent keys
+        #[arg(long)]
+        skills: Option<String>,
+        /// Install docli's hooks: `auto` (detected here), `none` (the default), or a
+        /// comma-separated list of claude,codex
+        #[arg(long)]
+        hooks: Option<String>,
+        /// Write the docli section of AGENTS.md, and a CLAUDE.md importing it when none
+        /// exists (an existing CLAUDE.md is never edited)
+        #[arg(long)]
+        agents_md: bool,
     },
     /// Bring every mount to the server's head (one-shot; never pushes)
     Sync {
@@ -487,6 +504,11 @@ fn run(cli: Cli) -> Result<i32> {
             });
             init_cmd::run(&cwd, api.as_ref(), &args)
         }
+        Command::AgentSetup {
+            skills,
+            hooks,
+            agents_md,
+        } => agent_setup::run(&cwd, skills.as_deref(), hooks.as_deref(), agents_md),
         Command::Sync {
             check,
             full,

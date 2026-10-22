@@ -276,15 +276,17 @@ fn due(checked_at: i64, now: i64) -> bool {
 ///
 /// It names **two** commands, and the second is v0.29.1 D9. `self-update` swaps the BINARY and
 /// nothing else, while the agent contract — `SKILL.md`, `AGENTS.md`, the hook wiring — reaches
-/// disk only through `docli init`. An un-regenerated install is therefore the blast radius of
-/// every contract change, and a release that removed a documented output field (this one removed
-/// `local_path`) would otherwise leave an agent following instructions describing a CLI that no
-/// longer exists. `docli init` has been idempotent since v0.28.2, so naming it unconditionally
-/// costs a re-run that changes nothing when nothing changed.
+/// disk only through the `agent_setup` unit. An un-regenerated install is therefore the blast
+/// radius of every contract change, and a release that removed a documented output field (v0.29.1
+/// removed `local_path`) would otherwise leave an agent following instructions describing a CLI
+/// that no longer exists. Since v0.46.0 the command named is `docli agent-setup`, not `docli
+/// init`: it regenerates without re-asking the mount questions, and without a terminal it only
+/// refreshes what is installed — so naming it unconditionally costs a run that changes nothing
+/// when nothing changed.
 pub fn notice_for(latest: &str, current: &str) -> Option<String> {
     match (parse_semver(latest), parse_semver(current)) {
         (Some(l), Some(c)) if l > c => Some(format!(
-            "docli-cli {current} -> {latest} - update: docli self-update, then docli init"
+            "docli-cli {current} -> {latest} - update: docli self-update, then docli agent-setup"
         )),
         _ => None,
     }
@@ -376,7 +378,7 @@ mod tests {
 
     #[test]
     fn the_notice_announces_strictly_newer_and_names_the_command() {
-        // «docli-cli 0.1.2 -> 0.1.3 - update: docli self-update, then docli init». An agent that
+        // «docli-cli 0.1.2 -> 0.1.3 - update: docli self-update, then docli agent-setup». An agent that
         // reads a state and a VERB can act; an agent that reads a complaint cannot.
         let n = notice_for("0.1.3", "0.1.2").expect("newer announces");
         assert!(n.contains("0.1.2") && n.contains("0.1.3"), "{n}");
@@ -385,7 +387,7 @@ mod tests {
         // name the command that regenerates the agent contract on disk. Without it an
         // un-regenerated install keeps instructing agents about output fields a release removed.
         assert!(
-            n.contains("docli init"),
+            n.contains("docli agent-setup"),
             "the contract half must be named: {n}"
         );
         // ONE naming rule across every message the CLI prints: it names ITSELF `docli-cli`, and
