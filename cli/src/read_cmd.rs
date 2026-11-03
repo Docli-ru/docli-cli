@@ -1630,37 +1630,20 @@ fn leaf_of(server_path: &str) -> String {
         .to_string()
 }
 
-/// `A-B`, `A-` (to the end) or a bare `A` (one line). All 1-based and inclusive.
+/// `A-B`, `A-` (to the end) or a bare `A` (one line). All 1-based and inclusive — the grammar is
+/// `docli_rules::range` (v0.48.0 D12, shared with the api's read tools); the messages are ours.
 fn parse_lines(spec: &str) -> Result<(usize, Option<usize>), String> {
-    let bad = || {
-        format!(
+    use docli_rules::range::{parse_range, RangeError};
+    match parse_range(spec) {
+        Ok(r) => Ok((r.from, r.to)),
+        Err(RangeError::StartsAtZero) => Err("line numbers start at 1".to_string()),
+        Err(RangeError::Backwards { from, to }) => {
+            Err(format!("`--lines {from}-{to}` ends before it starts"))
+        }
+        Err(RangeError::NotARange) => Err(format!(
             "`--lines {}` is not a range - use `40-80`, `40-` for the rest, or `40` for one line",
             crate::ui::sanitize(spec)
-        )
-    };
-    let spec = spec.trim();
-    let num = |s: &str| -> Result<usize, String> {
-        s.trim().parse::<usize>().map_err(|_| bad()).and_then(|n| {
-            if n == 0 {
-                Err("line numbers start at 1".to_string())
-            } else {
-                Ok(n)
-            }
-        })
-    };
-    match spec.split_once('-') {
-        None => {
-            let a = num(spec)?;
-            Ok((a, Some(a)))
-        }
-        Some((a, "")) => Ok((num(a)?, None)),
-        Some((a, b)) => {
-            let (a, b) = (num(a)?, num(b)?);
-            if b < a {
-                return Err(format!("`--lines {a}-{b}` ends before it starts"));
-            }
-            Ok((a, Some(b)))
-        }
+        )),
     }
 }
 

@@ -27,6 +27,10 @@ use uuid::Uuid;
 /// list would serialize N index builds in one request. A client with more mounts BATCHES.
 pub const SEARCH_WORKSPACE_CAP: usize = 16;
 
+fn is_zero(n: &i64) -> bool {
+    *n == 0
+}
+
 fn is_false(b: &bool) -> bool {
     !*b
 }
@@ -400,6 +404,16 @@ pub struct SearchAttachmentWire {
     pub name: String,
     pub path: String,
     pub mime: Option<String>,
+    /// v0.48.0 D7 — `"name"` (filename/path match) or `"content"` (extracted text). Absent from a
+    /// pre-v0.48.0 api, where every row is a filename match.
+    #[serde(default, rename = "match", skip_serializing_if = "Option::is_none")]
+    pub match_kind: Option<String>,
+    /// The best chunk's highlighted fragment, for a file whose content matched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+    /// That chunk's unit: a PDF page, a PPTX slide or an XLSX sheet (1-based).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<i32>,
 }
 
 /// The per-workspace outcome shape (v0.28.0 D5): an id that fails its gate yields a REFUSAL entry
@@ -428,6 +442,23 @@ pub struct SearchWorkspaceOutcome {
     pub attachments_truncated: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub attachments_query_truncated: bool,
+    /// v0.48.0 D7 — file COVERAGE: candidates whose content is not searchable right now, so a zero
+    /// is never silently a zero. `files_pending` closes by itself (extraction or indexing in
+    /// progress); `files_partial` (text past the plan's page cap) and `files_unsearchable` (scans,
+    /// encrypted or broken files) are standing limits of the workspace.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub files_pending: i64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub files_partial: i64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub files_unsearchable: i64,
+    /// v0.48.0 D7 — the FILES index could not serve this search (content hits skipped). The rule
+    /// for the legacy [`Self::degraded`]: a gap that closes by itself (a files miss, a pending
+    /// file) ALSO sets it, because a released CLI reads only that flag to decide a zero is
+    /// inconclusive; a standing limit (`files_partial`, `files_unsearchable`) does not, or every
+    /// search in such a workspace would read degraded forever.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub files_degraded: bool,
     /// v0.29.0 — the MIRROR DELTA for the position the caller sent in
     /// [`SearchRequest::positions`]: `"none"`, `"pending"`, `"epoch_mismatch"` or
     /// `"rebuild_required"`, all server-derived.
@@ -733,6 +764,10 @@ mod tests {
             degraded: false,
             attachments_truncated: false,
             attachments_query_truncated: false,
+            files_pending: 0,
+            files_partial: 0,
+            files_unsearchable: 0,
+            files_degraded: false,
             delta: Some("pending".into()),
             changed: None,
         };
@@ -754,6 +789,10 @@ mod tests {
             degraded: false,
             attachments_truncated: false,
             attachments_query_truncated: false,
+            files_pending: 0,
+            files_partial: 0,
+            files_unsearchable: 0,
+            files_degraded: false,
             delta: None,
             changed: None,
         };
@@ -901,6 +940,10 @@ mod tests {
             degraded: false,
             attachments_truncated: false,
             attachments_query_truncated: false,
+            files_pending: 0,
+            files_partial: 0,
+            files_unsearchable: 0,
+            files_degraded: false,
             delta: Some("pending".into()),
             changed: Some(ChangedSet {
                 nodes: vec![
@@ -941,6 +984,53 @@ mod tests {
                 r#""at":"2026-09-05T11:00:00.000000Z","gone":true}]}}]}"#
             )
         );
+    }
+
+    /// v0.48.0 D7 — the content-hit fields and the coverage counts are additive and absent when
+    /// empty, so a pre-v0.48.0 answer and a v0.48.0 answer with nothing to say are the same bytes,
+    /// and an older CLI reads a content hit as a plain file row.
+    #[test]
+    fn file_content_hits_and_coverage_are_additive() {
+        let outcome = SearchWorkspaceOutcome {
+            workspace_id: ws(1),
+            refused: None,
+            hits: vec![],
+            attachments: vec![SearchAttachmentWire {
+                id: ws(2),
+                name: "a.pdf".into(),
+                path: "a.pdf".into(),
+                mime: Some("application/pdf".into()),
+                match_kind: Some("content".into()),
+                snippet: Some("the <b>invoice</b>".into()),
+                page: Some(40),
+            }],
+            degraded: true,
+            attachments_truncated: false,
+            attachments_query_truncated: false,
+            files_pending: 2,
+            files_partial: 0,
+            files_unsearchable: 1,
+            files_degraded: false,
+            delta: None,
+            changed: None,
+        };
+        let json = serde_json::to_string(&outcome).unwrap();
+        assert_eq!(
+            json,
+            concat!(
+                r#"{"workspaceId":"00000000-0000-0000-0000-000000000001","#,
+                r#""attachments":[{"id":"00000000-0000-0000-0000-000000000002","name":"a.pdf","#,
+                r#""path":"a.pdf","mime":"application/pdf","match":"content","#,
+                r#""snippet":"the <b>invoice</b>","page":40}],"degraded":true,"#,
+                r#""filesPending":2,"filesUnsearchable":1}"#
+            )
+        );
+        // A pre-v0.48.0 file row parses with every new field empty.
+        let old: SearchAttachmentWire = serde_json::from_str(
+            r#"{"id":"00000000-0000-0000-0000-000000000002","name":"a","path":"a","mime":null}"#,
+        )
+        .unwrap();
+        assert!(old.match_kind.is_none() && old.snippet.is_none() && old.page.is_none());
     }
 
     /// The three answers the client has to tell apart, and the two that look alike in JSON.

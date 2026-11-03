@@ -1,0 +1,1014 @@
+{
+  "_": [
+    "v0.47.0 D1 — the task-line grammar, pinned as shared vectors.",
+    "",
+    "Each case is one markdown block and the tasks it holds, in document order. Consumed by",
+    "packages/core/src/markdown/tasks.rs today; the TS consumers (the editor's live preview, Docli",
+    "Connect) take the same file when they start reading tasks, so the grammar has ONE written",
+    "contract across release trains.",
+    "",
+    "`line` is 1-based in the note body. `parent` is the ordinal of the nearest enclosing CHECKBOX (a task or, since v0.47.1, a checklist item) (a",
+    "plain bullet in between is skipped). A provisional identity's `hash` is FNV-1a 32-bit over the",
+    "line from the list bullet to its end (trailing whitespace trimmed), as 8 lowercase hex digits.",
+    "`%%…%%` comment text is removed before the line is read.",
+    "",
+    "v0.47.1 — `isTask`: a checkbox is a TASK when it carries a signal (a `^t-` id, a reserved field,",
+    "a date emoji, or a `[/]` `[h]` `[-]` state); a bare one is a checklist item. A note's frontmatter",
+    "boolean `tasks` overrides (`true` every checkbox, `false` none); `switch` is that value when a",
+    "case sets it (absent = no boolean switch).",
+    "",
+    "v0.47.5 — `tags`: the `#tags` the note's tag pass finds on the task's OWN line, after its marker",
+    "(not a child line's, not the note's; code excluded), one per tag ignoring case with the first",
+    "spelling kept. Absent when the line has none."
+  ],
+  "cases": [
+    {
+      "name": "five-symbols",
+      "markdown": "- [ ] open ^t-a1\n- [/] doing ^t-a2\n- [h] waiting ^t-a3\n- [x] done ^t-a4\n- [X] Done too ^t-a5\n- [-] dropped ^t-a6",
+      "tasks": [
+        {
+          "ordinal": 0,
+          "parent": null,
+          "line": 1,
+          "category": "open",
+          "symbol": " ",
+          "text": "open",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "task": "t-a1"
+          },
+          "isTask": true
+        },
+        {
+          "ordinal": 1,
+          "parent": null,
+          "line": 2,
+          "category": "in_progress",
+          "symbol": "/",
+          "text": "doing",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "task": "t-a2"
+          },
+          "isTask": true
+        },
+        {
+          "ordinal": 2,
+          "parent": null,
+          "line": 3,
+          "category": "waiting",
+          "symbol": "h",
+          "text": "waiting",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "task": "t-a3"
+          },
+          "isTask": true
+        },
+        {
+          "ordinal": 3,
+          "parent": null,
+          "line": 4,
+          "category": "done",
+          "symbol": "x",
+          "text": "done",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "task": "t-a4"
+          },
+          "isTask": true
+        },
+        {
+          "ordinal": 4,
+          "parent": null,
+          "line": 5,
+          "category": "done",
+          "symbol": "X",
+          "text": "Done too",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "task": "t-a5"
+          },
+          "isTask": true
+        },
+        {
+          "ordinal": 5,
+          "parent": null,
+          "line": 6,
+          "category": "dropped",
+          "symbol": "-",
+          "text": "dropped",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "task": "t-a6"
+          },
+          "isTask": true
+        }
+      ]
+    },
+    {
+      "name": "non-task-markers",
+      "markdown": "- [?] question\n- [!] important\n- [i] info\n- plain bullet\n- [] empty brackets\n- [ ]no space",
+      "tasks": []
+    },
+    {
+      "name": "fields-before-emoji",
+      "markdown": "- [ ] call Ivan [owner:: u-k2m4] [horizon:: week] [client:: Acme] 📅 2026-10-30 ^t-b1",
+      "tasks": [
+        {
+          "ordinal": 0,
+          "parent": null,
+          "line": 1,
+          "category": "open",
+          "symbol": " ",
+          "text": "call Ivan",
+          "fields": [
+            ["owner", "u-k2m4"],
+            ["horizon", "week"],
+            ["client", "Acme"]
+          ],
+          "emojiDates": [
+            ["due", "2026-10-30"]
+          ],
+          "identity": {
+            "task": "t-b1"
+          },
+          "isTask": true
+        }
+      ]
+    },
+    {
+      "name": "emoji-dates-read-from-the-end",
+      "markdown": "- [x] report ⏳ 2026-10-01 📅 2026-10-05 ✅ 2026-10-04",
+      "tasks": [
+        {
+          "ordinal": 0,
+          "parent": null,
+          "line": 1,
+          "category": "done",
+          "symbol": "x",
+          "text": "report",
+          "fields": [],
+          "emojiDates": [
+            ["scheduled", "2026-10-01"],
+            ["due", "2026-10-05"],
+            ["done", "2026-10-04"]
+          ],
+          "identity": {
+            "provisional": {
+              "hash": "394ccc35",
+              "ordinal": 0
+            }
+          },
+          "isTask": true
+        }
+      ]
+    },
+    {
+      "name": "subtask-nesting",
+      "markdown": "- [ ] parent ^p\n  - [ ] child\n  - plain\n    - [x] grandchild under a plain bullet\n- [ ] sibling",
+      "tasks": [
+        {
+          "ordinal": 0,
+          "parent": null,
+          "line": 1,
+          "category": "open",
+          "symbol": " ",
+          "text": "parent",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "block": "p"
+          },
+          "isTask": false
+        },
+        {
+          "ordinal": 1,
+          "parent": 0,
+          "line": 2,
+          "category": "open",
+          "symbol": " ",
+          "text": "child",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "provisional": {
+              "hash": "791e21a4",
+              "ordinal": 1
+            }
+          },
+          "isTask": false
+        },
+        {
+          "ordinal": 2,
+          "parent": 0,
+          "line": 4,
+          "category": "done",
+          "symbol": "x",
+          "text": "grandchild under a plain bullet",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "provisional": {
+              "hash": "60c4803d",
+              "ordinal": 2
+            }
+          },
+          "isTask": false
+        },
+        {
+          "ordinal": 3,
+          "parent": null,
+          "line": 5,
+          "category": "open",
+          "symbol": " ",
+          "text": "sibling",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "provisional": {
+              "hash": "f3fd0a84",
+              "ordinal": 3
+            }
+          },
+          "isTask": false
+        }
+      ]
+    },
+    {
+      "name": "identity-order",
+      "markdown": "- [ ] global ^t-zz\n- [ ] user id ^my-block\n- [ ] none\n- [ ] caret in text a^b",
+      "tasks": [
+        {
+          "ordinal": 0,
+          "parent": null,
+          "line": 1,
+          "category": "open",
+          "symbol": " ",
+          "text": "global",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "task": "t-zz"
+          },
+          "isTask": true
+        },
+        {
+          "ordinal": 1,
+          "parent": null,
+          "line": 2,
+          "category": "open",
+          "symbol": " ",
+          "text": "user id",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "block": "my-block"
+          },
+          "isTask": false
+        },
+        {
+          "ordinal": 2,
+          "parent": null,
+          "line": 3,
+          "category": "open",
+          "symbol": " ",
+          "text": "none",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "provisional": {
+              "hash": "3e0c50ec",
+              "ordinal": 2
+            }
+          },
+          "isTask": false
+        },
+        {
+          "ordinal": 3,
+          "parent": null,
+          "line": 4,
+          "category": "open",
+          "symbol": " ",
+          "text": "caret in text a^b",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "provisional": {
+              "hash": "b2159bd4",
+              "ordinal": 3
+            }
+          },
+          "isTask": false
+        }
+      ]
+    },
+    {
+      "name": "quotes-and-callouts",
+      "markdown": "> - [ ] quoted\n\n> [!todo] Callout\n> - [/] in callout",
+      "tasks": [
+        {
+          "ordinal": 0,
+          "parent": null,
+          "line": 1,
+          "category": "open",
+          "symbol": " ",
+          "text": "quoted",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "provisional": {
+              "hash": "1627518a",
+              "ordinal": 0
+            }
+          },
+          "isTask": false
+        },
+        {
+          "ordinal": 1,
+          "parent": null,
+          "line": 4,
+          "category": "in_progress",
+          "symbol": "/",
+          "text": "in callout",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "provisional": {
+              "hash": "896242a8",
+              "ordinal": 1
+            }
+          },
+          "isTask": true
+        }
+      ]
+    },
+    {
+      "name": "code-is-never-searched",
+      "markdown": "```\n- [ ] in fence\n```\n\n    - [ ] indented code\n\n`- [ ] inline`",
+      "tasks": []
+    },
+    {
+      "name": "comments-hide-tasks",
+      "markdown": "- [ ] kept %%aside%%\n%%\n- [ ] hidden\n%%\n- [ ] after",
+      "tasks": [
+        {
+          "ordinal": 0,
+          "parent": null,
+          "line": 1,
+          "category": "open",
+          "symbol": " ",
+          "text": "kept",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "provisional": {
+              "hash": "79c3c6f2",
+              "ordinal": 0
+            }
+          },
+          "isTask": false
+        },
+        {
+          "ordinal": 1,
+          "parent": null,
+          "line": 5,
+          "category": "open",
+          "symbol": " ",
+          "text": "after",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "provisional": {
+              "hash": "b26750ac",
+              "ordinal": 1
+            }
+          },
+          "isTask": false
+        }
+      ]
+    },
+    {
+      "name": "ordered-lists",
+      "markdown": "1. [ ] first\n2) [x] second",
+      "tasks": [
+        {
+          "ordinal": 0,
+          "parent": null,
+          "line": 1,
+          "category": "open",
+          "symbol": " ",
+          "text": "first",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "provisional": {
+              "hash": "f022a8b2",
+              "ordinal": 0
+            }
+          },
+          "isTask": false
+        },
+        {
+          "ordinal": 1,
+          "parent": null,
+          "line": 2,
+          "category": "done",
+          "symbol": "x",
+          "text": "second",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "provisional": {
+              "hash": "c87daa36",
+              "ordinal": 1
+            }
+          },
+          "isTask": false
+        }
+      ]
+    },
+    {
+      "name": "frontmatter-shifts-lines",
+      "markdown": "---\ntags: [a]\n---\n- [ ] after frontmatter",
+      "tasks": [
+        {
+          "ordinal": 0,
+          "parent": null,
+          "line": 4,
+          "category": "open",
+          "symbol": " ",
+          "text": "after frontmatter",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "provisional": {
+              "hash": "c1bc948a",
+              "ordinal": 0
+            }
+          },
+          "isTask": false
+        }
+      ]
+    },
+    {
+      "name": "empty-description",
+      "markdown": "- [ ] [horizon:: today] ^t-c1\n- [ ]",
+      "tasks": [
+        {
+          "ordinal": 0,
+          "parent": null,
+          "line": 1,
+          "category": "open",
+          "symbol": " ",
+          "text": "",
+          "fields": [
+            ["horizon", "today"]
+          ],
+          "emojiDates": [],
+          "identity": {
+            "task": "t-c1"
+          },
+          "isTask": true
+        },
+        {
+          "ordinal": 1,
+          "parent": null,
+          "line": 2,
+          "category": "open",
+          "symbol": " ",
+          "text": "",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "provisional": {
+              "hash": "ba54fe82",
+              "ordinal": 1
+            }
+          },
+          "isTask": false
+        }
+      ]
+    },
+    {
+      "name": "unicode-custom-field",
+      "markdown": "- [ ] позвонить [срок:: в пятницу] про [[Договор|договор]]",
+      "tasks": [
+        {
+          "ordinal": 0,
+          "parent": null,
+          "line": 1,
+          "category": "open",
+          "symbol": " ",
+          "text": "позвонить про [[Договор|договор]]",
+          "fields": [
+            ["срок", "в пятницу"]
+          ],
+          "emojiDates": [],
+          "identity": {
+            "provisional": {
+              "hash": "aedcb2a8",
+              "ordinal": 0
+            }
+          },
+          "isTask": false
+        }
+      ]
+    },
+    {
+      "name": "checklist-vs-signals",
+      "markdown": "- [ ] milk [qty:: 2]\n- [ ] plain\n- [x] done plain\n- [ ] owned [owner:: u-aaaa]\n- [ ] due 📅 2026-11-01\n- [ ] kept ^mine\n- [ ] id ^t-s1\n- [/] doing",
+      "tasks": [
+        {
+          "ordinal": 0,
+          "parent": null,
+          "line": 1,
+          "category": "open",
+          "symbol": " ",
+          "text": "milk",
+          "fields": [
+            ["qty", "2"]
+          ],
+          "emojiDates": [],
+          "identity": {
+            "provisional": {
+              "ordinal": 0,
+              "hash": "cff7460d"
+            }
+          },
+          "isTask": false
+        },
+        {
+          "ordinal": 1,
+          "parent": null,
+          "line": 2,
+          "category": "open",
+          "symbol": " ",
+          "text": "plain",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "provisional": {
+              "ordinal": 1,
+              "hash": "f80423b2"
+            }
+          },
+          "isTask": false
+        },
+        {
+          "ordinal": 2,
+          "parent": null,
+          "line": 3,
+          "category": "done",
+          "symbol": "x",
+          "text": "done plain",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "provisional": {
+              "ordinal": 2,
+              "hash": "bb1d4256"
+            }
+          },
+          "isTask": false
+        },
+        {
+          "ordinal": 3,
+          "parent": null,
+          "line": 4,
+          "category": "open",
+          "symbol": " ",
+          "text": "owned",
+          "fields": [
+            ["owner", "u-aaaa"]
+          ],
+          "emojiDates": [],
+          "identity": {
+            "provisional": {
+              "ordinal": 3,
+              "hash": "26497278"
+            }
+          },
+          "isTask": true
+        },
+        {
+          "ordinal": 4,
+          "parent": null,
+          "line": 5,
+          "category": "open",
+          "symbol": " ",
+          "text": "due",
+          "fields": [],
+          "emojiDates": [
+            ["due", "2026-11-01"]
+          ],
+          "identity": {
+            "provisional": {
+              "ordinal": 4,
+              "hash": "842200f6"
+            }
+          },
+          "isTask": true
+        },
+        {
+          "ordinal": 5,
+          "parent": null,
+          "line": 6,
+          "category": "open",
+          "symbol": " ",
+          "text": "kept",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "block": "mine"
+          },
+          "isTask": false
+        },
+        {
+          "ordinal": 6,
+          "parent": null,
+          "line": 7,
+          "category": "open",
+          "symbol": " ",
+          "text": "id",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "task": "t-s1"
+          },
+          "isTask": true
+        },
+        {
+          "ordinal": 7,
+          "parent": null,
+          "line": 8,
+          "category": "in_progress",
+          "symbol": "/",
+          "text": "doing",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "provisional": {
+              "ordinal": 7,
+              "hash": "20b76fbe"
+            }
+          },
+          "isTask": true
+        }
+      ]
+    },
+    {
+      "name": "bare-child-of-a-task",
+      "markdown": "- [ ] parent [horizon:: week]\n  - [ ] step one\n  - [ ] step two [check:: 2026-11-02]",
+      "tasks": [
+        {
+          "ordinal": 0,
+          "parent": null,
+          "line": 1,
+          "category": "open",
+          "symbol": " ",
+          "text": "parent",
+          "fields": [
+            ["horizon", "week"]
+          ],
+          "emojiDates": [],
+          "identity": {
+            "provisional": {
+              "ordinal": 0,
+              "hash": "33a8e635"
+            }
+          },
+          "isTask": true
+        },
+        {
+          "ordinal": 1,
+          "parent": 0,
+          "line": 2,
+          "category": "open",
+          "symbol": " ",
+          "text": "step one",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "provisional": {
+              "ordinal": 1,
+              "hash": "b893b940"
+            }
+          },
+          "isTask": false
+        },
+        {
+          "ordinal": 2,
+          "parent": 0,
+          "line": 3,
+          "category": "open",
+          "symbol": " ",
+          "text": "step two",
+          "fields": [
+            ["check", "2026-11-02"]
+          ],
+          "emojiDates": [],
+          "identity": {
+            "provisional": {
+              "ordinal": 2,
+              "hash": "aa95fdde"
+            }
+          },
+          "isTask": true
+        }
+      ]
+    },
+    {
+      "name": "switch-true",
+      "markdown": "---\ntasks: true\n---\n- [ ] plain\n- [x] done plain",
+      "switch": true,
+      "tasks": [
+        {
+          "ordinal": 0,
+          "parent": null,
+          "line": 4,
+          "category": "open",
+          "symbol": " ",
+          "text": "plain",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "provisional": {
+              "ordinal": 0,
+              "hash": "f80423b2"
+            }
+          },
+          "isTask": true
+        },
+        {
+          "ordinal": 1,
+          "parent": null,
+          "line": 5,
+          "category": "done",
+          "symbol": "x",
+          "text": "done plain",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "provisional": {
+              "ordinal": 1,
+              "hash": "bb1d4256"
+            }
+          },
+          "isTask": true
+        }
+      ]
+    },
+    {
+      "name": "switch-false",
+      "markdown": "---\ntasks: false\n---\n- [ ] plain\n- [/] doing ^t-s2",
+      "switch": false,
+      "tasks": [
+        {
+          "ordinal": 0,
+          "parent": null,
+          "line": 4,
+          "category": "open",
+          "symbol": " ",
+          "text": "plain",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "provisional": {
+              "ordinal": 0,
+              "hash": "f80423b2"
+            }
+          },
+          "isTask": false
+        },
+        {
+          "ordinal": 1,
+          "parent": null,
+          "line": 5,
+          "category": "in_progress",
+          "symbol": "/",
+          "text": "doing",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "task": "t-s2"
+          },
+          "isTask": false
+        }
+      ]
+    },
+    {
+      "name": "switch-not-a-boolean",
+      "markdown": "---\ntasks: \"true\"\n---\n- [ ] plain\n- [ ] owned [owner:: u-aaaa]",
+      "tasks": [
+        {
+          "ordinal": 0,
+          "parent": null,
+          "line": 4,
+          "category": "open",
+          "symbol": " ",
+          "text": "plain",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "provisional": {
+              "ordinal": 0,
+              "hash": "f80423b2"
+            }
+          },
+          "isTask": false
+        },
+        {
+          "ordinal": 1,
+          "parent": null,
+          "line": 5,
+          "category": "open",
+          "symbol": " ",
+          "text": "owned",
+          "fields": [
+            ["owner", "u-aaaa"]
+          ],
+          "emojiDates": [],
+          "identity": {
+            "provisional": {
+              "ordinal": 1,
+              "hash": "26497278"
+            }
+          },
+          "isTask": true
+        }
+      ]
+    },
+    {
+      "name": "each-signal-alone",
+      "markdown": "- [h] wait\n- [-] gone\n- [ ] w [waiting:: u-bbbb]\n- [ ] m [milestone:: v1]",
+      "tasks": [
+        {
+          "ordinal": 0,
+          "parent": null,
+          "line": 1,
+          "category": "waiting",
+          "symbol": "h",
+          "text": "wait",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "provisional": {
+              "ordinal": 0,
+              "hash": "d6b885b3"
+            }
+          },
+          "isTask": true
+        },
+        {
+          "ordinal": 1,
+          "parent": null,
+          "line": 2,
+          "category": "dropped",
+          "symbol": "-",
+          "text": "gone",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "provisional": {
+              "ordinal": 1,
+              "hash": "bc6539c2"
+            }
+          },
+          "isTask": true
+        },
+        {
+          "ordinal": 2,
+          "parent": null,
+          "line": 3,
+          "category": "open",
+          "symbol": " ",
+          "text": "w",
+          "fields": [
+            ["waiting", "u-bbbb"]
+          ],
+          "emojiDates": [],
+          "identity": {
+            "provisional": {
+              "ordinal": 2,
+              "hash": "ef775bb4"
+            }
+          },
+          "isTask": true
+        },
+        {
+          "ordinal": 3,
+          "parent": null,
+          "line": 4,
+          "category": "open",
+          "symbol": " ",
+          "text": "m",
+          "fields": [
+            ["milestone", "v1"]
+          ],
+          "emojiDates": [],
+          "identity": {
+            "provisional": {
+              "ordinal": 3,
+              "hash": "a9bbd53e"
+            }
+          },
+          "isTask": true
+        }
+      ]
+    },
+    {
+      "name": "line-tags",
+      "markdown": "---\ntags: [note-tag]\n---\n- [ ] Fix login #bug #Bug #bug/ui ^t-g1\n  - [ ] child #child ^t-g2\n- [ ] code `#notatag` and ==#hi== ^t-g3\n\n#bug in a paragraph",
+      "tasks": [
+        {
+          "ordinal": 0,
+          "parent": null,
+          "line": 4,
+          "category": "open",
+          "symbol": " ",
+          "text": "Fix login #bug #Bug #bug/ui",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "task": "t-g1"
+          },
+          "isTask": true,
+          "tags": ["bug", "bug/ui"]
+        },
+        {
+          "ordinal": 1,
+          "parent": 0,
+          "line": 5,
+          "category": "open",
+          "symbol": " ",
+          "text": "child #child",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "task": "t-g2"
+          },
+          "isTask": true,
+          "tags": ["child"]
+        },
+        {
+          "ordinal": 2,
+          "parent": null,
+          "line": 6,
+          "category": "open",
+          "symbol": " ",
+          "text": "code `#notatag` and ==#hi==",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "task": "t-g3"
+          },
+          "isTask": true,
+          "tags": ["hi"]
+        }
+      ]
+    },
+    {
+      "name": "quoted-line-tags",
+      "markdown": "> - [ ] quoted #q &amp; #r ^t-q1\n\n> [!todo] Callout #c\n> - [/] in callout #inner ^t-q2",
+      "tasks": [
+        {
+          "ordinal": 0,
+          "parent": null,
+          "line": 1,
+          "category": "open",
+          "symbol": " ",
+          "text": "quoted #q &amp; #r",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "task": "t-q1"
+          },
+          "isTask": true,
+          "tags": ["q", "r"]
+        },
+        {
+          "ordinal": 1,
+          "parent": null,
+          "line": 4,
+          "category": "in_progress",
+          "symbol": "/",
+          "text": "in callout #inner",
+          "fields": [],
+          "emojiDates": [],
+          "identity": {
+            "task": "t-q2"
+          },
+          "isTask": true,
+          "tags": ["inner"]
+        }
+      ]
+    }
+  ]
+}

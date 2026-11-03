@@ -113,6 +113,8 @@ pub fn valid_label(label: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// v0.48.0 D12 — the `lines` / `pages` range grammar, shared by `docli read --lines` and the api.
+pub mod range;
 pub mod related;
 pub mod winpath;
 
@@ -134,6 +136,10 @@ pub mod vectors {
     /// is pinned here and not in `graph.json`). Consumed by the api's arm test, core's `fuse`
     /// test and the CLI's `related_cmd` test.
     pub const RELATED: &str = include_str!("../vectors/related.json");
+    /// v0.47.0 D1 — the task-line grammar: one markdown block → the tasks it holds. Consumed by
+    /// core's `markdown::tasks` test today; the TS consumers (the editor, Docli Connect) share it
+    /// when they start reading tasks.
+    pub const TASKS: &str = include_str!("../vectors/tasks.json");
 }
 
 #[cfg(test)]

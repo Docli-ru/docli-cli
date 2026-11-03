@@ -1046,6 +1046,7 @@ const MCP_READ_ONLY_TOOLS: &[&str] = &[
     "related_notes",
     "attachment_info",
     "read_attachment",
+    "query_tasks",
 ];
 
 /// Does this `PostToolUse` tool name warrant a sync? Bare tool name or `mcp__<label>__<tool>`.

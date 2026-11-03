@@ -128,7 +128,7 @@ pub fn run(project: &Project, api: &Api, query: &str, json: bool) -> Result<i32>
             } else if any_degraded {
                 // Never a bare empty result on a degraded index.
                 crate::ui::warn(
-                    "no hits - but the note index was incomplete for at least one workspace, \
+                    "no hits - but the search index was incomplete for at least one workspace, \
                      so this is INCONCLUSIVE about absence; retry shortly",
                 );
             } else {
@@ -336,6 +336,14 @@ pub struct RenderedWorkspace {
     pub attachments: Vec<RenderedHit>,
     pub attachments_truncated: bool,
     pub attachments_query_truncated: bool,
+    /// v0.48.0 D7 — the FILES index could not serve this search: files were matched by name only.
+    pub files_degraded: bool,
+    /// v0.48.0 D7 — files whose text was not searched: still being indexed (closes by itself),
+    /// past the plan's page cap (only the first pages are searchable), or with no searchable text
+    /// (scans, password-protected or broken files). Zero from a pre-v0.48.0 server.
+    pub files_pending: i64,
+    pub files_partial: i64,
+    pub files_unsearchable: i64,
     /// The server's mirror-delta answer for the position this run sent (v0.29.0 D6). THREE cases,
     /// and the key is always present so a consumer never has to distinguish «absent» from
     /// «null»:
@@ -370,6 +378,17 @@ pub struct RenderedHit {
     /// never the file's bytes, so `docli read` prints the marker's fields and `read_attachment`
     /// over MCP fetches the bytes.
     pub marker: bool,
+    /// v0.48.0 — how a file matched: `"name"` or `"content"` (absent for notes, and from a
+    /// pre-v0.48.0 server).
+    #[serde(rename = "match", skip_serializing_if = "Option::is_none")]
+    pub match_kind: Option<String>,
+    /// v0.48.0 — the unit a file's content matched in: a PDF page, a PPTX slide, an XLSX sheet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<i32>,
+    /// What `page` counts, for the human line — `page`, `slide` or `sheet`, so «page» means one
+    /// thing (D6).
+    #[serde(skip)]
+    pub unit: &'static str,
 }
 
 fn render_workspace(
@@ -392,6 +411,9 @@ fn render_workspace(
                 // DECLARED contract change — `--json` used to carry the raw markup.
                 snippet: Some(snippet_text(&h.snippet)),
                 marker: false,
+                match_kind: None,
+                page: None,
+                unit: "page",
             }
         })
         .collect();
@@ -403,8 +425,19 @@ fn render_workspace(
             RenderedHit {
                 server_path: a.path.clone(),
                 id: a.id,
-                snippet: None,
+                snippet: a.snippet.as_deref().map(snippet_text),
                 marker: true,
+                match_kind: a.match_kind.clone(),
+                page: a.page,
+                unit: match a.mime.as_deref() {
+                    Some(
+                        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                    ) => "slide",
+                    Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") => {
+                        "sheet"
+                    }
+                    _ => "page",
+                },
             }
         })
         .collect();
@@ -417,6 +450,10 @@ fn render_workspace(
         attachments,
         attachments_truncated: o.attachments_truncated,
         attachments_query_truncated: o.attachments_query_truncated,
+        files_degraded: o.files_degraded,
+        files_pending: o.files_pending,
+        files_partial: o.files_partial,
+        files_unsearchable: o.files_unsearchable,
         // Asked ⇒ whatever the server said, IF this build understands it (an older api, a
         // derivation failure, a refusal and an unknown value all arrive here as «no answer»).
         // Not asked ⇒ null plus the local token. Never both.
@@ -434,6 +471,39 @@ fn render_workspace(
             _ => None,
         },
     }
+}
+
+/// Which index a degraded answer was missing. Since v0.48.0 the server also raises the legacy flag
+/// while files are still being indexed (so a released CLI treats the zero as inconclusive), and
+/// this build can tell that case from a note-index miss only by the files fields beside it.
+fn incomplete_index(r: &RenderedWorkspace) -> &'static str {
+    if r.files_degraded || r.files_pending > 0 {
+        "search index"
+    } else {
+        "note index"
+    }
+}
+
+/// v0.48.0 D7 — the files whose text this search could not look inside, or `None` when there are
+/// none. A standing limit (`partial`, `unsearchable`) does not make the answer inconclusive, but a
+/// reader concluding «no file says X» must know which files were never read.
+fn coverage_line(r: &RenderedWorkspace) -> Option<String> {
+    let parts: Vec<String> = [
+        (r.files_pending, "still being indexed"),
+        (
+            r.files_partial,
+            "searchable only up to the plan's page limit",
+        ),
+        (
+            r.files_unsearchable,
+            "with no searchable text (scans, password-protected or broken files)",
+        ),
+    ]
+    .into_iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, what)| format!("{n} {what}"))
+    .collect();
+    (!parts.is_empty()).then(|| format!("not every file's text was searched: {}", parts.join(", ")))
 }
 
 /// The mirror line's TEXT, or `None` when there is nothing honest to say (v0.29.0 D6). Pure, so
@@ -642,10 +712,20 @@ fn print_workspace(r: &RenderedWorkspace, show_mount: bool) {
     }
     if r.degraded {
         crate::ui::warn(&format!(
-            "[{}] the note index was incomplete for this query - a missing result here proves \
-             nothing; retry shortly",
+            "[{}] the {} was incomplete for this query - a missing result here proves nothing; \
+             retry shortly",
+            r.mount,
+            incomplete_index(r)
+        ));
+    }
+    if r.files_degraded {
+        crate::ui::warn(&format!(
+            "[{}] file contents could not be searched this time - files were matched by name only",
             r.mount
         ));
+    }
+    if let Some(line) = coverage_line(r) {
+        crate::ui::detail(&format!("[{}] {line}", r.mount));
     }
     for h in &r.hits {
         // The SERVER PATH is the answer — bold and on its own line, because it is what you hand
@@ -665,12 +745,24 @@ fn print_workspace(r: &RenderedWorkspace, show_mount: bool) {
         }
     }
     for a in &r.attachments {
+        let found = match (a.match_kind.as_deref(), a.page) {
+            (Some("content"), Some(p)) => {
+                format!("(a file, with a text match on {} {p} - ", a.unit)
+            }
+            (Some("content"), None) => "(a file, with a text match - ".to_string(),
+            _ => "(a file - ".to_string(),
+        };
         crate::ui::line(&format!(
             "{tag}{} {} {}",
             console::style(&a.server_path).bold(),
             crate::ui::dim(&a.id.to_string()),
-            crate::ui::dim("(a file - docli read prints its marker; the bytes stay on the server)")
+            crate::ui::dim(&format!(
+                "{found}docli read prints the file's marker; the bytes and the text stay on the server)"
+            ))
         ));
+        if let Some(s) = &a.snippet {
+            crate::ui::line(&format!("    {}", s.replace('\n', " ")));
+        }
     }
     if r.attachments_truncated {
         crate::ui::detail(&format!(
@@ -784,6 +876,10 @@ mod tests {
             degraded: false,
             attachments_truncated: false,
             attachments_query_truncated: false,
+            files_pending: 0,
+            files_partial: 0,
+            files_unsearchable: 0,
+            files_degraded: false,
             delta: None,
             changed: None,
         }
@@ -966,6 +1062,9 @@ mod tests {
             name: path.rsplit('/').next().unwrap().into(),
             path: path.into(),
             mime: Some("image/png".into()),
+            match_kind: None,
+            snippet: None,
+            page: None,
         }
     }
 
@@ -1399,6 +1498,48 @@ mod tests {
             !line.contains("`docli sync` brings"),
             "plain `docli sync` does not replay a parked delivery: {line}"
         );
+    }
+
+    /// v0.48.0 D7 — a content hit carries its page into `--json`, and what the search could not
+    /// look inside is disclosed rather than folded into «no hits».
+    #[test]
+    fn file_content_hits_and_coverage_are_disclosed() {
+        let f = fx();
+        let mut o = outcome(
+            vec![],
+            vec![SearchAttachmentWire {
+                match_kind: Some("content".into()),
+                snippet: Some("the <b>clause</b>".into()),
+                page: Some(40),
+                ..att(2, "Contracts/lease.pdf")
+            }],
+        );
+        o.files_pending = 2;
+        o.files_unsearchable = 1;
+        o.degraded = true;
+        let mut any = false;
+        let r = render_workspace(&f.mount, &as_local(false), &o, &mut any);
+        assert!(any);
+        assert_eq!(r.attachments[0].page, Some(40));
+        assert_eq!(r.attachments[0].snippet.as_deref(), Some("the clause"));
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["attachments"][0]["match"], "content");
+        assert_eq!(json["files_pending"], 2);
+        assert_eq!(
+            coverage_line(&r).unwrap(),
+            "not every file's text was searched: 2 still being indexed, 1 with no searchable \
+             text (scans, password-protected or broken files)"
+        );
+        // A degraded flag raised for pending files is not blamed on the note index.
+        assert_eq!(incomplete_index(&r), "search index");
+        let quiet = render_workspace(
+            &f.mount,
+            &as_local(false),
+            &outcome(vec![], vec![]),
+            &mut any,
+        );
+        assert_eq!(coverage_line(&quiet), None);
+        assert_eq!(incomplete_index(&quiet), "note index");
     }
 
     fn rendered_with(f: &Fx, l: &MountLocal, delta: Option<&str>) -> RenderedWorkspace {
