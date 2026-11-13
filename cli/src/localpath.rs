@@ -97,9 +97,114 @@ pub fn has_reserved_segment(server_path: &str) -> bool {
     })
 }
 
+/// Names a coding agent loads as INSTRUCTIONS when it works in the tree that holds them — the
+/// files Claude Code, Codex, Cursor, Gemini, Windsurf, Cline, Copilot, Roo, Kiro, Junie and
+/// Continue read, and the folders their rules, skills and commands live in.
+///
+/// The mirror sits inside the user's project and mirrors server names verbatim, and any
+/// co-member of the workspace can create a note named `CLAUDE.md` or a folder `.claude/skills/`.
+/// Materialized, that note stops being content and becomes a prompt injected into whichever
+/// agent next touches the subtree. So these names PARK (structural — the note stays readable over
+/// the docli MCP connection, where it arrives as data in a tool result, never as instructions).
+const AGENT_INSTRUCTION_NAMES: [&str; 21] = [
+    "CLAUDE.md",
+    "CLAUDE.local.md",
+    "AGENTS.md",
+    "AGENTS.override.md",
+    "AGENT.md",
+    "GEMINI.md",
+    ".cursorrules",
+    ".windsurfrules",
+    ".clinerules",
+    "copilot-instructions.md",
+    ".claude",
+    ".cursor",
+    ".codex",
+    ".gemini",
+    ".windsurf",
+    ".github",
+    ".agents",
+    ".roo",
+    ".kiro",
+    ".junie",
+    ".continue",
+];
+
+/// True when ANY segment of a (scope-relative) path is an agent-instruction name — files and
+/// folders alike, in one list: a FOLDER named `AGENTS.md` parks too, which costs nothing, and
+/// `.clinerules` is a file or a folder depending on the tool's version.
+///
+/// The comparison is ASCII-case-insensitive like [`has_reserved_segment`], and ALSO matches a
+/// name whose Unicode upper- or lower-case mapping lands on the ASCII one. That is not
+/// thoroughness for its own sake: the question here is not «does the server's guard agree» (the
+/// reserved list's reason) but «will the local filesystem open this file when an agent asks for
+/// `AGENTS.md`», and a case-insensitive filesystem folds with its OWN Unicode table, not ASCII:
+/// `ſ` (U+017F) upper-cases to `S` and `ı` (U+0131) to `I`. Which of those a given NTFS or APFS
+/// volume honours is not ours to predict, so a name that any case mapping lands on an
+/// instruction name parks like it. Over-parking costs one note served over MCP instead.
+pub fn names_agent_instructions(path: &str) -> bool {
+    path.split('/').any(|seg| {
+        let matches = |s: &str| {
+            AGENT_INSTRUCTION_NAMES
+                .iter()
+                .any(|n| s.eq_ignore_ascii_case(n))
+        };
+        matches(seg)
+            || (!seg.is_ascii() && (matches(&seg.to_uppercase()) || matches(&seg.to_lowercase())))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_instruction_names_park_in_any_segment_and_any_case() {
+        for p in [
+            "CLAUDE.md",
+            "notes/claude.md",
+            "a/b/Agents.MD",
+            "sub/AGENTS.override.md",
+            "CLAUDE.local.md",
+            "AGENT.md",
+            "GEMINI.md",
+            ".cursorrules",
+            ".windsurfrules",
+            ".clinerules/rule.md",
+            ".github/copilot-instructions.md",
+            "docs/copilot-instructions.md",
+            ".claude/skills/x/SKILL.md",
+            "proj/.CLAUDE/commands/go.md",
+            ".cursor/rules/x.mdc",
+            ".codex/x.md",
+            ".gemini/x.md",
+            ".windsurf/rules/x.md",
+            ".agents/x.md",
+            ".roo/rules/x.md",
+            ".KIRO/steering/x.md",
+            ".junie/guidelines.md",
+            ".continue/rules/x.md",
+            ".github",
+            // Lookalikes a case-insensitive filesystem resolves onto the ASCII name.
+            "AGENTſ.md",
+            "GEMıNı.md",
+        ] {
+            assert!(names_agent_instructions(p), "{p} must park");
+        }
+        for p in [
+            "claude.md.bak",
+            "notes/CLAUDE",
+            "my-CLAUDE.md",
+            "agents/x.md",
+            "claude/x.md",
+            "github/x.md",
+            ".githubx/x.md",
+            "Заметка.md",
+            "",
+        ] {
+            assert!(!names_agent_instructions(p), "{p} must not park");
+        }
+    }
 
     fn win_rules() -> FsRules {
         FsRules {

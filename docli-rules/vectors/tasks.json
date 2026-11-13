@@ -1010,5 +1010,58 @@
         }
       ]
     }
-  ]
+  ],
+  "fields": {
+    "_": [
+      "v0.49.0 D2 — typed fields: how a raw `[key:: value]` matches a declared choice option, and what",
+      "parses as a declared number or date. Consumed by packages/core/src/markdown/fields.rs and",
+      "apps/web/src/lib/fields.test.ts. An option matches by its key or its label, ignoring case and",
+      "the value's surrounding space; `default-stages` is the unstored stage set, which also matches",
+      "the other catalog's label. A number is `3`, `-1`, `2.5` or `2,5`; a date a real YYYY-MM-DD day."
+    ],
+    "matchOption": [
+      {"declaration": {"options": [{"key": "revyu", "label": "Ревью"}, {"key": "qa", "label": "QA"}]}, "raw": "revyu", "expect": "revyu"},
+      {"declaration": {"options": [{"key": "revyu", "label": "Ревью"}, {"key": "qa", "label": "QA"}]}, "raw": " РЕВЬЮ ", "expect": "revyu"},
+      {"declaration": {"options": [{"key": "revyu", "label": "Ревью"}, {"key": "qa", "label": "QA"}]}, "raw": "qa", "expect": "qa"},
+      {"declaration": {"options": [{"key": "revyu", "label": "Ревью"}, {"key": "qa", "label": "QA"}]}, "raw": "Qa", "expect": "qa"},
+      {"declaration": {"options": [{"key": "revyu", "label": "Ревью"}, {"key": "qa", "label": "QA"}]}, "raw": "ревю", "expect": null},
+      {"declaration": {"options": [{"key": "revyu", "label": "Ревью"}, {"key": "qa", "label": "QA"}]}, "raw": "", "expect": null},
+      {"declaration": {"options": [{"key": "vysokiy", "label": "Высокий"}]}, "raw": "ВЫСОКИЙ", "expect": "vysokiy"},
+      {"declaration": {"options": [{"key": "yozh", "label": "Ёж"}]}, "raw": "ёж", "expect": "yozh"},
+      {"declaration": {"options": [{"key": "yozh", "label": "Ёж"}]}, "raw": "еж", "expect": null},
+      {"declaration": "default-stages", "language": "ru", "raw": "В работе", "expect": "v-rabote"},
+      {"declaration": "default-stages", "language": "ru", "raw": "in progress", "expect": "v-rabote"},
+      {"declaration": "default-stages", "language": "en", "raw": "в работе", "expect": "v-rabote"},
+      {"declaration": "default-stages", "language": "en", "raw": "zhdyom", "expect": "zhdyom"},
+      {"declaration": "default-stages", "language": "ru", "raw": "Бэклог", "expect": "beklog"},
+      {"declaration": "default-stages", "language": "ru", "raw": "Review", "expect": null}
+    ],
+    "number": [
+      {"raw": "3", "expect": 3},
+      {"raw": " 2.5 ", "expect": 2.5},
+      {"raw": "2,5", "expect": 2.5},
+      {"raw": "-1", "expect": -1},
+      {"raw": "0", "expect": 0},
+      {"raw": "1 000", "expect": null},
+      {"raw": "1e3", "expect": null},
+      {"raw": ".5", "expect": null},
+      {"raw": "5.", "expect": null},
+      {"raw": "+2", "expect": null},
+      {"raw": "1.2.3", "expect": null},
+      {"raw": "много", "expect": null},
+      {"raw": "", "expect": null}
+    ],
+    "date": [
+      {"raw": "2026-11-06", "expect": true},
+      {"raw": " 2024-02-29 ", "expect": true},
+      {"raw": "2026-02-29", "expect": false},
+      {"raw": "2026-02-30", "expect": false},
+      {"raw": "2026-13-01", "expect": false},
+      {"raw": "2026-00-10", "expect": false},
+      {"raw": "2026-1-5", "expect": false},
+      {"raw": "06.11.2026", "expect": false},
+      {"raw": "2100-02-29", "expect": false},
+      {"raw": "2000-02-29", "expect": true}
+    ]
+  }
 }

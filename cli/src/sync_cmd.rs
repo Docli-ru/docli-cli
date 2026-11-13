@@ -243,6 +243,20 @@ fn invalidator(
     if let Some(r) = state.rebuild_reason(mount.folder.as_deref(), now_unix()) {
         return Some(r.into());
     }
+    // A mirror written before agent-instruction names parked still holds those files, and an
+    // incremental pull never re-delivers a node that did not change — so it would keep them
+    // forever. One from-zero redelivers every node, the park arm untracks each one and removes
+    // its file, and the next run finds nothing tracked here: it fires once, never in a loop.
+    if let Some(n) = state.nodes.values().find(|n| {
+        crate::localpath::scope_relative(&n.server_path, mount.folder.as_deref())
+            .is_some_and(crate::localpath::names_agent_instructions)
+    }) {
+        return Some(format!(
+            "the mirror holds {} under a name reserved for coding-agent instructions - \
+             this version of docli no longer writes such paths, so a full resync removes it",
+            crate::ui::sanitize(&n.local_path)
+        ));
+    }
     // Mirror-vs-manifest: every tracked materialization must exist on disk, so `rm -rf mirror/`
     // with `.docli/` left behind reads as from-zero, never as healthy.
     for n in state.nodes.values() {
@@ -1047,6 +1061,7 @@ const MCP_READ_ONLY_TOOLS: &[&str] = &[
     "attachment_info",
     "read_attachment",
     "query_tasks",
+    "list_fields",
 ];
 
 /// Does this `PostToolUse` tool name warrant a sync? Bare tool name or `mcp__<label>__<tool>`.
@@ -1638,6 +1653,94 @@ mod tests {
         assert!(
             dir_b.join(format!("{sib}.docli")).exists(),
             "sibling untouched"
+        );
+    }
+
+    #[test]
+    fn a_leftover_agent_instruction_file_forces_one_full_resync_and_only_one() {
+        // A mirror an older CLI wrote: it tracks AGENTS.md, and an incremental pull would never
+        // re-deliver the unchanged note. The invalidator must force the from-zero that removes it
+        // — and the state that from-zero leaves must not trip it again.
+        use crate::state::NodeState;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("mirror");
+        std::fs::create_dir_all(&root).unwrap();
+        let control = ControlRoot::new(tmp.path());
+        let ws = Uuid::from_u128(0xF);
+        let mount = Mount {
+            workspace: ws,
+            dir: "mirror".into(),
+            folder: None,
+            name: None,
+            derived_dir: false,
+            workspace_label: String::new(),
+        };
+        let mut state = WsState::fresh(None);
+        state.from_zero = false;
+        state.at_head = true;
+        state.head_reached_at = Some(now_unix());
+        let track = |state: &mut WsState, id: u128, path: &str| {
+            std::fs::write(root.join(path), "body").unwrap();
+            state.nodes.insert(
+                Uuid::from_u128(id),
+                NodeState {
+                    server_path: path.into(),
+                    local_path: path.into(),
+                    kind: TrackedKind::Note,
+                    rev: 1,
+                    content_sha256: crate::apply::sha_hex(b"body"),
+                    marker_path: None,
+                    content_changed_at: None,
+                },
+            );
+            state.ledger.insert(Uuid::from_u128(id));
+        };
+        track(&mut state, 1, "a.md");
+        assert_eq!(invalidator(&state, &mount, &root, &control), None);
+
+        track(&mut state, 2, "AGENTS.md");
+        let reason = invalidator(&state, &mount, &root, &control).expect("invalidated");
+        assert!(reason.contains("AGENTS.md"), "{reason}");
+        assert!(reason.contains("instructions"), "{reason}");
+
+        // The from-zero redelivers the node; the park arm untracks it and removes the file.
+        let node = |id: u128, path: &str| docli_sync_wire::WireNode {
+            id: Uuid::from_u128(id),
+            parent_id: None,
+            kind: "file".into(),
+            name: path.into(),
+            path: path.into(),
+            rev: 1,
+            trashed: false,
+            mime: None,
+            content_bytes: 4,
+            body: Some("body".into()),
+            blob_url: None,
+            position: None,
+            sha256: None,
+            blob_generation: None,
+            content_changed_at: None,
+        };
+        apply_page(
+            &mut state,
+            &FsRules {
+                fold_case_insensitive: true,
+                win_names: false,
+                max_component_bytes: 255,
+            },
+            &root,
+            &control,
+            ws,
+            None,
+            &[node(1, "a.md"), node(2, "AGENTS.md")],
+        )
+        .unwrap();
+        assert!(!root.join("AGENTS.md").exists());
+        assert!(state.parks.contains_key(&Uuid::from_u128(2)));
+        assert_eq!(
+            invalidator(&state, &mount, &root, &control),
+            None,
+            "the parked node is no longer tracked, so it never fires again"
         );
     }
 

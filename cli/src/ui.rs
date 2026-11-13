@@ -295,6 +295,23 @@ pub fn sanitize(text: &str) -> String {
         .collect()
 }
 
+/// [`sanitize`] for multi-line text bound for a terminal — a note body `docli read` prints.
+///
+/// The same rule with line breaks kept: `\n`, and `\r` only as half of a `\r\n` pair. A LONE
+/// carriage return goes like any other control character, because it moves the cursor back over
+/// text already printed — `rm -rf ~\rls` displays as `ls` followed by the rest, and that forgery
+/// needs no escape sequence at all. A CRLF note still prints as itself.
+pub fn sanitize_multiline(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        let keep =
+            c == '\t' || c == '\n' || !c.is_control() || (c == '\r' && chars.peek() == Some(&'\n'));
+        out.push(if keep { c } else { '\u{fffd}' });
+    }
+    out
+}
+
 /// Inline styles for values quoted inside a sentence. Functions rather than raw `style()` calls
 /// at the call sites, so the palette lives in ONE place.
 pub fn path(p: &str) -> String {
@@ -373,6 +390,21 @@ impl Progress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multiline_sanitize_keeps_lines_and_drops_every_terminal_control() {
+        // OSC 52 (a clipboard write), a screen clear, C1 CSI, a backspace — all gone.
+        let hostile = "a\u{1b}]52;c;cm0gLXJm\u{7}b\u{1b}[2Jc\u{9b}31md\u{8}e";
+        let out = sanitize_multiline(hostile);
+        assert!(!out.chars().any(|c| c.is_control()), "{out:?}");
+        assert!(out.starts_with('a') && out.ends_with('e'));
+        // Lines, tabs and CRLF pairs survive; Cyrillic and the rest of UTF-8 untouched.
+        let body = "# Заметка\r\n\tline\nlast";
+        assert_eq!(sanitize_multiline(body), body);
+        // A LONE `\r` would redraw the line over what was printed: it goes.
+        assert_eq!(sanitize_multiline("rm -rf ~\rls"), "rm -rf ~\u{fffd}ls");
+        assert_eq!(sanitize_multiline("end\r"), "end\u{fffd}");
+    }
 
     /// This module's state is PROCESS-GLOBAL — `QUIET`, `NO_INPUT`, `REPORT`, `MACHINE` and the
     /// locale environment are all one set of statics — and `cargo test` runs these in parallel

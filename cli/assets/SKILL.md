@@ -72,6 +72,17 @@ normal case) no `docli init` is needed; when a project keeps it local, `docli in
   BM25 search with Russian and English stemming on the server, across every mount, and prints
   each hit's **server path** and node id. `docli read` takes that path (or `--id <uuid>`) and
   prints the note.
+- **Filters narrow a search on the server, before its result cap**: `--under <path>` (a folder's
+  subtree, or one note), `--tag <tag>` (nested tags included) and `--field key=value` — a field
+  the workspace declares (`list_fields` over MCP names them), read from each note's frontmatter
+  by its key or label; `key=` means not set, `'key=!misfit'` (quoted: a shell expands `!`) a value
+  that fits nothing, `key=from..to` a number or date range with either end optional. A repeated
+  `--under` or `--tag`, or a repeated `--field` key, is «any of them»; different flags and
+  different keys must all hold. With a filter the query is optional. Without a query, the
+  matching notes are listed most recently changed first with their count. A filter searches ONE
+  workspace, so with several mounts it needs `--mount`. `docli search` exits 2 when the search did
+  not run as asked — a refused filter (the server's message names the fix) or a server too old for
+  filters — which never means «no match».
 - `docli search` publishes **no local mirror path** for its results, so a mirrored note is read
   with `docli read` rather than by opening a file. `--lines 40-80` reads a range (`40-` for the rest, `40` for one
   line); `--json` returns the read_note envelope; `--mount <name-or-workspace-id>` picks a mount
@@ -226,7 +237,7 @@ normal case) no `docli init` is needed; when a project keeps it local, `docli in
 | `docli sync` | bring every mount to the server's head (one-shot) |
 | `docli sync --check` | cheap freshness gate — 0 = current, 1 = behind (follow the printed remedy), 2 = could not check |
 | `docli sync --full` | authoritative resync: re-derive the mirror, prune stale files |
-| `docli search "q"` | server search across mounts — server paths and node ids |
+| `docli search "q"` | server search across mounts — server paths and node ids; `--under`, `--tag`, `--field`, `--mount` |
 | `docli read "path"…` | print a mirrored note (or several); `--lines`, `--id`, `--mount`, `--json`; a file's bytes with `--out` |
 | `docli related "path"` | notes and files related to a note or file, ranked offline; `--limit`, `--id`, `--mount`, `--json` |
 | `docli ls [folder]` · `docli tree` · `docli tags` · `docli tagged tag` | the workspace listed from the held graph; `--mount`, `--json`; exit 1 when a mount's graph is not held |

@@ -17,7 +17,8 @@ use anyhow::Result;
 use std::collections::{BTreeMap, HashMap};
 
 use docli_sync_wire::{
-    ChangedSet, MirrorPosition, SearchRequest, SearchWorkspaceOutcome, SEARCH_WORKSPACE_CAP,
+    ChangedSet, MirrorPosition, SearchFieldWire, SearchFilterWire, SearchRequest,
+    SearchWorkspaceOutcome, SEARCH_WORKSPACE_CAP,
 };
 use uuid::Uuid;
 
@@ -25,7 +26,69 @@ use crate::config::{validate_config, Mount, Project};
 use crate::http::Api;
 use crate::state::{ControlRoot, NodeState, TrackedKind};
 
-pub fn run(project: &Project, api: &Api, query: &str, json: bool) -> Result<i32> {
+/// `--under`, `--tag` and `--field` as the wire filter (v0.49.2 D6), or `None` when none is given.
+/// The CLI evaluates nothing: the server resolves every path, key and option, so `docli search`
+/// can never return a false negative from client-side divergence.
+pub fn parse_filter(
+    under: &[String],
+    tags: &[String],
+    fields: &[String],
+) -> Result<Option<SearchFilterWire>> {
+    if under.is_empty() && tags.is_empty() && fields.is_empty() {
+        return Ok(None);
+    }
+    let mut out = SearchFilterWire {
+        under: under.to_vec(),
+        tags: tags.to_vec(),
+        fields: Vec::new(),
+    };
+    for f in fields {
+        let Some((key, value)) = f.split_once('=') else {
+            anyhow::bail!(
+                "--field takes KEY=VALUE (`key=` for not set, `key=!misfit`, `key=from..to`): `{f}`"
+            );
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            anyhow::bail!("--field needs a key before `=`: `{f}`");
+        }
+        let i = match out.fields.iter().position(|c| c.key == key) {
+            Some(i) => i,
+            None => {
+                out.fields.push(SearchFieldWire {
+                    key: key.to_string(),
+                    ..SearchFieldWire::default()
+                });
+                out.fields.len() - 1
+            }
+        };
+        let c = &mut out.fields[i];
+        match value.split_once("..") {
+            Some((from, to)) => {
+                if c.from.is_some() || c.to.is_some() {
+                    anyhow::bail!("--field {key}: only one range is allowed");
+                }
+                let end = |s: &str| (!s.trim().is_empty()).then(|| s.trim().to_string());
+                c.from = end(from);
+                c.to = end(to);
+                if c.from.is_none() && c.to.is_none() {
+                    anyhow::bail!("--field {key}=..: a range needs `from`, `to` or both");
+                }
+            }
+            None => c.values.push(value.trim().to_string()),
+        }
+    }
+    Ok(Some(out))
+}
+
+pub fn run(
+    project: &Project,
+    api: &Api,
+    query: &str,
+    json: bool,
+    filter: Option<SearchFilterWire>,
+    mount: Option<&str>,
+) -> Result<i32> {
     if json {
         crate::ui::machine_mode();
     } else {
@@ -36,7 +99,24 @@ pub fn run(project: &Project, api: &Api, query: &str, json: bool) -> Result<i32>
     // mirror-write geometry rules must not block a server query.
     validate_config(&project.config)?;
     let control = project.control_root();
-    let mounts: Vec<&Mount> = project.config.mounts.iter().collect();
+    let mounts: Vec<&Mount> =
+        crate::read_cmd::select_mounts(project, mount).map_err(|r| anyhow::anyhow!(r.message))?;
+    // A filter's paths, keys and options belong to ONE workspace (v0.49.2 D6) — refused here,
+    // naming the choices, rather than fanned out.
+    if filter.is_some() && mounts.len() != 1 {
+        anyhow::bail!(
+            "a filter searches one workspace - choose it with --mount: {}",
+            mounts
+                .iter()
+                .map(|m| format!(
+                    "{} ({})",
+                    crate::ui::sanitize(m.display_name()),
+                    m.workspace
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
     // The local read happens BEFORE the request, because the position rides the request
     // (v0.29.0 D2d) and the answer must describe the position actually sent.
@@ -72,11 +152,25 @@ pub fn run(project: &Project, api: &Api, query: &str, json: bool) -> Result<i32>
             // OMITTED, never `{}`, when no mount in this chunk qualifies — the two are
             // byte-different and absence is what the server reads as «did not ask».
             positions: (!positions.is_empty()).then_some(positions),
+            filter: filter.clone(),
         };
         match api.search(&req)? {
             Ok(resp) => outcomes.extend(resp.workspaces),
             Err(f) => anyhow::bail!("{f}"),
         }
+    }
+
+    // A non-refused outcome that did not apply the filter came from an api older than v0.49.2,
+    // which ignored it: its hits are a superset, and a superset looks exactly like a correct
+    // answer. A refusal renders as today — it never searched, so it says nothing about support.
+    if filter.is_some()
+        && outcomes
+            .iter()
+            .any(|o| o.refused.is_none() && !o.filter_applied)
+    {
+        anyhow::bail!(
+            "the server does not support filters yet - search without --under, --tag or --field"
+        );
     }
 
     let mut rendered = Vec::new();
@@ -95,7 +189,9 @@ pub fn run(project: &Project, api: &Api, query: &str, json: bool) -> Result<i32>
         };
         let l = local.get(&o.workspace_id).expect("every mount was read");
         record_marks(&control, o, l);
-        rendered.push(render_workspace(mount, l, o, &mut any_hit));
+        let mut r = render_workspace(mount, l, o, &mut any_hit);
+        r.filter = filter.clone();
+        rendered.push(r);
         any_degraded |= o.degraded;
         any_refused |= o.refused.is_some();
     }
@@ -363,6 +459,12 @@ pub struct RenderedWorkspace {
     /// prose field would become a second contract nobody meant to make.
     #[serde(skip)]
     pub mirror_reason: Option<String>,
+    /// v0.49.2 — how many notes a filter-only search matched (the hits are capped).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<i64>,
+    /// v0.49.2 — the filter this run SENT (the server's resolved echo is MCP-only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter: Option<SearchFilterWire>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -409,7 +511,8 @@ fn render_workspace(
                 // instruction, not data: an agent parsing this wants the sentence, and the CLI's
                 // own `--json` is closed over what it emits (the v0.29.0 delta precedent). A
                 // DECLARED contract change — `--json` used to carry the raw markup.
-                snippet: Some(snippet_text(&h.snippet)),
+                // A filter-only listing has no text to show a window of (v0.49.2 D4).
+                snippet: o.total.is_none().then(|| snippet_text(&h.snippet)),
                 marker: false,
                 match_kind: None,
                 page: None,
@@ -470,6 +573,8 @@ fn render_workspace(
             AskDecision::Unusable(r) | AskDecision::StateUnreadable(r) => Some(r.clone()),
             _ => None,
         },
+        total: o.total,
+        filter: None,
     }
 }
 
@@ -707,7 +812,12 @@ fn print_workspace(r: &RenderedWorkspace, show_mount: bool) {
             "INTERNAL" => "a temporary server error - run the search again".to_string(),
             _ => crate::sync_cmd::no_access_message(&r.mount),
         };
-        crate::ui::refuse(&format!("[{}] {code}: {line}", r.mount));
+        // The code is the SERVER's string; scrubbed like every other one this screen prints.
+        crate::ui::refuse(&format!(
+            "[{}] {}: {line}",
+            r.mount,
+            crate::ui::sanitize(code)
+        ));
         return;
     }
     if r.degraded {
@@ -727,42 +837,18 @@ fn print_workspace(r: &RenderedWorkspace, show_mount: bool) {
     if let Some(line) = coverage_line(r) {
         crate::ui::detail(&format!("[{}] {line}", r.mount));
     }
-    for h in &r.hits {
-        // The SERVER PATH is the answer — bold and on its own line, because it is what you hand
-        // to `docli read`. The id rides beside it, dimmed, so `--id` has a producer in the human
-        // output too and not only in `--json`. The snippet is context: dimmed and clipped to one
-        // terminal line, so a screenful of hits stays a list rather than a wall of prose.
-        crate::ui::line(&format!(
-            "{tag}{} {}",
-            console::style(&h.server_path).bold(),
-            crate::ui::dim(&h.id.to_string())
-        ));
-        if let Some(s) = &h.snippet {
-            // The server's `<b>` marks say WHICH terms matched — the most useful thing in the
-            // line. They were being printed literally, so every agent reading search results saw
-            // raw tags (observed 2026-09-05). Rendered as emphasis now, never as text.
-            crate::ui::line(&format!("    {}", styled_snippet(&s.replace('\n', " "))));
+    for h in r.hits.iter().chain(&r.attachments) {
+        for l in hit_lines(&tag, h) {
+            crate::ui::line(&l);
         }
     }
-    for a in &r.attachments {
-        let found = match (a.match_kind.as_deref(), a.page) {
-            (Some("content"), Some(p)) => {
-                format!("(a file, with a text match on {} {p} - ", a.unit)
-            }
-            (Some("content"), None) => "(a file, with a text match - ".to_string(),
-            _ => "(a file - ".to_string(),
-        };
-        crate::ui::line(&format!(
-            "{tag}{} {} {}",
-            console::style(&a.server_path).bold(),
-            crate::ui::dim(&a.id.to_string()),
-            crate::ui::dim(&format!(
-                "{found}docli read prints the file's marker; the bytes and the text stay on the server)"
-            ))
+    // A capped listing that does not say it is capped reads as «these are all of them».
+    if let Some(total) = r.total {
+        crate::ui::detail(&format!(
+            "[{}] showing {} of {total} matching notes, most recently changed first",
+            r.mount,
+            r.hits.len()
         ));
-        if let Some(s) = &a.snippet {
-            crate::ui::line(&format!("    {}", s.replace('\n', " ")));
-        }
     }
     if r.attachments_truncated {
         crate::ui::detail(&format!(
@@ -780,8 +866,103 @@ fn print_workspace(r: &RenderedWorkspace, show_mount: bool) {
     mirror_notice(r);
 }
 
+/// The terminal lines for one hit — a note's, or a file's when `h.marker` is set.
+///
+/// Every server string goes through [`crate::ui::sanitize`] first: a path and a snippet are text
+/// a co-member wrote (a note body, a file's extracted text, a name), and the server passes them
+/// through verbatim, so an `ESC]52` clipboard write or an `ESC[2J` with forged lines after it
+/// would otherwise reach the reader's terminal. `--json` is untouched — serde escapes control
+/// characters, and a machine wants the exact text. Pure, so the scrub is asserted rather than
+/// trusted.
+fn hit_lines(tag: &str, h: &RenderedHit) -> Vec<String> {
+    use crate::ui::{dim, sanitize};
+    // Newlines fold to spaces BEFORE the scrub, which would otherwise turn each into U+FFFD.
+    let one_line = |s: &str| sanitize(&s.replace('\n', " "));
+    // The SERVER PATH is the answer — bold and on its own line, because it is what you hand to
+    // `docli read`. The id rides beside it, dimmed, so `--id` has a producer in the human output
+    // too and not only in `--json`.
+    let path = console::style(sanitize(&h.server_path)).bold();
+    let id = dim(&h.id.to_string());
+    let mut lines = Vec::with_capacity(2);
+    if h.marker {
+        let found = match (h.match_kind.as_deref(), h.page) {
+            (Some("content"), Some(p)) => {
+                format!("(a file, with a text match on {} {p} - ", h.unit)
+            }
+            (Some("content"), None) => "(a file, with a text match - ".to_string(),
+            _ => "(a file - ".to_string(),
+        };
+        lines.push(format!(
+            "{tag}{path} {id} {}",
+            dim(&format!(
+                "{found}docli read prints the file's marker; the bytes and the text stay on the server)"
+            ))
+        ));
+        if let Some(s) = &h.snippet {
+            lines.push(format!("    {}", one_line(s)));
+        }
+    } else {
+        lines.push(format!("{tag}{path} {id}"));
+        if let Some(s) = &h.snippet {
+            // The snippet is context: dimmed and clipped to one terminal line, so a screenful of
+            // hits stays a list rather than a wall of prose. The server's `<b>` marks say WHICH
+            // terms matched — the most useful thing in the line. They were being printed
+            // literally, so every agent reading search results saw raw tags (observed
+            // 2026-09-05). Rendered as emphasis now, never as text.
+            lines.push(format!("    {}", styled_snippet(&one_line(s))));
+        }
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
+    /// Every ESC in a line must open an SGR sequence (`ESC [ digits/; m`) — the CLI's own styling.
+    /// Anything else (OSC, a screen clear, a bell) came from the server and reached the terminal.
+    fn only_sgr_escapes(line: &str) -> bool {
+        let mut rest = line;
+        while let Some(i) = rest.find('\u{1b}') {
+            let seq = &rest[i + 1..];
+            let Some(body) = seq.strip_prefix('[') else {
+                return false;
+            };
+            let end = body
+                .find(|c: char| !(c.is_ascii_digit() || c == ';'))
+                .unwrap_or(body.len());
+            if !body[end..].starts_with('m') {
+                return false;
+            }
+            rest = &body[end + 1..];
+        }
+        !line.chars().any(|c| c.is_control() && c != '\u{1b}')
+    }
+
+    #[test]
+    fn server_text_never_reaches_the_terminal_as_control_sequences() {
+        let osc52 = "\u{1b}]52;c;cm0gLXJmIH4=\u{7}";
+        let hit = |marker: bool| super::RenderedHit {
+            server_path: format!("evil{osc52}.md"),
+            id: uuid::Uuid::nil(),
+            snippet: Some(format!(
+                "before\u{1b}[2J\nforged line{osc52}\u{9b}31m after"
+            )),
+            marker,
+            match_kind: Some("content".into()),
+            page: Some(1),
+            unit: "page",
+        };
+        // Colour is left as the test process has it (a global — toggling it would race the
+        // other tests); `only_sgr_escapes` admits the CLI's own styling either way.
+        for marker in [false, true] {
+            let lines = super::hit_lines("", &hit(marker));
+            assert_eq!(lines.len(), 2);
+            for l in &lines {
+                assert!(only_sgr_escapes(l), "marker={marker}: {l:?}");
+            }
+            assert!(lines[1].contains("forged line"), "the text itself survives");
+        }
+    }
+
     #[test]
     fn highlight_marks_never_reach_the_reader_as_text() {
         // Observed 2026-09-05 in real output: `no <b>author</b>** — but that is three populati...`
@@ -882,7 +1063,79 @@ mod tests {
             files_degraded: false,
             delta: None,
             changed: None,
+            filter_applied: false,
+            total: None,
         }
+    }
+
+    /// v0.49.2 — the flags as a wire filter: a repeated key is ONE condition with any-of values,
+    /// `key=` is «not set», `from..to` a range with either end optional, and malformed flags are
+    /// refused before any request.
+    #[test]
+    fn the_filter_flags_parse_to_one_condition_per_key() {
+        assert_eq!(parse_filter(&[], &[], &[]).unwrap(), None);
+        let f = parse_filter(
+            &["Законы".into()],
+            &["#work".into()],
+            &[
+                "redaktsiya=Актуальная".into(),
+                "redaktsiya=".into(),
+                "redaktsiya=!misfit".into(),
+                "n=..5".into(),
+                "srok=2026-01-01..".into(),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(f.under, ["Законы"]);
+        assert_eq!(f.tags, ["#work"]);
+        assert_eq!(f.fields.len(), 3);
+        assert_eq!(f.fields[0].values, ["Актуальная", "", "!misfit"]);
+        assert_eq!(
+            (f.fields[1].from.as_deref(), f.fields[1].to.as_deref()),
+            (None, Some("5"))
+        );
+        assert_eq!(f.fields[2].from.as_deref(), Some("2026-01-01"));
+        for bad in ["novalue", "=x", "n=..", "n=1..2"] {
+            let fields: Vec<String> = if bad == "n=1..2" {
+                vec!["n=..1".into(), bad.into()]
+            } else {
+                vec![bad.into()]
+            };
+            assert!(parse_filter(&[], &[], &fields).is_err(), "{bad}");
+        }
+    }
+
+    /// v0.49.2 — `--json` carries `total` and the filter this run sent; a listing hit carries no
+    /// snippet; neither key appears on a plain search.
+    #[test]
+    fn the_json_projection_carries_total_and_the_sent_filter() {
+        let f = fx();
+        let hit = SearchHitWire {
+            id: Uuid::from_u128(9),
+            name: "a.md".into(),
+            path: "A/a.md".into(),
+            snippet: String::new(),
+            rank: 0.0,
+        };
+        let mut o = outcome(vec![hit], vec![]);
+        o.filter_applied = true;
+        o.total = Some(312);
+        let mut any = false;
+        let mut r = render_workspace(&f.mount, &as_local(false), &o, &mut any);
+        r.filter = parse_filter(&["A".into()], &[], &[]).unwrap();
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["total"], 312);
+        assert_eq!(v["filter"], serde_json::json!({"under": ["A"]}));
+        assert!(v["hits"][0].get("snippet").is_none(), "{v}");
+        let plain = render_workspace(
+            &f.mount,
+            &as_local(false),
+            &outcome(vec![], vec![]),
+            &mut any,
+        );
+        let v = serde_json::to_value(&plain).unwrap();
+        assert!(v.get("total").is_none() && v.get("filter").is_none(), "{v}");
     }
 
     /// The render input, as a `MountLocal`. Since v0.29.1 D1 it is the ask decision alone —

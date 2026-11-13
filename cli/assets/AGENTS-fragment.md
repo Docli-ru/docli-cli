@@ -57,6 +57,16 @@ Two rules, and both fire on an **event**, not on your judgement of whether you n
   and node id; `docli read` prints that note — `--lines 40-80` for a range, `--json` for the
   read_note envelope, `--mount` when more than one mount holds it. **Exit 3 means only that this
   mirror does not hold the requested note or file — never that it does not exist on the server.**
+- **`docli search` takes filters**, applied on the server before its result cap: `--under <path>`
+  (a folder's subtree, or one note), `--tag <tag>` (nested tags included), `--field key=value` (a
+  declared field read from each note's frontmatter; `key=` for not set, `'key=!misfit'` (quoted:
+  a shell expands `!`) for a value that fits nothing, `key=from..to` for a number or date range).
+  A repeated `--under` or `--tag`, or a repeated `--field` key, means «any of them»; different
+  flags and different keys must all hold. With a filter the query may be left out: the matching
+  notes are listed most recently changed first, with how many matched. A filter searches one
+  workspace — pass `--mount` when several are mounted. **Exit 2 means the search did not run as
+  asked** (a refused filter, with the server's reason, or a server too old for filters) — never
+  «nothing matched».
 - **Exit 4 means the server listed that note as changed since this mirror last applied it**, so
   `docli read` will not serve what it holds. Run `docli sync` and read it again. It fires only for a
   note the server named — never as a general «something might be stale» — though a note whose stamp

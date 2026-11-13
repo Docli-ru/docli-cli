@@ -1708,6 +1708,22 @@ fn needs_closing_newline(body: &str, stdout_is_a_terminal: bool) -> bool {
     stdout_is_a_terminal && !body.is_empty() && !body.ends_with('\n')
 }
 
+/// The body as stdout should receive it — gated on a terminal like [`needs_closing_newline`],
+/// and pure for the same reason.
+///
+/// A note body is text any co-member of the workspace can write, so on a TERMINAL it is scrubbed
+/// of control characters: an `ESC]52` sequence would write the reader's clipboard and an
+/// `ESC[2J` would clear the screen and forge what follows. Piped or redirected it stays
+/// byte-verbatim — agents and `> file` need exactly what the mirror holds, and a byte stream
+/// carries no terminal to attack.
+fn terminal_safe_body(body: &str, stdout_is_a_terminal: bool) -> std::borrow::Cow<'_, str> {
+    if stdout_is_a_terminal {
+        std::borrow::Cow::Owned(crate::ui::sanitize_multiline(body))
+    } else {
+        std::borrow::Cow::Borrowed(body)
+    }
+}
+
 /// Write the product to stdout, treating a CLOSED PIPE as a normal end.
 ///
 /// `print!` PANICS when stdout will not take the bytes, and the documented flow for this verb is
@@ -1795,16 +1811,18 @@ fn render_served(s: &Served, json: bool) -> i32 {
         crate::ui::warn(&d.message);
     }
     if let Some(n) = &s.note {
-        crate::ui::detail(n);
+        // It carries the note's TAGS — co-member text, on stderr, which is a terminal.
+        crate::ui::detail(&crate::ui::sanitize(n));
     }
     if json {
         return write_json(&s.envelope, 0);
     }
     // The body is bytes-as-asked, not a UI line: no prefix, no styling, no
-    // `--quiet` suppression.
+    // `--quiet` suppression — and on a terminal, no control characters.
+    let tty = console::Term::stdout().is_term();
     match write_product(
-        &s.body,
-        needs_closing_newline(&s.body, console::Term::stdout().is_term()),
+        &terminal_safe_body(&s.body, tty),
+        needs_closing_newline(&s.body, tty),
     ) {
         Ok(()) => 0,
         // The reader hung up. It got what it asked for; so did we.
@@ -3269,6 +3287,23 @@ mod tests {
             assert!(!needs_closing_newline("ends with one\n", is_term));
             assert!(!needs_closing_newline("", is_term));
         }
+    }
+
+    /// A terminal never receives a co-member's escape sequences; a pipe receives the exact bytes.
+    #[test]
+    fn a_terminal_gets_a_scrubbed_body_and_a_pipe_gets_the_bytes() {
+        let hostile = "# t\r\n\u{1b}]52;c;cm0gLXJmIH4=\u{7}\u{1b}[2Jforged\n";
+        let shown = terminal_safe_body(hostile, true);
+        assert!(
+            !shown.contains('\u{1b}') && !shown.contains('\u{7}'),
+            "{shown:?}"
+        );
+        assert!(shown.starts_with("# t\r\n") && shown.ends_with("forged\n"));
+        assert_eq!(terminal_safe_body(hostile, false), hostile);
+        assert!(matches!(
+            terminal_safe_body(hostile, false),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     /// Every token the ambiguity refusal prints must be one `--mount` accepts, or the remedy

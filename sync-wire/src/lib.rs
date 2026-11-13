@@ -370,6 +370,41 @@ pub struct SearchRequest {
     /// chunk qualifies — `{}` and absence are byte-different and the pin freezes one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub positions: Option<BTreeMap<Uuid, MirrorPosition>>,
+    /// v0.49.2 D6 — narrow the notes before the cap. A filtered request names EXACTLY ONE
+    /// workspace (its paths, keys and options belong to one); anything else is a request-level
+    /// rejection, and so is a condition the server cannot apply — with the message. OMITTED when
+    /// `None`, so a filterless request's bytes are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<SearchFilterWire>,
+}
+
+/// A search filter as the CLI typed it (v0.49.2 D6): every condition holds; within one, any of its
+/// values. The server resolves paths, keys and options — the client evaluates nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchFilterWire {
+    /// Folder or note paths; a folder includes its subtree.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub under: Vec<String>,
+    /// Tags, `#` optional; a tag matches its nested tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<SearchFieldWire>,
+}
+
+/// One field condition: `values` holds option keys or labels, `""` for not set and `!misfit` for a
+/// value that fits nothing; `from`/`to` is a number or date range, either end optional.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchFieldWire {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
 }
 
 /// One mount's position on the sync keyset, plus the comparand only the client holds (v0.29.0
@@ -486,6 +521,16 @@ pub struct SearchWorkspaceOutcome {
     /// nothing changed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub changed: Option<ChangedSet>,
+    /// v0.49.2 D6 — the request's filter was applied to this workspace. Set on every non-refused
+    /// outcome of a filtered request, `degraded` included. A non-refused outcome WITHOUT it, to a
+    /// filtered request, means an api older than v0.49.2 ignored the filter — its hits are a
+    /// superset, and the CLI says so rather than printing them.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub filter_applied: bool,
+    /// v0.49.2 D4 — how many notes a filter-only search matched; absent otherwise, and on a
+    /// degraded answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<i64>,
 }
 
 /// The changed set for one workspace (v0.29.7 D1).
@@ -710,6 +755,7 @@ mod tests {
             query: "заметка".into(),
             limit: Some(20),
             positions: Some(positions),
+            filter: None,
         };
         assert_eq!(
             serde_json::to_string(&req).unwrap(),
@@ -733,11 +779,60 @@ mod tests {
             query: "q".into(),
             limit: None,
             positions: None,
+            filter: None,
         };
         assert_eq!(
             serde_json::to_string(&req).unwrap(),
             r#"{"workspaceIds":["00000000-0000-0000-0000-000000000001"],"query":"q"}"#
         );
+    }
+
+    /// v0.49.2 — a filtered request: only what was given rides, and an outcome that applied it
+    /// says so with its `total`.
+    #[test]
+    fn a_filtered_search_pins_its_fields() {
+        let req = SearchRequest {
+            workspace_ids: vec![ws(1)],
+            query: "".into(),
+            limit: None,
+            positions: None,
+            filter: Some(SearchFilterWire {
+                under: vec!["Законы".into()],
+                tags: vec![],
+                fields: vec![
+                    SearchFieldWire {
+                        key: "redaktsiya".into(),
+                        values: vec!["aktualnaya".into(), "".into()],
+                        ..SearchFieldWire::default()
+                    },
+                    SearchFieldWire {
+                        key: "n".into(),
+                        from: Some("1".into()),
+                        ..SearchFieldWire::default()
+                    },
+                ],
+            }),
+        };
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            concat!(
+                r#"{"workspaceIds":["00000000-0000-0000-0000-000000000001"],"query":"","#,
+                r#""filter":{"under":["Законы"],"fields":[{"key":"redaktsiya","#,
+                r#""values":["aktualnaya",""]},{"key":"n","from":"1"}]}}"#
+            )
+        );
+        let o: SearchWorkspaceOutcome = serde_json::from_str(concat!(
+            r#"{"workspaceId":"00000000-0000-0000-0000-000000000001","filterApplied":true,"#,
+            r#""total":312}"#
+        ))
+        .unwrap();
+        assert!(o.filter_applied);
+        assert_eq!(o.total, Some(312));
+        // A pre-v0.49.2 api's outcome: no flag, no total.
+        let o: SearchWorkspaceOutcome =
+            serde_json::from_str(r#"{"workspaceId":"00000000-0000-0000-0000-000000000001"}"#)
+                .unwrap();
+        assert!(!o.filter_applied && o.total.is_none());
     }
 
     /// The request the v0.28.x CLI sends (no `positions`) still parses — the field defaults to
@@ -770,6 +865,8 @@ mod tests {
             files_degraded: false,
             delta: Some("pending".into()),
             changed: None,
+            filter_applied: false,
+            total: None,
         };
         assert_eq!(
             serde_json::to_string(&SearchResponse {
@@ -795,6 +892,8 @@ mod tests {
             files_degraded: false,
             delta: None,
             changed: None,
+            filter_applied: false,
+            total: None,
         };
         assert_eq!(
             serde_json::to_string(&SearchResponse {
@@ -944,6 +1043,8 @@ mod tests {
             files_partial: 0,
             files_unsearchable: 0,
             files_degraded: false,
+            filter_applied: false,
+            total: None,
             delta: Some("pending".into()),
             changed: Some(ChangedSet {
                 nodes: vec![
@@ -1013,6 +1114,8 @@ mod tests {
             files_degraded: false,
             delta: None,
             changed: None,
+            filter_applied: false,
+            total: None,
         };
         let json = serde_json::to_string(&outcome).unwrap();
         assert_eq!(

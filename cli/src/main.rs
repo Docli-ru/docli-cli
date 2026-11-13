@@ -182,12 +182,29 @@ enum Command {
     },
     /// Server search across all mounts; pass a result to `docli read`
     Search {
-        /// The query
+        /// The query - optional with a filter; without a query, the matching notes are listed most
+        /// recently changed first
         #[arg(value_name = "QUERY")]
         query: Vec<String>,
         /// Machine-readable output (JSON)
         #[arg(long)]
         json: bool,
+        /// Only notes and files at or under this folder or note (repeatable - any of them)
+        #[arg(long, value_name = "PATH")]
+        under: Vec<String>,
+        /// Only notes with this tag or a tag nested under it (repeatable - any of them)
+        #[arg(long, value_name = "TAG")]
+        tag: Vec<String>,
+        /// A declared field in the note's frontmatter: `key=value`, `key=` (not set),
+        /// `'key=!misfit'` (fits nothing; quoted, as a shell expands `!`), `key=from..to` (a
+        /// number or date range; either end may be left out). Repeatable; a repeated key matches
+        /// any of its values
+        #[arg(long, value_name = "KEY=VALUE")]
+        field: Vec<String>,
+        /// Which mount to search - a mount name or a workspace id. A filter searches one
+        /// workspace, so it needs this when more than one is mounted
+        #[arg(long)]
+        mount: Option<String>,
     },
     /// Print a mirrored note, or a file's metadata, by server path or node id
     Read {
@@ -551,14 +568,25 @@ fn run(cli: Cli) -> Result<i32> {
                 },
             )
         }
-        Command::Search { query, json } => {
+        Command::Search {
+            query,
+            json,
+            under,
+            tag,
+            field,
+            mount,
+        } => {
             let project = config::load_project(&cwd)?;
             let api = api_for(&project)?;
             let q = query.join(" ");
-            if q.trim().is_empty() {
-                anyhow::bail!("usage: docli search <query>");
+            let filter = search_cmd::parse_filter(&under, &tag, &field)?;
+            if q.trim().is_empty() && filter.is_none() {
+                anyhow::bail!(
+                    "usage: docli search [<query>] [--under PATH] [--tag TAG] [--field KEY=VALUE] \
+                     [--mount MOUNT] - give a query, a filter or both"
+                );
             }
-            search_cmd::run(&project, &api, &q, json)
+            search_cmd::run(&project, &api, &q, json, filter, mount.as_deref())
         }
         Command::Read {
             paths,

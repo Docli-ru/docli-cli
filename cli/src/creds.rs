@@ -6,13 +6,14 @@
 //! an unspecified inherited-ACL default; OS keychain deferred — no native deps in the static
 //! binary).
 //!
-//! **Refresh is rotating and single-use, and a double-spend is TERMINAL** (reuse detection
-//! revokes the whole lineage): an agent-driven CLI hits the concurrent shape routinely, so
-//! refresh runs SINGLE-FLIGHT — an advisory file lock around the critical section (lock →
-//! re-read creds → re-check expiry → refresh only if still needed → write → unlock). Two
-//! failure classes are handled distinctly: `invalid_grant` ⇒ creds are dead, say «run
-//! `docli login`», never retry; `503 + Retry-After` (the SUSPENDED-grant answer — a different
-//! class than reuse) ⇒ wait and retry with re-read creds, never discard.
+//! **Refresh is rotating and single-use, and a double-spend is REFUSED** (inside the server's
+//! 60 s grace window it changes nothing; past it, reuse detection revokes the whole lineage): an
+//! agent-driven CLI hits the concurrent shape routinely, so refresh runs SINGLE-FLIGHT — an
+//! advisory file lock around the critical section (lock → re-read creds → re-check expiry →
+//! refresh only if still needed → write → unlock). Two failure classes are handled distinctly:
+//! `invalid_grant` ⇒ the stored token is unusable, say «run `docli login`», never retry;
+//! `503 + Retry-After` (the SUSPENDED-grant answer — a different class than reuse) ⇒ wait and
+//! retry with re-read creds, never discard.
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -311,7 +312,8 @@ impl CredsStore {
         // rename path, which replaces the security descriptor wholesale. Fail closed.
         // …UNDER the credentials lock (Codex round 22): an unlocked rewrite could resume
         // with a stale snapshot after a concurrent refresh rotated the tokens, and the next
-        // refresh would then replay a consumed refresh token into terminal lineage revocation.
+        // refresh would then replay a consumed refresh token — refused, and past the server's
+        // grace window a lineage revocation.
         // The REFUSAL is unconditional and comes first: a credentials entry that is not a
         // regular file (a symlink pointing anywhere) must never be used, and that question is a
         // no-follow stat needing no lock at all. Gating it behind the lock meant a second
@@ -788,9 +790,10 @@ impl CredsStore {
                  {TOKEN_VAR} again."
             );
         }
-        // The advisory lock: the loser of a concurrent refresh would trip reuse detection and
-        // revoke the LINEAGE — both processes lose the credential, recovery is a browser
-        // round-trip an agent cannot perform.
+        // The advisory lock: the loser of a concurrent refresh would present a consumed token.
+        // It is refused, and past the server's grace window it revokes the LINEAGE — both
+        // processes lose the credential, recovery is a browser round-trip an agent cannot
+        // perform.
         let lock = self.lock_for_write()?;
         lock.lock().context("waiting for the credentials lock")?;
         let result = self.refresh_locked(server, refresh, rejected);
@@ -824,8 +827,8 @@ impl CredsStore {
             // and it would replace a key the user is still managing on the server.
             //
             // The entry is KEPT, unlike the `invalid_grant` arm below. That arm acts on the
-            // token endpoint saying the lineage is dead; this one has only a single 401 from a
-            // sync request, which a momentary server-side fault also produces. Nothing was
+            // token endpoint refusing the refresh token itself; this one has only a single 401
+            // from a sync request, which a momentary server-side fault also produces. Nothing was
             // consumed by the failure — no rotation happened — so keeping the key costs
             // nothing, while deleting it would force a re-paste on exactly the population that
             // cannot do one on demand: a sandbox, a CI job, an unattended container.
@@ -853,8 +856,9 @@ impl CredsStore {
                     return Ok(access_token);
                 }
                 RefreshOutcome::InvalidGrant => {
-                    // Terminal: never retry (a dead lineage stays dead). The creds entry goes,
-                    // so the next command says «run docli login» immediately.
+                    // Terminal: never retry (a refused refresh token stays refused, whether or
+                    // not its lineage is dead). The creds entry goes, so the next command says
+                    // «run docli login» immediately.
                     self.remove_unlocked(server)?;
                     bail!("your sign-in to {server} is no longer valid - run `docli login`");
                 }
@@ -881,7 +885,7 @@ pub enum RefreshOutcome {
         refresh_token: String,
         expires_in: i64,
     },
-    /// `400 invalid_grant` — creds are dead.
+    /// `400 invalid_grant` — the stored refresh token is unusable.
     InvalidGrant,
     /// `503 + Retry-After` — entitlement off / persona archived; wait, never discard.
     Suspended { retry_after_secs: u64 },

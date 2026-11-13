@@ -1660,3 +1660,111 @@ fn the_related_artifact_rides_the_head_page_and_absence_keeps_what_is_held() {
         "--check does not ask"
     );
 }
+
+// ---- v0.49.2 — search filters ----------------------------------------------------------------
+
+fn search(
+    fx: &mut Fx,
+    server: &str,
+    filter: Option<docli_sync_wire::SearchFilterWire>,
+    mount: Option<&str>,
+) -> anyhow::Result<i32> {
+    fx.project.config.server = server.to_string();
+    let api = api_for(&fx.project.root, server);
+    docli_cli::search_cmd::run(&fx.project, &api, "", true, filter, mount)
+}
+
+fn under(p: &str) -> Option<docli_sync_wire::SearchFilterWire> {
+    docli_cli::search_cmd::parse_filter(&[p.to_string()], &[], &[]).unwrap()
+}
+
+/// The filter rides the request; an answer that applied it is served; an api older than v0.49.2
+/// (no `filterApplied`) is refused rather than printed; a refused workspace stays a refusal; a
+/// request-level rejection carries the server's message.
+#[test]
+fn a_filtered_search_needs_a_server_that_applied_it() {
+    let mut f = fx();
+    let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let s2 = seen.clone();
+    let applied = spawn_stub(Arc::new(move |path, body| {
+        assert_eq!(path, "/api/sync/search");
+        s2.lock().unwrap().push(body.clone());
+        (
+            200,
+            json!({"workspaces": [{"workspaceId": WS.to_string(), "filterApplied": true, "total": 3}]}),
+        )
+    }));
+    assert_eq!(search(&mut f, &applied, under("Законы"), None).unwrap(), 0);
+    assert_eq!(
+        seen.lock().unwrap()[0]["filter"],
+        json!({"under": ["Законы"]})
+    );
+
+    let old = spawn_stub(Arc::new(|_, _| {
+        (
+            200,
+            json!({"workspaces": [{"workspaceId": WS.to_string()}]}),
+        )
+    }));
+    let err = search(&mut f, &old, under("Законы"), None)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("does not support filters"), "{err}");
+
+    let refused = spawn_stub(Arc::new(|_, _| {
+        (
+            200,
+            json!({"workspaces": [{"workspaceId": WS.to_string(), "refused": "FORBIDDEN"}]}),
+        )
+    }));
+    assert_eq!(
+        search(&mut f, &refused, under("Законы"), None).unwrap(),
+        0,
+        "a refusal is never «server too old»"
+    );
+
+    let rejected = spawn_stub(Arc::new(|_, _| {
+        (
+            422,
+            json!({"code": "BAD_REQUEST", "message": "`redaktsiya` has no option `новая`"}),
+        )
+    }));
+    let err = search(&mut f, &rejected, under("Законы"), None)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("новая"), "{err}");
+}
+
+/// A filter names one workspace: with several mounts and no `--mount` it is refused before any
+/// request, naming the mounts; `--mount` picks one.
+#[test]
+fn a_filter_with_several_mounts_needs_mount() {
+    let mut f = fx();
+    let mut second = f.project.config.mounts[0].clone();
+    second.workspace = Uuid::from_u128(0xBB);
+    second.dir = "mirror2".into();
+    second.name = Some("второй".into());
+    f.project.config.mounts.push(second);
+    let hits: Arc<Mutex<usize>> = Arc::default();
+    let h2 = hits.clone();
+    let server = spawn_stub(Arc::new(move |_, body| {
+        *h2.lock().unwrap() += 1;
+        assert_eq!(body["workspaceIds"].as_array().unwrap().len(), 1);
+        (
+            200,
+            json!({"workspaces": [{"workspaceId": body["workspaceIds"][0], "filterApplied": true}]}),
+        )
+    }));
+    let err = search(&mut f, &server, under("A"), None)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("--mount") && err.contains("тест") && err.contains("второй"),
+        "{err}"
+    );
+    assert_eq!(*hits.lock().unwrap(), 0, "refused before any request");
+    assert_eq!(
+        search(&mut f, &server, under("A"), Some("второй")).unwrap(),
+        0
+    );
+}
